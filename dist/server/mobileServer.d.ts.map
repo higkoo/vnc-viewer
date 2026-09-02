@@ -1,0 +1,1 @@
+{"version":3,"file":"mobileServer.d.ts","sourceRoot":"","sources":["../../src/server/mobileServer.ts"],"names":[],"mappings":"AA4BA,qBAAa,YAAY;IACvB,OAAO,CAAC,UAAU,CAAc;IAChC,OAAO,CAAC,GAAG,CAAkB;IAC7B,OAAO,CAAC,IAAI,CAAS;gBAET,IAAI,SAAO;IAkBvB,OAAO,CAAC,UAAU;IA6BlB,OAAO,CAAC,cAAc;IAyCtB,OAAO,CAAC,YAAY;IAiCpB,KAAK,IAAI,IAAI;IAOb,IAAI,IAAI,IAAI;IAUZ,OAAO,IAAI,MAAM;CAGlB"}
