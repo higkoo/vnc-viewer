@@ -1,0 +1,18 @@
+{
+  "name": "vnc-viewer",
+  "version": "1.0.0",
+  "description": "跨平台 VNC 查看器 - 参考 UltraVNC 实现",
+  "main": "dist/main/main.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "npm run build && electron .",
+    "dev": "tsc && electron ."
+  },
+  "author": "higkoo",
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^33.0.0",
+    "typescript": "^5.5.0"
+  },
+  "dependencies": {}
+}
