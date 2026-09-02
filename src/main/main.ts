@@ -9,10 +9,12 @@ import { RfbClient } from '../rfb/client';
 import {
   IPC_CHANNELS, ConnectionState, ConnectionParams, FramebufferRect,
 } from '../rfb/types';
+import { MobileServer } from '../server/mobileServer';
 
 let mainWindow: BrowserWindow | null = null;
 let rfbClient: RfbClient | null = null;
 let currentConnectionParams: ConnectionParams | null = null;
+let mobileServer: MobileServer | null = null;
 
 function createWindow(): void {
   mainWindow = new BrowserWindow({
@@ -66,6 +68,25 @@ function createWindow(): void {
           { label: '退出全屏', accelerator: 'Escape', click: () => {
             mainWindow?.webContents.send('menu:exit-fullscreen');
           }},
+        ],
+      },
+      {
+        label: '手机',
+        submenu: [
+          {
+            label: '显示手机连接信息',
+            click: () => {
+              if (mobileServer) {
+                const port = mobileServer.getPort();
+                dialog.showMessageBox(mainWindow!, {
+                  type: 'info',
+                  title: '手机连接信息',
+                  message: '在手机浏览器中打开以下地址：',
+                  detail: `http://<本机IP>:${port}\n\n确保手机和电脑在同一网络下。`,
+                });
+              }
+            },
+          },
         ],
       },
       {
@@ -124,6 +145,25 @@ function createWindow(): void {
           }},
           { type: 'separator' },
           { role: 'toggleDevTools' },
+        ],
+      },
+      {
+        label: '手机',
+        submenu: [
+          {
+            label: '显示手机连接信息',
+            click: () => {
+              if (mobileServer) {
+                const port = mobileServer.getPort();
+                dialog.showMessageBox(mainWindow!, {
+                  type: 'info',
+                  title: '手机连接信息',
+                  message: '在手机浏览器中打开以下地址：',
+                  detail: `http://<本机IP>:${port}\n\n确保手机和电脑在同一网络下。`,
+                });
+              }
+            },
+          },
         ],
       },
     ];
@@ -240,6 +280,10 @@ app.whenReady().then(() => {
   setupIPC();
   createWindow();
 
+  // 启动手机代理服务器
+  mobileServer = new MobileServer();
+  mobileServer.start();
+
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
       createWindow();
@@ -251,6 +295,10 @@ app.on('window-all-closed', () => {
   if (rfbClient) {
     rfbClient.disconnect();
     rfbClient = null;
+  }
+  if (mobileServer) {
+    mobileServer.stop();
+    mobileServer = null;
   }
   if (process.platform !== 'darwin') {
     app.quit();
