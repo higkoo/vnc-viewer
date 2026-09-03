@@ -153,11 +153,16 @@ jobs:
           
           # 查找 Android SDK 路径
           SDK_PATH="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
-          if [ -z "$SDK_PATH" ]; then
-            # 尝试从 setup-android action 的默认路径查找
-            SDK_PATH="$HOME/.android/sdk"
-            [ -d "$SDK_PATH" ] || SDK_PATH="/usr/local/lib/android/sdk"
-            [ -d "$SDK_PATH" ] || SDK_PATH="/opt/android/sdk"
+          if [ -z "$SDK_PATH" ] || [ ! -d "$SDK_PATH" ]; then
+            # 尝试从 setup-android action 的常见安装路径查找
+            for p in "$HOME/.android/sdk" "/usr/local/lib/android/sdk" "/opt/android/sdk" "$ANDROID_HOME" "$ANDROID_SDK_ROOT"; do
+              [ -d "$p" ] && { SDK_PATH="$p"; break; } || true
+            done
+          fi
+          # 如果还是没找到，全局搜索 sdkmanager
+          if [ -z "$SDK_PATH" ] || [ ! -d "$SDK_PATH" ]; then
+            SDK_PATH=$(dirname "$(dirname "$(find / -name 'sdkmanager' -type f 2>/dev/null | head -1)")" 2>/dev/null || echo "")
+            [ -z "$SDK_PATH" ] && SDK_PATH="/usr/local/lib/android/sdk"  # 兜底
           fi
           echo "SDK_PATH=${SDK_PATH}"
           echo "ANDROID_HOME=${SDK_PATH}" >> $GITHUB_ENV
