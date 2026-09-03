@@ -125,7 +125,7 @@ jobs:
           cache: 'npm'
 
       - name: Setup Java 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: 'temurin'
           java-version: '17'
@@ -143,55 +143,78 @@ jobs:
       - name: Prepare Capacitor Android project
         shell: bash
         run: |
-          set -e
-          # 确保移动端 web 资源就位
+          set -euo pipefail
+          
+          # 确保 ANDROID_HOME 和 ANDROID_SDK_ROOT 已设置
+          ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+          ANDROID_HOME="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          echo "ANDROID_HOME=${ANDROID_HOME}"
+          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT}"
+          echo "ANDROID_HOME=${ANDROID_HOME}" >> $GITHUB_ENV
+          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT}" >> $GITHUB_ENV
+
+          # 准备移动端 web 资源
           mkdir -p capacitor/web
           cp src/mobile/index.html capacitor/web/
 
-          echo "ANDROID_HOME=${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
-          export ANDROID_HOME="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
-          export ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
-
-          # 生成 Capacitor Android 原生工程
-          if [ ! -d android ]; then
-            yes | npx cap add android 2>&1 | tail -40 || { echo "::: cap add android 失败，输出以上日志"; }
+          # 清空可能存在的空 android 目录，让 cap add 重新生成
+          if [ -d android ] && [ -z "$(ls -A android 2>/dev/null)" ]; then
+            rmdir android
           fi
 
-          # 同步 web 资源到 Android 工程
-          npx cap sync android 2>&1 | tail -40 || true
+          # 生成 Capacitor Android 原生工程
+          npx cap add android --skip-install 2>&1 || {
+            echo "::: cap add android 失败，尝试不带 skip-install"
+            npx cap add android 2>&1
+          }
 
-          # 确保 gradlew 存在
+          # 同步 web 资源
+          npx cap sync android 2>&1
+
+          # 确保 gradlew 可执行
           if [ -f android/gradlew ]; then
             chmod +x android/gradlew
           else
-            echo "::: android/gradlew 未生成，尝试安装 gradle 生成 wrapper"
-            which gradle >/dev/null 2>&1 || sudo apt-get install -y gradle || true
+            echo "::: android/gradlew 未生成，手动生成 wrapper"
+            cd android
+            gradle wrapper --gradle-version 8.5 2>&1 || {
+              echo "::: gradle 未安装，通过 apt 安装"
+              sudo apt-get install -y gradle
+              gradle wrapper --gradle-version 8.5 2>&1
+            }
+            chmod +x gradlew
+            cd ..
           fi
+          echo "::: Android 工程准备完成"
 
       - name: Assemble Android Debug APK
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
           export ANDROID_HOME="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
           export ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
-          if [ -f android/gradlew ]; then
-            cd android
-            chmod +x gradlew
-            # 首次在本机生成 wrapper（如缺失）
-            ./gradlew --version >/dev/null 2>&1 || {
-              echo "::: gradlew 不可用，重新生成 wrapper"
-              cd .. && rm -rf android/gradle/wrapper/gradle-wrapper.jar android/gradlew && cd android
-              gradle wrapper --gradle-version 8.5 2>&1 | tail -20 || true
-              chmod +x gradlew
-            }
-            ./gradlew :app:assembleDebug --no-daemon -x lint 2>&1 | tail -60
-            cd ..
-            echo "::: APK 产物:"
-            find android/app/build/outputs -type f \( -name "*.apk" -o -name "*.aab" \) | xargs ls -la 2>/dev/null || echo "未找到 APK"
-          else
-            echo "WARN: android/gradlew 不存在，跳过 APK 构建"
-            mkdir -p android/app/build/outputs/apk/debug
-            touch android/app/build/outputs/apk/debug/placeholder-not-built.log
+          echo "ANDROID_HOME=${ANDROID_HOME}"
+          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT}"
+
+          if [ ! -f android/gradlew ]; then
+            echo "FATAL: android/gradlew 不存在"
+            exit 1
+          fi
+
+          cd android
+          chmod +x gradlew
+          ./gradlew --version
+          ./gradlew :app:assembleDebug --no-daemon -x lint 2>&1
+          cd ..
+          
+          echo "::: APK 产物列表:"
+          find android/app/build/outputs -type f \( -name "*.apk" -o -name "*.aab" \) -exec ls -la {} \; 2>/dev/null || echo "未找到 APK"
+          
+          # 如果没有 APK，报错
+          APK_COUNT=$(find android/app/build/outputs -type f -name "*.apk" 2>/dev/null | wc -l)
+          if [ "$APK_COUNT" -eq 0 ]; then
+            echo "FATAL: 没有生成任何 APK 文件"
+            exit 1
           fi
 
       - name: Upload APK artifact
