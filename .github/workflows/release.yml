@@ -60,14 +60,19 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
-          # 逐包安装并容错，避免单个包名缺失导致整体失败
+          # 安装所有依赖，单个包缺失不阻断整体
           for pkg in \
             libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
             libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \
-            libgbm1 libpango-1.0-0 libcairo2 rpm squashfs-tools fakeroot \
+            libgbm1 libpango-1.0-0 libcairo2 rpm squashfs-tools \
+            fakeroot dpkg-dev dpkg \
             libasound2t64 libasound2 libfuse2t64 libfuse2 fuse; do
-            sudo apt-get install -y "$pkg" 2>/dev/null || echo "::: skip $pkg"
+            echo "::: installing $pkg ..."
+            sudo apt-get install -y "$pkg" || echo "::: skip $pkg (not found)"
           done
+          # 验证关键依赖
+          echo "::: verify fakeroot: $(which fakeroot || echo MISSING)"
+          echo "::: verify dpkg-deb: $(which dpkg-deb || echo MISSING)"
 
       - name: Install dependencies
         run: npm install --ignore-scripts
@@ -145,19 +150,25 @@ jobs:
         run: |
           set -euo pipefail
           
-          # 确保 ANDROID_HOME 和 ANDROID_SDK_ROOT 已设置
-          ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
-          ANDROID_HOME="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
-          echo "ANDROID_HOME=${ANDROID_HOME}"
-          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT}"
-          echo "ANDROID_HOME=${ANDROID_HOME}" >> $GITHUB_ENV
-          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT}" >> $GITHUB_ENV
+          # 查找 Android SDK 路径
+          SDK_PATH="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          if [ -z "$SDK_PATH" ]; then
+            # 尝试从 setup-android action 的默认路径查找
+            SDK_PATH="$HOME/.android/sdk"
+            [ -d "$SDK_PATH" ] || SDK_PATH="/usr/local/lib/android/sdk"
+            [ -d "$SDK_PATH" ] || SDK_PATH="/opt/android/sdk"
+          fi
+          echo "SDK_PATH=${SDK_PATH}"
+          echo "ANDROID_HOME=${SDK_PATH}" >> $GITHUB_ENV
+          echo "ANDROID_SDK_ROOT=${SDK_PATH}" >> $GITHUB_ENV
+          export ANDROID_HOME="$SDK_PATH"
+          export ANDROID_SDK_ROOT="$SDK_PATH"
 
           # 准备移动端 web 资源
           mkdir -p capacitor/web
           cp src/mobile/index.html capacitor/web/
 
-          # 清空可能存在的空 android 目录，让 cap add 重新生成
+          # 清空可能存在的空 android 目录
           if [ -d android ] && [ -z "$(ls -A android 2>/dev/null)" ]; then
             rmdir android
           fi
@@ -170,6 +181,10 @@ jobs:
 
           # 同步 web 资源
           npx cap sync android 2>&1
+
+          # 写入 local.properties 确保 Gradle 能找到 SDK
+          echo "sdk.dir=${SDK_PATH}" > android/local.properties
+          echo "::: local.properties: $(cat android/local.properties)"
 
           # 确保 gradlew 可执行
           if [ -f android/gradlew ]; then
@@ -191,10 +206,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          export ANDROID_HOME="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
-          export ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
-          echo "ANDROID_HOME=${ANDROID_HOME}"
-          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT}"
+          # 从环境变量或 local.properties 获取 SDK 路径
+          SDK_PATH="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          echo "ANDROID_HOME=${SDK_PATH}"
+          export ANDROID_HOME="$SDK_PATH"
+          export ANDROID_SDK_ROOT="$SDK_PATH"
 
           if [ ! -f android/gradlew ]; then
             echo "FATAL: android/gradlew 不存在"
@@ -203,7 +219,13 @@ jobs:
 
           cd android
           chmod +x gradlew
+          
+          # 确保 local.properties 存在
+          [ -f local.properties ] || echo "sdk.dir=${SDK_PATH}" > local.properties
+          
+          echo "::: Gradle 版本:"
           ./gradlew --version
+          echo "::: 开始构建 APK..."
           ./gradlew :app:assembleDebug --no-daemon -x lint 2>&1
           cd ..
           
