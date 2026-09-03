@@ -129,11 +129,12 @@ jobs:
           node-version: '22'
           cache: 'npm'
 
-      - name: Setup Java 17
+      - name: Setup Java 21
         uses: actions/setup-java@v5
         with:
           distribution: 'temurin'
-          java-version: '17'
+          # Capacitor 8 的 @capacitor/android 需 Java 21（source release 21），17 会报 invalid source release
+          java-version: '21'
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
