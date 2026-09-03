@@ -1,0 +1,20 @@
+# Node
+node_modules/
+npm-debug.log*
+
+# Electron build output
+dist/
+release/
+
+# Capacitor / Android 构建产物
+android/.gradle/
+android/app/build/
+android/build/
+android/local.properties
+android/app/src/main/assets/public/
+*.apk
+*.aab
+
+# 其它
+*.log
+.DS_Store

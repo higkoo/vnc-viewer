@@ -139,7 +139,8 @@ jobs:
         uses: android-actions/setup-android@v3
         with:
           cmdline-tools-version: 'latest'
-          packages: 'platform-tools platforms;android-34 build-tools;34.0.0'
+          # compileSdk=36（见 android/variables.gradle），必须安装 android-36 + 对应 build-tools
+          packages: 'platform-tools platforms;android-36 build-tools;36.0.0'
           accept-android-sdk-licenses: true
 
       - name: Install dependencies
@@ -168,38 +169,15 @@ jobs:
           mkdir -p capacitor/web
           cp src/mobile/index.html capacitor/web/
 
-          # 清空可能存在的空 android 目录
-          if [ -d android ] && [ -z "$(ls -A android 2>/dev/null)" ]; then
-            rmdir android
-          fi
-
-          # 生成 Capacitor Android 原生工程
-          npx cap add android --skip-install 2>&1 || {
-            echo "::: cap add android 失败，尝试不带 skip-install"
-            npx cap add android 2>&1
-          }
-
-          # 同步 web 资源
+          # android/ 原生工程已提交到仓库，只需同步 web 资源（Capacitor 会在 android 目录存在时更新 assets/plugins）
           npx cap sync android 2>&1
 
           # 写入 local.properties 确保 Gradle 能找到 SDK
           echo "sdk.dir=${SDK_PATH}" > android/local.properties
-          echo "::: local.properties: $(cat android/local.properties)"
+          cat android/local.properties
 
-          # 确保 gradlew 可执行
-          if [ -f android/gradlew ]; then
-            chmod +x android/gradlew
-          else
-            echo "::: android/gradlew 未生成，手动生成 wrapper"
-            cd android
-            gradle wrapper --gradle-version 8.5 2>&1 || {
-              echo "::: gradle 未安装，通过 apt 安装"
-              sudo apt-get install -y gradle
-              gradle wrapper --gradle-version 8.5 2>&1
-            }
-            chmod +x gradlew
-            cd ..
-          fi
+          # 确保 gradlew 可执行（已随 android/ 提交）
+          chmod +x android/gradlew || { echo "FATAL: android/gradlew 缺失"; exit 1; }
           echo "::: Android 工程准备完成"
 
       - name: Assemble Android Debug APK

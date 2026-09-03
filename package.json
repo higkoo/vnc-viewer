@@ -16,7 +16,10 @@
     "android:build": "npm run android:sync && cd android && ./gradlew assembleDebug && echo 'APK: android/app/build/outputs/apk/debug/app-debug.apk'",
     "build:mobile": "mkdir -p dist/mobile && cp src/mobile/index.html dist/mobile/ 2>/dev/null || true"
   },
-  "author": "higkoo",
+  "author": {
+    "name": "higkoo",
+    "email": "higkoo@users.noreply.github.com"
+  },
   "license": "MIT",
   "build": {
     "appId": "com.higkoo.vncviewer",
