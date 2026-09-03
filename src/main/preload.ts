@@ -22,6 +22,13 @@ const api = {
     ipcRenderer.on(IPC_CHANNELS.APP_LOG, (_event, entry) => callback(entry));
   },
 
+  // 设置
+  getSettings: () => ipcRenderer.invoke(IPC_CHANNELS.GET_SETTINGS),
+  setSettings: (settings: any) => ipcRenderer.invoke(IPC_CHANNELS.SET_SETTINGS, settings),
+  onMobilePortChanged: (callback: (port: number) => void) => {
+    ipcRenderer.on(IPC_CHANNELS.MOBILE_PORT_CHANGED, (_event, port) => callback(port));
+  },
+
   // 事件监听
   onFramebufferUpdate: (callback: (rect: any) => void) => {
     ipcRenderer.on(IPC_CHANNELS.FRAMEBUFFER_UPDATE, (_event, rect) => callback(rect));
@@ -64,6 +71,9 @@ const api = {
   },
   onMenuShowLogs: (callback: () => void) => {
     ipcRenderer.on('menu:show-logs', () => callback());
+  },
+  onMenuShowSettings: (callback: () => void) => {
+    ipcRenderer.on('menu:show-settings', () => callback());
   },
 };
 

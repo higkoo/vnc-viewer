@@ -64,6 +64,27 @@
     </div>
   </div>
 
+  <!-- 设置对话框 -->
+  <div id="settings-dialog" class="dialog-overlay hidden">
+    <div class="dialog dialog-sm">
+      <div class="dialog-header">
+        <h1>设置</h1>
+      </div>
+      <div class="dialog-body">
+        <div class="form-group">
+          <label for="settings-mobile-port">手机代理端口</label>
+          <input type="number" id="settings-mobile-port" value="5933" min="1024" max="65535">
+          <p class="form-hint">修改后立即生效，手机浏览器需使用新端口访问</p>
+        </div>
+        <div class="error-msg" id="settings-error-msg"></div>
+      </div>
+      <div class="dialog-footer">
+        <button class="btn" id="btn-settings-cancel">取消</button>
+        <button class="btn btn-primary" id="btn-settings-save">保存</button>
+      </div>
+    </div>
+  </div>
+
   <!-- 实时日志面板 -->
   <div id="log-panel" class="log-panel hidden">
     <div class="log-header">
