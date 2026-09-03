@@ -1021,8 +1021,8 @@ class MobileRfbClient {
   }
 
   _processData() {
-    if (!this.connected) return;
     while (this.buffer.length > 0) {
+      // 先处理挂起的握手/数据读取，握手完成前也能消费数据
       if (this._pendingExpect) {
         const { n, callback } = this._pendingExpect;
         if (this.buffer.length >= n) {
@@ -1034,6 +1034,9 @@ class MobileRfbClient {
         }
         break;
       }
+
+      // 握手完成前不处理 FramebufferUpdate，等待更多数据
+      if (!this.connected) break;
 
       // 等待 FramebufferUpdate 消息
       if (this.buffer.length < 4) break;
@@ -1336,57 +1339,17 @@ function doConnect() {
   statusText.textContent = '连接中...';
   statusText.className = '';
 
-  client = new MobileRfbClient();
-
   const proxy = getProxyServer();
 
-  client.onName = (name) => {
-    toolbarTitle.textContent = `${params.host} - ${name}`;
-  };
-
-  client.onResize = (w, h) => {
-    fbW = w;
-    fbH = h;
-    resizeCanvas();
-  };
-
-  client.onUpdate = (fb, w, h) => {
-    const imageData = new ImageData(new Uint8ClampedArray(fb.buffer), w, h);
-    ctx.putImageData(imageData, 0, 0);
-  };
-
-  client.onError = (msg) => {
-    statusText.textContent = '错误: ' + msg;
-    statusText.className = 'error';
-    btn.disabled = false;
+  // 关闭旧连接，避免重复创建导致的问题
+  if (client) {
+    client.disconnect();
     client = null;
-  };
+  }
 
-  client.onClose = () => {
-    statusText.textContent = '已断开连接';
-    statusText.className = '';
-    connectPanel.classList.remove('hidden');
-    toolbar.classList.add('hidden');
-    btn.disabled = false;
-    client = null;
-  };
+  const c = new MobileRfbClient();
 
-  client.connect(proxy.host, parseInt(proxy.port), params.password);
-  // 代理连接成功后，会自动连接到 VNC 服务器
-  // 但我们需要在代理连接成功后发送 VNC 连接参数
-  // 实际上 proxy 已经处理了，MobileRfbClient 的 connect 方法会发送连接命令
-  // 但 proxy 的 host:port 是代理服务器，不是 VNC 服务器
-  // 我们需要修改一下：client 先连接代理，然后通过代理连接 VNC 服务器
-  // 实际上 MobileRfbClient.connect 已经做了：
-  // 1. 连接 WebSocket 到代理服务器
-  // 2. 发送连接命令 (host:port of VNC server)
-  // 所以这里应该是：
-  // client.connect(params.host, params.port, params.password) 但 WebSocket URL 是代理服务器
-  // 重新连接：
-  client.disconnect();
-  client = new MobileRfbClient();
-
-  client.onName = (name) => {
+  c.onName = (name) => {
     toolbarTitle.textContent = `${params.host} - ${name}`;
     connectPanel.classList.add('hidden');
     toolbar.classList.remove('hidden');
@@ -1395,25 +1358,29 @@ function doConnect() {
     btn.disabled = false;
   };
 
-  client.onResize = (w, h) => {
+  c.onResize = (w, h) => {
     fbW = w;
     fbH = h;
     resizeCanvas();
   };
 
-  client.onUpdate = (fb, w, h) => {
-    const imageData = new ImageData(new Uint8ClampedArray(fb.buffer), w, h);
-    ctx.putImageData(imageData, 0, 0);
+  c.onUpdate = (fb, w, h) => {
+    try {
+      const imageData = new ImageData(new Uint8ClampedArray(fb.buffer), w, h);
+      ctx.putImageData(imageData, 0, 0);
+    } catch (e) {
+      console.error('渲染画面失败:', e);
+    }
   };
 
-  client.onError = (msg) => {
+  c.onError = (msg) => {
     statusText.textContent = '错误: ' + msg;
     statusText.className = 'error';
     btn.disabled = false;
-    client = null;
+    if (client === c) client = null;
   };
 
-  client.onClose = () => {
+  c.onClose = () => {
     statusText.textContent = '已断开连接';
     statusText.className = '';
     connectPanel.classList.remove('hidden');
@@ -1421,40 +1388,49 @@ function doConnect() {
     keyboardPanel.classList.add('hidden');
     keyboardVisible = false;
     btn.disabled = false;
+    if (client === c) client = null;
   };
 
-  // 直接连接到代理，发送 VNC 目标
+  // 连接的 WebSocket 是代理服务器，VNC 目标地址在握手命令中发送
   const wsUrl = `ws://${proxy.host}:${proxy.port}/proxy`;
   const ws = new WebSocket(wsUrl);
   ws.binaryType = 'arraybuffer';
 
+  // 让客户端通过该 WebSocket 发送 RFB 数据
+  c.ws = ws;
+  c._sendRfbMessage = (d) => {
+    if (ws.readyState === WebSocket.OPEN) ws.send(d);
+  };
+
   ws.onopen = () => {
-    // 发送连接命令: host + port
+    // 发送连接命令: 0x00 + VNC host + 0x00 + port
     const hostBytes = new TextEncoder().encode(params.host);
-    const buf = new Uint8Array(1 + hostBytes.length + 1 + 2);
+    const buf = new Uint8Array(1 + hostBytes.length + 2 + 2);
     buf[0] = 0x00;
     buf.set(hostBytes, 1);
     buf[1 + hostBytes.length] = 0x00;
-    buf[1 + hostBytes.length + 1] = params.port >> 8;
+    buf[1 + hostBytes.length + 1] = (params.port >> 8) & 0xff;
     buf[1 + hostBytes.length + 2] = params.port & 0xff;
     ws.send(buf);
   };
 
   ws.onmessage = (event) => {
+    // 连接可能已断开（client 被置空），直接忽略
+    if (!c) return;
     const data = new Uint8Array(event.data);
     if (data.length === 1 && data[0] === 0x01) {
-      // 代理连接成功，开始 RFB 握手
-      client.ws = ws;
-      client._sendRfbMessage = (data) => ws.send(data);
-      client._startHandshake(params.password);
+      // 代理已连上 VNC，开始 RFB 握手
+      c._startHandshake(params.password);
       return;
     }
     if (data[0] === 0x02) {
+      // 代理返回错误（如 VNC 地址不可达）
       const len = data[1];
       const msg = new TextDecoder().decode(data.slice(2, 2 + len));
       statusText.textContent = '错误: ' + msg;
       statusText.className = 'error';
       btn.disabled = false;
+      if (client === c) client = null;
       return;
     }
     if (data[0] === 0x03) {
@@ -1465,33 +1441,34 @@ function doConnect() {
       keyboardPanel.classList.add('hidden');
       keyboardVisible = false;
       btn.disabled = false;
-      client = null;
+      if (client === c) client = null;
       return;
     }
-    // RFB 数据
-    client._appendData(data);
-    client._processData();
+    // RFB 协议数据
+    c._appendData(data);
+    c._processData();
   };
 
   ws.onerror = () => {
     statusText.textContent = '无法连接到代理服务器';
     statusText.className = 'error';
     btn.disabled = false;
+    if (client === c) client = null;
   };
 
   ws.onclose = () => {
-    if (client && client.connected) {
+    if (client === c && c.connected) {
       statusText.textContent = '连接已断开';
       connectPanel.classList.remove('hidden');
       toolbar.classList.add('hidden');
       keyboardPanel.classList.add('hidden');
       keyboardVisible = false;
       btn.disabled = false;
-      client = null;
+      if (client === c) client = null;
     }
   };
 
-  client.ws = ws;
+  client = c;
 }
 
 // 断开连接

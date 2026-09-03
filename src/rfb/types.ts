@@ -133,4 +133,8 @@ export const IPC_CHANNELS = {
   SET_ENCODINGS: 'rfb:set-encodings',
   SET_PIXEL_FORMAT: 'rfb:set-pixel-format',
   SET_DESKTOP_SIZE: 'rfb:request-desktop-size',
+  // 应用日志
+  APP_LOG: 'app:log',
+  LOG_GET: 'app:log:get',
+  LOG_CLEAR: 'app:log:clear',
 } as const;

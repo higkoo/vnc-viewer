@@ -10,6 +10,7 @@ import {
   IPC_CHANNELS, ConnectionState, ConnectionParams, FramebufferRect,
 } from '../rfb/types';
 import { MobileServer } from '../server/mobileServer';
+import { info, warn, error, setLogSender, getLogs, clearLogs } from './logger';
 
 let mainWindow: BrowserWindow | null = null;
 let rfbClient: RfbClient | null = null;
@@ -99,6 +100,10 @@ function createWindow(): void {
             mainWindow?.webContents.send('menu:zoom-100');
           }},
           { type: 'separator' },
+          { label: '查看实时日志', accelerator: 'CmdOrCtrl+L', click: () => {
+            mainWindow?.webContents.send('menu:show-logs');
+          }},
+          { type: 'separator' },
           { role: 'toggleDevTools', label: '开发者工具' },
         ],
       },
@@ -144,6 +149,10 @@ function createWindow(): void {
             mainWindow?.webContents.send('menu:zoom-100');
           }},
           { type: 'separator' },
+          { label: '查看实时日志', accelerator: 'Ctrl+L', click: () => {
+            mainWindow?.webContents.send('menu:show-logs');
+          }},
+          { type: 'separator' },
           { role: 'toggleDevTools' },
         ],
       },
@@ -187,9 +196,12 @@ function setupIPC(): void {
     currentConnectionParams = params;
     rfbClient = new RfbClient();
 
+    info(`正在连接 ${params.host}:${params.port} ${params.shared ? '(共享模式)' : ''}`);
+
     // 状态变更
     rfbClient.on('state', (state: ConnectionState) => {
       mainWindow?.webContents.send(IPC_CHANNELS.CONNECTION_STATE, state);
+      info(`连接状态: ${connectionStateLabel(state)}`);
     });
 
     // 帧缓冲更新
@@ -206,13 +218,15 @@ function setupIPC(): void {
     });
 
     // 服务器信息
-    rfbClient.on('server-info', (info: any) => {
-      mainWindow?.webContents.send(IPC_CHANNELS.SERVER_INFO, info);
+    rfbClient.on('server-info', (info_: any) => {
+      mainWindow?.webContents.send(IPC_CHANNELS.SERVER_INFO, info_);
+      info(`收到服务器信息: ${info_.name} ${info_.width}x${info_.height}`);
     });
 
     // 错误
     rfbClient.on('error', (msg: string) => {
       mainWindow?.webContents.send(IPC_CHANNELS.ERROR, msg);
+      error(msg);
     });
 
     // 桌面大小变化
@@ -237,6 +251,9 @@ function setupIPC(): void {
 
   ipcMain.handle(IPC_CHANNELS.DISCONNECT, async () => {
     if (rfbClient) {
+      if (currentConnectionParams) {
+        info(`断开连接 ${currentConnectionParams.host}:${currentConnectionParams.port}`);
+      }
       rfbClient.disconnect();
       rfbClient = null;
     }
@@ -272,13 +289,46 @@ function setupIPC(): void {
     rfbClient?.requestDesktopSize(width, height);
     return { success: true };
   });
+
+  // ---- 实时日志 ----
+  ipcMain.handle(IPC_CHANNELS.LOG_GET, async () => getLogs());
+  ipcMain.handle(IPC_CHANNELS.LOG_CLEAR, async () => {
+    clearLogs();
+    return { success: true };
+  });
+}
+
+// 连接状态的中文描述，便于日志查看
+function connectionStateLabel(state: ConnectionState): string {
+  switch (state) {
+    case ConnectionState.Disconnected: return '已断开';
+    case ConnectionState.Connecting: return '正在连接...';
+    case ConnectionState.ProtocolVersion: return '协议握手 (版本协商)';
+    case ConnectionState.Security: return '安全类型协商';
+    case ConnectionState.Authentication: return '认证中...';
+    case ConnectionState.ClientInit: return '客户端初始化';
+    case ConnectionState.ServerInit: return '服务端初始化';
+    case ConnectionState.Connected: return '已连接';
+    case ConnectionState.Error: return '错误';
+    default: return `未知(${state})`;
+  }
 }
 
 // ---- 应用生命周期 ----
 
 app.whenReady().then(() => {
+  // 将主进程日志实时推送给渲染进程
+  setLogSender((entry) => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send(IPC_CHANNELS.APP_LOG, entry);
+    }
+  });
+
   setupIPC();
   createWindow();
+
+  info('VNC Viewer 已启动');
+  info(`平台: ${process.platform} ${process.arch}`);
 
   // 启动手机代理服务器
   mobileServer = new MobileServer();

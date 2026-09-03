@@ -23,6 +23,10 @@ interface VncApi {
   onMenuExitFullscreen: (callback: () => void) => void;
   onMenuZoomFit: (callback: () => void) => void;
   onMenuZoom100: (callback: () => void) => void;
+  onMenuShowLogs: (callback: () => void) => void;
+  getLogs: () => Promise<any>;
+  clearLogs: () => Promise<any>;
+  onLog: (callback: (entry: { time: string; level: string; msg: string }) => void) => void;
 }
 
 declare var vncApi: VncApi;
@@ -70,6 +74,12 @@ const btnZoom100 = getEl<HTMLButtonElement>('btn-zoom-100');
 const btnFullscreen = getEl<HTMLButtonElement>('btn-fullscreen');
 const btnCtrlAltDel = getEl<HTMLButtonElement>('btn-ctrl-alt-del');
 const btnClipboard = getEl<HTMLButtonElement>('btn-clipboard');
+const btnLog = getEl<HTMLButtonElement>('btn-log');
+const logPanel = getEl<HTMLDivElement>('log-panel');
+const logBody = getEl<HTMLDivElement>('log-body');
+const logAutoScroll = getEl<HTMLInputElement>('log-autoscroll');
+const btnLogClear = getEl<HTMLButtonElement>('btn-log-clear');
+const btnLogClose = getEl<HTMLButtonElement>('btn-log-close');
 
 // ---- 状态变量 ----
 let isConnected = false;
@@ -134,6 +144,11 @@ function setupEventListeners(): void {
     if (text !== null) vncApi.sendCutText(text);
   });
 
+  // 日志面板开关
+  btnLog.addEventListener('click', toggleLogPanel);
+  btnLogClose.addEventListener('click', toggleLogPanel);
+  btnLogClear.addEventListener('click', clearLogView);
+
   // 画布鼠标事件
   canvas.addEventListener('mousedown', handleMouseDown);
   canvas.addEventListener('mouseup', handleMouseUp);
@@ -155,6 +170,11 @@ function setupEventListeners(): void {
 
 // ---- IPC 监听 ----
 function setupIPCListeners(): void {
+  // 实时接收主进程推送的日志
+  vncApi.onLog((entry) => {
+    appendLog(entry);
+  });
+
   vncApi.onFramebufferUpdate((rect) => {
     renderRect(rect);
   });
@@ -217,6 +237,49 @@ function setupIPCListeners(): void {
   vncApi.onMenuExitFullscreen(() => exitFullscreen());
   vncApi.onMenuZoomFit(() => setZoomMode('fit'));
   vncApi.onMenuZoom100(() => setZoomMode('100'));
+  vncApi.onMenuShowLogs(() => toggleLogPanel());
+}
+
+// ---- 实时日志面板 ----
+function toggleLogPanel(): void {
+  const isHidden = logPanel.classList.contains('hidden');
+  logPanel.classList.toggle('hidden', !isHidden);
+  if (isHidden) {
+    // 打开时重新从主进程拉取最新日志
+    vncApi.getLogs().then((entries: { time: string; level: string; msg: string }[]) => {
+      logBody.innerHTML = '';
+      for (const e of entries) appendLog(e);
+      scrollLogToBottom();
+    });
+  }
+}
+
+function clearLogView(): void {
+  vncApi.clearLogs();
+  logBody.innerHTML = '';
+}
+
+function appendLog(entry: { time: string; level: string; msg: string }): void {
+  const line = document.createElement('div');
+  line.className = `log-line log-${entry.level}`;
+  const time = document.createElement('span');
+  time.className = 'log-time';
+  time.textContent = entry.time;
+  const level = document.createElement('span');
+  level.className = 'log-level';
+  level.textContent = entry.level.toUpperCase();
+  const msg = document.createElement('span');
+  msg.className = 'log-msg';
+  msg.textContent = entry.msg;
+  line.appendChild(time);
+  line.appendChild(level);
+  line.appendChild(msg);
+  logBody.appendChild(line);
+  if (logAutoScroll.checked) scrollLogToBottom();
+}
+
+function scrollLogToBottom(): void {
+  logBody.scrollTop = logBody.scrollHeight;
 }
 
 // ---- 连接管理 ----

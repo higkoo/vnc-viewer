@@ -14,6 +14,12 @@ const api = {
     setEncodings: (encodings) => electron_1.ipcRenderer.invoke(types_1.IPC_CHANNELS.SET_ENCODINGS, encodings),
     setPixelFormat: (format) => electron_1.ipcRenderer.invoke(types_1.IPC_CHANNELS.SET_PIXEL_FORMAT, format),
     requestDesktopSize: (width, height) => electron_1.ipcRenderer.invoke(types_1.IPC_CHANNELS.SET_DESKTOP_SIZE, width, height),
+    // 实时日志
+    getLogs: () => electron_1.ipcRenderer.invoke(types_1.IPC_CHANNELS.LOG_GET),
+    clearLogs: () => electron_1.ipcRenderer.invoke(types_1.IPC_CHANNELS.LOG_CLEAR),
+    onLog: (callback) => {
+        electron_1.ipcRenderer.on(types_1.IPC_CHANNELS.APP_LOG, (_event, entry) => callback(entry));
+    },
     // 事件监听
     onFramebufferUpdate: (callback) => {
         electron_1.ipcRenderer.on(types_1.IPC_CHANNELS.FRAMEBUFFER_UPDATE, (_event, rect) => callback(rect));
@@ -53,6 +59,9 @@ const api = {
     },
     onMenuZoom100: (callback) => {
         electron_1.ipcRenderer.on('menu:zoom-100', () => callback());
+    },
+    onMenuShowLogs: (callback) => {
+        electron_1.ipcRenderer.on('menu:show-logs', () => callback());
     },
 };
 electron_1.contextBridge.exposeInMainWorld('vncApi', api);

@@ -15,6 +15,13 @@ const api = {
   setPixelFormat: (format: any) => ipcRenderer.invoke(IPC_CHANNELS.SET_PIXEL_FORMAT, format),
   requestDesktopSize: (width: number, height: number) => ipcRenderer.invoke(IPC_CHANNELS.SET_DESKTOP_SIZE, width, height),
 
+  // 实时日志
+  getLogs: () => ipcRenderer.invoke(IPC_CHANNELS.LOG_GET),
+  clearLogs: () => ipcRenderer.invoke(IPC_CHANNELS.LOG_CLEAR),
+  onLog: (callback: (entry: { time: string; level: string; msg: string }) => void) => {
+    ipcRenderer.on(IPC_CHANNELS.APP_LOG, (_event, entry) => callback(entry));
+  },
+
   // 事件监听
   onFramebufferUpdate: (callback: (rect: any) => void) => {
     ipcRenderer.on(IPC_CHANNELS.FRAMEBUFFER_UPDATE, (_event, rect) => callback(rect));
@@ -54,6 +61,9 @@ const api = {
   },
   onMenuZoom100: (callback: () => void) => {
     ipcRenderer.on('menu:zoom-100', () => callback());
+  },
+  onMenuShowLogs: (callback: () => void) => {
+    ipcRenderer.on('menu:show-logs', () => callback());
   },
 };
 

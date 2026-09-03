@@ -45,6 +45,12 @@ const btnZoom100 = getEl('btn-zoom-100');
 const btnFullscreen = getEl('btn-fullscreen');
 const btnCtrlAltDel = getEl('btn-ctrl-alt-del');
 const btnClipboard = getEl('btn-clipboard');
+const btnLog = getEl('btn-log');
+const logPanel = getEl('log-panel');
+const logBody = getEl('log-body');
+const logAutoScroll = getEl('log-autoscroll');
+const btnLogClear = getEl('btn-log-clear');
+const btnLogClose = getEl('btn-log-close');
 // ---- 状态变量 ----
 let isConnected = false;
 let isFullscreen = false;
@@ -99,6 +105,10 @@ function setupEventListeners() {
         if (text !== null)
             vncApi.sendCutText(text);
     });
+    // 日志面板开关
+    btnLog.addEventListener('click', toggleLogPanel);
+    btnLogClose.addEventListener('click', toggleLogPanel);
+    btnLogClear.addEventListener('click', clearLogView);
     // 画布鼠标事件
     canvas.addEventListener('mousedown', handleMouseDown);
     canvas.addEventListener('mouseup', handleMouseUp);
@@ -118,6 +128,10 @@ function setupEventListeners() {
 }
 // ---- IPC 监听 ----
 function setupIPCListeners() {
+    // 实时接收主进程推送的日志
+    vncApi.onLog((entry) => {
+        appendLog(entry);
+    });
     vncApi.onFramebufferUpdate((rect) => {
         renderRect(rect);
     });
@@ -175,6 +189,47 @@ function setupIPCListeners() {
     vncApi.onMenuExitFullscreen(() => exitFullscreen());
     vncApi.onMenuZoomFit(() => setZoomMode('fit'));
     vncApi.onMenuZoom100(() => setZoomMode('100'));
+    vncApi.onMenuShowLogs(() => toggleLogPanel());
+}
+// ---- 实时日志面板 ----
+function toggleLogPanel() {
+    const isHidden = logPanel.classList.contains('hidden');
+    logPanel.classList.toggle('hidden', !isHidden);
+    if (isHidden) {
+        // 打开时重新从主进程拉取最新日志
+        vncApi.getLogs().then((entries) => {
+            logBody.innerHTML = '';
+            for (const e of entries)
+                appendLog(e);
+            scrollLogToBottom();
+        });
+    }
+}
+function clearLogView() {
+    vncApi.clearLogs();
+    logBody.innerHTML = '';
+}
+function appendLog(entry) {
+    const line = document.createElement('div');
+    line.className = `log-line log-${entry.level}`;
+    const time = document.createElement('span');
+    time.className = 'log-time';
+    time.textContent = entry.time;
+    const level = document.createElement('span');
+    level.className = 'log-level';
+    level.textContent = entry.level.toUpperCase();
+    const msg = document.createElement('span');
+    msg.className = 'log-msg';
+    msg.textContent = entry.msg;
+    line.appendChild(time);
+    line.appendChild(level);
+    line.appendChild(msg);
+    logBody.appendChild(line);
+    if (logAutoScroll.checked)
+        scrollLogToBottom();
+}
+function scrollLogToBottom() {
+    logBody.scrollTop = logBody.scrollHeight;
 }
 // ---- 连接管理 ----
 function handleConnect() {

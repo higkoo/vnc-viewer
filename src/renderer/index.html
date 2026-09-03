@@ -64,6 +64,23 @@
     </div>
   </div>
 
+  <!-- 实时日志面板 -->
+  <div id="log-panel" class="log-panel hidden">
+    <div class="log-header">
+      <span>实时日志</span>
+      <div class="log-actions">
+        <button class="log-btn" id="btn-log-clear" title="清空日志">清空</button>
+        <button class="log-btn" id="btn-log-close" title="关闭">✕</button>
+      </div>
+    </div>
+    <div class="log-body" id="log-body"></div>
+    <div class="log-footer">
+      <label class="log-auto-scroll">
+        <input type="checkbox" id="log-autoscroll" checked> 自动滚动
+      </label>
+    </div>
+  </div>
+
   <!-- 工具栏 -->
   <div id="toolbar" class="toolbar hidden">
     <button class="toolbar-btn" id="btn-new-conn" title="新建连接 (Ctrl+N)">
@@ -89,6 +106,10 @@
     <div class="toolbar-separator"></div>
     <button class="toolbar-btn" id="btn-clipboard" title="剪贴板">
       <svg width="16" height="16" viewBox="0 0 16 16"><path fill="currentColor" d="M4 1.5H3a2 2 0 0 0-2 2V14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V3.5a2 2 0 0 0-2-2h-1v1h1a1 1 0 0 1 1 1V14a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V3.5a1 1 0 0 1 1-1h1v-1z"/><path fill="currentColor" d="M9.5 1a.5.5 0 0 1 .5.5v1a.5.5 0 0 1-.5.5h-3a.5.5 0 0 1-.5-.5v-1a.5.5 0 0 1 .5-.5h3zm-3-1A1.5 1.5 0 0 0 5 1.5v1A1.5 1.5 0 0 0 6.5 4h3A1.5 1.5 0 0 0 11 2.5v-1A1.5 1.5 0 0 0 9.5 0h-3z"/></svg>
+    </button>
+    <div class="toolbar-separator"></div>
+    <button class="toolbar-btn" id="btn-log" title="实时日志 (Ctrl+L)">
+      <svg width="16" height="16" viewBox="0 0 16 16"><path fill="currentColor" d="M2 2h12v12H2V2zm1 1v10h10V3H3zm2 2h6v1H5V5zm0 3h6v1H5V8zm0 3h4v1H5v-1z"/></svg>
     </button>
   </div>
 

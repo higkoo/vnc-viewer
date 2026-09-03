@@ -3,6 +3,7 @@ import * as fs from "fs";
 import * as path from "path";
 import * as net from "net";
 import { WebSocketServer, WebSocket } from "ws";
+import { info, warn, error as logError } from "../main/logger";
 
 const PROJECT_ROOT = path.resolve(__dirname, "..", "..");
 
@@ -87,6 +88,7 @@ export class MobileServer {
         port: 0,
       };
       sessions.set(ws, session);
+      info(`[手机代理] 新客户端接入，当前在线 ${sessions.size} 个`);
 
       ws.on("message", (data: Buffer) => {
         if (data[0] === 0x00) {
@@ -122,8 +124,10 @@ export class MobileServer {
   private connectToVnc(session: MobileSession, host: string, port: number): void {
     const tcp = new net.Socket();
     session.tcp = tcp;
+    info(`[手机代理] 转发到 VNC 服务器 ${host}:${port}`);
 
     tcp.connect(port, host, () => {
+      info(`[手机代理] 已连接 ${host}:${port}`);
       session.ws.send(Buffer.from([0x01])); // Connected signal
     });
 
@@ -134,10 +138,12 @@ export class MobileServer {
     });
 
     tcp.on("error", (err) => {
+      logError(`[手机代理] 连接 ${host}:${port} 失败: ${err.message}`);
       try {
-        const errMsg = Buffer.alloc(2 + Buffer.byteLength(err.message, "utf8"));
+        const errBytes = Buffer.byteLength(err.message, "utf8");
+        const errMsg = Buffer.alloc(2 + errBytes);
         errMsg[0] = 0x02; // Error signal
-        errMsg.writeUInt8(err.message.length, 1);
+        errMsg.writeUInt8(errBytes, 1);
         errMsg.write(err.message, 2, "utf8");
         session.ws.send(errMsg);
       } catch {
@@ -159,16 +165,16 @@ export class MobileServer {
       this.httpServer.removeAllListeners("error");
       this.httpServer.once("error", (err: NodeJS.ErrnoException) => {
         if (err.code === "EADDRINUSE" && attempt < 20) {
-          console.warn(`[Mobile Server] 端口 ${port} 被占用，尝试端口 ${port + 1}`);
+          warn(`[手机代理] 端口 ${port} 被占用，尝试端口 ${port + 1}`);
           tryListen(attempt + 1);
         } else {
-          console.error(`[Mobile Server] 启动失败: ${err.message}`);
+          logError(`[手机代理] 启动失败: ${err.message}`);
         }
       });
       this.httpServer.listen(port, "0.0.0.0", () => {
         this.port = port;
-        console.log(`[Mobile Server] 运行在 http://0.0.0.0:${this.port}`);
-        console.log(`[Mobile Server] 手机浏览器打开 http://<本机IP>:${this.port}`);
+        info(`[手机代理] 运行在 http://0.0.0.0:${this.port}`);
+        info(`[手机代理] 手机浏览器打开 http://<本机IP>:${this.port}`);
       });
     };
     tryListen(0);

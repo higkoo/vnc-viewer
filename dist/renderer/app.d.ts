@@ -21,6 +21,14 @@ interface VncApi {
     onMenuExitFullscreen: (callback: () => void) => void;
     onMenuZoomFit: (callback: () => void) => void;
     onMenuZoom100: (callback: () => void) => void;
+    onMenuShowLogs: (callback: () => void) => void;
+    getLogs: () => Promise<any>;
+    clearLogs: () => Promise<any>;
+    onLog: (callback: (entry: {
+        time: string;
+        level: string;
+        msg: string;
+    }) => void) => void;
 }
 declare var vncApi: VncApi;
 declare enum ConnectionState {
@@ -60,6 +68,12 @@ declare const btnZoom100: HTMLButtonElement;
 declare const btnFullscreen: HTMLButtonElement;
 declare const btnCtrlAltDel: HTMLButtonElement;
 declare const btnClipboard: HTMLButtonElement;
+declare const btnLog: HTMLButtonElement;
+declare const logPanel: HTMLDivElement;
+declare const logBody: HTMLDivElement;
+declare const logAutoScroll: HTMLInputElement;
+declare const btnLogClear: HTMLButtonElement;
+declare const btnLogClose: HTMLButtonElement;
 declare let isConnected: boolean;
 declare let isFullscreen: boolean;
 declare let zoomLevel: number;
@@ -75,6 +89,14 @@ declare let currentState: ConnectionState;
 declare function init(): void;
 declare function setupEventListeners(): void;
 declare function setupIPCListeners(): void;
+declare function toggleLogPanel(): void;
+declare function clearLogView(): void;
+declare function appendLog(entry: {
+    time: string;
+    level: string;
+    msg: string;
+}): void;
+declare function scrollLogToBottom(): void;
 declare function handleConnect(): void;
 declare function handleDisconnect(): void;
 declare function showConnectionDialog(): void;

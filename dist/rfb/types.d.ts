@@ -111,5 +111,8 @@ export declare const IPC_CHANNELS: {
     readonly SET_ENCODINGS: "rfb:set-encodings";
     readonly SET_PIXEL_FORMAT: "rfb:set-pixel-format";
     readonly SET_DESKTOP_SIZE: "rfb:request-desktop-size";
+    readonly APP_LOG: "app:log";
+    readonly LOG_GET: "app:log:get";
+    readonly LOG_CLEAR: "app:log:clear";
 };
 //# sourceMappingURL=types.d.ts.map
