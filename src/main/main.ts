@@ -130,6 +130,12 @@ function createWindow(): void {
           },
           { type: 'separator' },
           {
+            label: '查看实时日志',
+            accelerator: 'CmdOrCtrl+L',
+            click: () => mainWindow?.webContents.send('menu:show-logs'),
+          },
+          { type: 'separator' },
+          {
             label: '设置...',
             accelerator: 'CmdOrCtrl+,',
             click: () => mainWindow?.webContents.send('menu:show-settings'),
@@ -218,6 +224,12 @@ function createWindow(): void {
                 });
               }
             },
+          },
+          { type: 'separator' },
+          {
+            label: '查看实时日志',
+            accelerator: 'Ctrl+L',
+            click: () => mainWindow?.webContents.send('menu:show-logs'),
           },
           { type: 'separator' },
           {
