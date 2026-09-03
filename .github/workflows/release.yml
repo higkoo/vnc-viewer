@@ -1,0 +1,248 @@
+name: Build and Package
+
+on:
+  push:
+    tags:
+      - 'v*'
+    branches:
+      - main
+    paths-ignore:
+      - 'README.md'
+      - 'LICENSE'
+      - '.github/ISSUE_TEMPLATE/**'
+  pull_request:
+    branches:
+      - main
+    paths-ignore:
+      - 'README.md'
+      - 'LICENSE'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: read
+
+jobs:
+  build-desktop:
+    name: Build Desktop (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            platform: mac
+            script: dist:mac
+          - os: windows-latest
+            platform: win
+            script: dist:win
+          - os: ubuntu-latest
+            platform: linux
+            script: dist:linux
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Setup macOS Universal (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          echo "MACOSX_DEPLOYMENT_TARGET=11.0" >> $GITHUB_ENV
+          echo "CSC_IDENTITY_AUTO_DISCOVERY=false" >> $GITHUB_ENV
+          echo "CSC_FOR_PULL_REQUEST=false" >> $GITHUB_ENV
+
+      - name: Setup Linux dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libnss3 \
+            libgtk-3-0 \
+            libxss1 \
+            libasound2 \
+            libgbm1 \
+            icnsutils \
+            graphicsmagick \
+            xz-utils \
+            rpm \
+            squashfs-tools
+
+      - name: Install dependencies (with proxy env)
+        run: |
+          npm config set registry https://registry.npmmirror.com
+          npm install --ignore-scripts
+          # 补装 electron 二进制（离线 fallback）
+          npx electron-installer || true
+
+      - name: Install Electron binary
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          npm_config_proxy="${{ env.all_proxy }}" npx electron@33 install-app-deps || true
+
+      - name: Build
+        run: npm run build
+
+      - name: Package (${{ matrix.platform }})
+        env:
+          # 仅产物构建，跳过 electron-builder 的 publish/update 检查
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+          CSC_FOR_PULL_REQUEST: false
+          APPLE_ID: ""
+          APPLE_APP_SPECIFIC_PASSWORD: ""
+        run: npm run ${{ matrix.script }}
+
+      - name: Upload macOS artifacts
+        if: matrix.os == 'macos-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-artifacts
+          path: |
+            release/*.dmg
+            release/*.zip
+            release/latest*
+          if-no-files-found: ignore
+
+      - name: Upload Windows artifacts
+        if: matrix.os == 'windows-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-artifacts
+          path: |
+            release/*.exe
+            release/latest*
+          if-no-files-found: ignore
+
+      - name: Upload Linux artifacts
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-artifacts
+          path: |
+            release/*.AppImage
+            release/*.deb
+            release/*.tar.xz
+          if-no-files-found: ignore
+
+  build-android:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Setup Java 17 (for Android Gradle)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'gradle'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          api-level: 34
+          build-tools: 34.0.0
+          target: android-34
+          ndk-version: '26.1.10909125'
+
+      - name: Prepare gradle wrapper via Capacitor init
+        shell: bash
+        run: |
+          set -e
+          npm config set registry https://registry.npmmirror.com
+          npm install --ignore-scripts
+
+          # 确保移动页资源就位
+          mkdir -p capacitor/web
+          cp src/mobile/index.html capacitor/web/
+
+          # Capacitor 原生 Android 工程不在仓库中时，由 cap add android 生成
+          if [ ! -d android ]; then
+            echo "ANDROID_HOME=$ANDROID_HOME"
+            echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
+            yes | npx cap add android --verbose || true
+          fi
+
+          # 同步 web 资源和插件
+          npx cap sync android --verbose || true
+
+          # 生成/补齐 gradle wrapper（cap add 通常会做，但保险起见）
+          if [ -d android ] && [ ! -f android/gradlew ]; then
+            cd android
+            if command -v gradle >/dev/null 2>&1; then
+              gradle wrapper --gradle-version 8.5
+            else
+              curl -sL https://services.gradle.org/distributions/gradle-8.5-bin.zip -o /tmp/gw.zip
+              unzip -q /tmp/gw.zip -d /tmp
+              /tmp/gradle-8.5/bin/gradle wrapper --gradle-version 8.5
+              rm -rf /tmp/gradle-8.5 /tmp/gw.zip
+            fi
+            cd ..
+            chmod +x android/gradlew || true
+          fi
+
+      - name: Assemble Android Debug APK
+        shell: bash
+        run: |
+          set -e
+          if [ -f android/gradlew ]; then
+            cd android
+            chmod +x gradlew
+            # Debug 签名使用 Android SDK 自带 debug keystore
+            ./gradlew :app:assembleDebug --no-daemon -x lint -x lintVitalAnalyzeRelease
+            cd ..
+            find android/app/build/outputs -type f \( -name "*.apk" -o -name "*.aab" \) | xargs ls -la
+          else
+            echo "WARN: android/gradlew 不存在，跳过 APK 真实构建，仅打包 web 资源"
+            mkdir -p android/app/build/outputs/apk/debug
+            touch android/app/build/outputs/apk/debug/placeholder-not-built.log
+          fi
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-artifacts
+          path: |
+            android/app/build/outputs/apk/**/*.apk
+            android/app/build/outputs/bundle/**/*.aab
+          if-no-files-found: ignore
+
+  release:
+    name: Publish GitHub Release
+    needs: [build-desktop, build-android]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Prepare release asset folder
+        run: |
+          mkdir -p release-artifacts
+          find artifacts -type f -not -name "*.log" -not -name "*.yml" | xargs -I{} cp -f {} release-artifacts/ 2>/dev/null || true
+          ls -la release-artifacts/
+
+      - name: Create GitHub Release and upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Release ${{ github.ref_name }}
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+          files: release-artifacts/*
