@@ -52,7 +52,7 @@ function getMimeType(ext) {
     return map[ext] || "application/octet-stream";
 }
 class MobileServer {
-    constructor(port = 5800) {
+    constructor(port = 5933) {
         this.port = port;
         this.httpServer = http.createServer((req, res) => this.handleHttp(req, res));
         this.wss = new ws_1.WebSocketServer({ noServer: true });
