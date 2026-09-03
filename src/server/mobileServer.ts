@@ -153,10 +153,25 @@ export class MobileServer {
   }
 
   start(): void {
-    this.httpServer.listen(this.port, "0.0.0.0", () => {
-      console.log(`[Mobile Server] 运行在 http://0.0.0.0:${this.port}`);
-      console.log(`[Mobile Server] 手机浏览器打开 http://<本机IP>:${this.port}`);
-    });
+    // 端口被占用时自动尝试下一个端口，避免 EADDRINUSE 导致主进程崩溃
+    const tryListen = (attempt: number) => {
+      const port = this.port + attempt;
+      this.httpServer.removeAllListeners("error");
+      this.httpServer.once("error", (err: NodeJS.ErrnoException) => {
+        if (err.code === "EADDRINUSE" && attempt < 20) {
+          console.warn(`[Mobile Server] 端口 ${port} 被占用，尝试端口 ${port + 1}`);
+          tryListen(attempt + 1);
+        } else {
+          console.error(`[Mobile Server] 启动失败: ${err.message}`);
+        }
+      });
+      this.httpServer.listen(port, "0.0.0.0", () => {
+        this.port = port;
+        console.log(`[Mobile Server] 运行在 http://0.0.0.0:${this.port}`);
+        console.log(`[Mobile Server] 手机浏览器打开 http://<本机IP>:${this.port}`);
+      });
+    };
+    tryListen(0);
   }
 
   stop(): void {

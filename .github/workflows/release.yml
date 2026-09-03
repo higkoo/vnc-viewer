@@ -74,6 +74,19 @@ jobs:
           echo "::: verify fakeroot: $(which fakeroot || echo MISSING)"
           echo "::: verify dpkg-deb: $(which dpkg-deb || echo MISSING)"
 
+      # 根据当前 ref 设置 package.json 版本号，让产物版本与 tag 一致
+      #   tag v0.0.6 -> 版本 0.0.6；推 main -> nightly.<sha前7位>
+      - name: Set package version
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VER="${GITHUB_REF_NAME#v}"
+          else
+            VER="0.0.0-nightly.${GITHUB_SHA:0:7}"
+          fi
+          export VER
+          node -e "const fs=require('fs');const j=JSON.parse(fs.readFileSync('package.json'));j.version=process.env.VER;fs.writeFileSync('package.json',JSON.stringify(j,null,2));"
+          echo "package.json version => $(node -p "require('./package.json').version")"
+
       - name: Install dependencies
         run: npm install --ignore-scripts
 
