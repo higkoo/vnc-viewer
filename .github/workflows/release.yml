@@ -60,23 +60,14 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            libnss3 \
-            libatk1.0-0 \
-            libatk-bridge2.0-0 \
-            libcups2 \
-            libdrm2 \
-            libxkbcommon0 \
-            libxcomposite1 \
-            libxdamage1 \
-            libxfixes3 \
-            libxrandr2 \
-            libgbm1 \
-            libpango-1.0-0 \
-            libcairo2 \
-            libasound2t64 \
-            rpm \
-            squashfs-tools
+          # 逐包安装并容错，避免单个包名缺失导致整体失败
+          for pkg in \
+            libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
+            libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \
+            libgbm1 libpango-1.0-0 libcairo2 rpm squashfs-tools fakeroot \
+            libasound2t64 libasound2 libfuse2t64 libfuse2 fuse; do
+            sudo apt-get install -y "$pkg" 2>/dev/null || echo "::: skip $pkg"
+          done
 
       - name: Install dependencies
         run: npm install --ignore-scripts
@@ -142,10 +133,9 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
         with:
-          api-level: 34
-          build-tools: 34.0.0
-          target: android-34
-          ndk-version: '26.1.10909125'
+          cmdline-tools-version: 'latest'
+          packages: 'platform-tools platforms;android-34 build-tools;34.0.0'
+          accept-android-sdk-licenses: true
 
       - name: Install dependencies
         run: npm install --ignore-scripts
@@ -158,42 +148,46 @@ jobs:
           mkdir -p capacitor/web
           cp src/mobile/index.html capacitor/web/
 
+          echo "ANDROID_HOME=${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          export ANDROID_HOME="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          export ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+
           # 生成 Capacitor Android 原生工程
           if [ ! -d android ]; then
-            echo "ANDROID_HOME=$ANDROID_HOME"
-            echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
-            yes | npx cap add android || true
+            yes | npx cap add android 2>&1 | tail -40 || { echo "::: cap add android 失败，输出以上日志"; }
           fi
 
           # 同步 web 资源到 Android 工程
-          npx cap sync android || true
+          npx cap sync android 2>&1 | tail -40 || true
 
-          # 确保 gradlew 可执行
+          # 确保 gradlew 存在
           if [ -f android/gradlew ]; then
             chmod +x android/gradlew
+          else
+            echo "::: android/gradlew 未生成，尝试安装 gradle 生成 wrapper"
+            which gradle >/dev/null 2>&1 || sudo apt-get install -y gradle || true
           fi
 
       - name: Assemble Android Debug APK
         shell: bash
         run: |
           set -e
+          export ANDROID_HOME="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          export ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
           if [ -f android/gradlew ]; then
             cd android
             chmod +x gradlew
-            ./gradlew :app:assembleDebug --no-daemon -x lint -x lintVitalAnalyzeRelease || {
-              echo "Gradle build failed, checking for alternative gradle..."
-              # 尝试安装 gradle 并生成 wrapper
-              if [ ! -f gradlew ]; then
-                curl -sL https://services.gradle.org/distributions/gradle-8.5-bin.zip -o /tmp/gw.zip
-                unzip -q /tmp/gw.zip -d /tmp
-                /tmp/gradle-8.5/bin/gradle wrapper --gradle-version 8.5
-                rm -rf /tmp/gradle-8.5 /tmp/gw.zip
-                chmod +x gradlew
-                ./gradlew :app:assembleDebug --no-daemon -x lint -x lintVitalAnalyzeRelease
-              fi
+            # 首次在本机生成 wrapper（如缺失）
+            ./gradlew --version >/dev/null 2>&1 || {
+              echo "::: gradlew 不可用，重新生成 wrapper"
+              cd .. && rm -rf android/gradle/wrapper/gradle-wrapper.jar android/gradlew && cd android
+              gradle wrapper --gradle-version 8.5 2>&1 | tail -20 || true
+              chmod +x gradlew
             }
+            ./gradlew :app:assembleDebug --no-daemon -x lint 2>&1 | tail -60
             cd ..
-            find android/app/build/outputs -type f \( -name "*.apk" -o -name "*.aab" \) | xargs ls -la
+            echo "::: APK 产物:"
+            find android/app/build/outputs -type f \( -name "*.apk" -o -name "*.aab" \) | xargs ls -la 2>/dev/null || echo "未找到 APK"
           else
             echo "WARN: android/gradlew 不存在，跳过 APK 构建"
             mkdir -p android/app/build/outputs/apk/debug
