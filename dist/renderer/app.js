@@ -51,6 +51,12 @@ const logBody = getEl('log-body');
 const logAutoScroll = getEl('log-autoscroll');
 const btnLogClear = getEl('btn-log-clear');
 const btnLogClose = getEl('btn-log-close');
+// 设置对话框
+const settingsDialog = getEl('settings-dialog');
+const settingsPortInput = getEl('settings-mobile-port');
+const settingsErrorMsg = getEl('settings-error-msg');
+const btnSettingsSave = getEl('btn-settings-save');
+const btnSettingsCancel = getEl('btn-settings-cancel');
 // ---- 状态变量 ----
 let isConnected = false;
 let isFullscreen = false;
@@ -109,6 +115,13 @@ function setupEventListeners() {
     btnLog.addEventListener('click', toggleLogPanel);
     btnLogClose.addEventListener('click', toggleLogPanel);
     btnLogClear.addEventListener('click', clearLogView);
+    // 设置对话框
+    btnSettingsSave.addEventListener('click', saveSettings);
+    btnSettingsCancel.addEventListener('click', closeSettings);
+    settingsPortInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter')
+            saveSettings();
+    });
     // 画布鼠标事件
     canvas.addEventListener('mousedown', handleMouseDown);
     canvas.addEventListener('mouseup', handleMouseUp);
@@ -190,6 +203,11 @@ function setupIPCListeners() {
     vncApi.onMenuZoomFit(() => setZoomMode('fit'));
     vncApi.onMenuZoom100(() => setZoomMode('100'));
     vncApi.onMenuShowLogs(() => toggleLogPanel());
+    vncApi.onMenuShowSettings(() => showSettings());
+    // 端口变化通知（主进程重启后）
+    vncApi.onMobilePortChanged((port) => {
+        settingsPortInput.value = String(port);
+    });
 }
 // ---- 实时日志面板 ----
 function toggleLogPanel() {
@@ -230,6 +248,39 @@ function appendLog(entry) {
 }
 function scrollLogToBottom() {
     logBody.scrollTop = logBody.scrollHeight;
+}
+// ---- 设置对话框 ----
+function showSettings() {
+    settingsErrorMsg.textContent = '';
+    // 从主进程加载当前配置
+    vncApi.getSettings().then((config) => {
+        settingsPortInput.value = String(config.mobilePort || 5933);
+    });
+    settingsDialog.classList.remove('hidden');
+    settingsPortInput.focus();
+    settingsPortInput.select();
+}
+function closeSettings() {
+    settingsDialog.classList.add('hidden');
+    settingsErrorMsg.textContent = '';
+}
+function saveSettings() {
+    const port = parseInt(settingsPortInput.value);
+    if (isNaN(port) || port < 1024 || port > 65535) {
+        settingsErrorMsg.textContent = '端口范围: 1024-65535';
+        return;
+    }
+    settingsErrorMsg.textContent = '';
+    btnSettingsSave.disabled = true;
+    btnSettingsSave.textContent = '保存中...';
+    vncApi.setSettings({ mobilePort: port }).then(() => {
+        closeSettings();
+    }).catch((err) => {
+        settingsErrorMsg.textContent = `保存失败: ${err.message}`;
+    }).finally(() => {
+        btnSettingsSave.disabled = false;
+        btnSettingsSave.textContent = '保存';
+    });
 }
 // ---- 连接管理 ----
 function handleConnect() {

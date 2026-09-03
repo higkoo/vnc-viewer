@@ -96,5 +96,9 @@ exports.IPC_CHANNELS = {
     APP_LOG: 'app:log',
     LOG_GET: 'app:log:get',
     LOG_CLEAR: 'app:log:clear',
+    // 设置
+    GET_SETTINGS: 'app:settings:get',
+    SET_SETTINGS: 'app:settings:set',
+    MOBILE_PORT_CHANGED: 'app:mobile-port-changed',
 };
 //# sourceMappingURL=types.js.map

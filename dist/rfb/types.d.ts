@@ -3,7 +3,7 @@
  * 参考: RFC 6143 - The Remote Framebuffer Protocol
  * 参考: UltraVNC 实现 (rfb/rfbproto.h)
  */
-export declare const RFB_VERSIONS: readonly ["003.003", "003.007", "003.008"];
+export declare const RFB_VERSIONS: readonly ['003.003', '003.007', '003.008'];
 export type RfbVersion = typeof RFB_VERSIONS[number];
 export declare enum SecurityType {
     Invalid = 0,
@@ -97,22 +97,25 @@ export declare enum ConnectionState {
     Error = 8
 }
 export declare const IPC_CHANNELS: {
-    readonly CONNECT: "rfb:connect";
-    readonly DISCONNECT: "rfb:disconnect";
-    readonly KEY_EVENT: "rfb:key-event";
-    readonly POINTER_EVENT: "rfb:pointer-event";
-    readonly CUT_TEXT: "rfb:cut-text";
-    readonly FRAMEBUFFER_UPDATE: "rfb:framebuffer-update";
-    readonly CONNECTION_STATE: "rfb:connection-state";
-    readonly SERVER_INFO: "rfb:server-info";
-    readonly BELL: "rfb:bell";
-    readonly CLIPBOARD: "rfb:clipboard";
-    readonly ERROR: "rfb:error";
-    readonly SET_ENCODINGS: "rfb:set-encodings";
-    readonly SET_PIXEL_FORMAT: "rfb:set-pixel-format";
-    readonly SET_DESKTOP_SIZE: "rfb:request-desktop-size";
-    readonly APP_LOG: "app:log";
-    readonly LOG_GET: "app:log:get";
-    readonly LOG_CLEAR: "app:log:clear";
+    readonly CONNECT: 'rfb:connect';
+    readonly DISCONNECT: 'rfb:disconnect';
+    readonly KEY_EVENT: 'rfb:key-event';
+    readonly POINTER_EVENT: 'rfb:pointer-event';
+    readonly CUT_TEXT: 'rfb:cut-text';
+    readonly FRAMEBUFFER_UPDATE: 'rfb:framebuffer-update';
+    readonly CONNECTION_STATE: 'rfb:connection-state';
+    readonly SERVER_INFO: 'rfb:server-info';
+    readonly BELL: 'rfb:bell';
+    readonly CLIPBOARD: 'rfb:clipboard';
+    readonly ERROR: 'rfb:error';
+    readonly SET_ENCODINGS: 'rfb:set-encodings';
+    readonly SET_PIXEL_FORMAT: 'rfb:set-pixel-format';
+    readonly SET_DESKTOP_SIZE: 'rfb:request-desktop-size';
+    readonly APP_LOG: 'app:log';
+    readonly LOG_GET: 'app:log:get';
+    readonly LOG_CLEAR: 'app:log:clear';
+    readonly GET_SETTINGS: 'app:settings:get';
+    readonly SET_SETTINGS: 'app:settings:set';
+    readonly MOBILE_PORT_CHANGED: 'app:mobile-port-changed';
 };
 //# sourceMappingURL=types.d.ts.map

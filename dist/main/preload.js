@@ -20,6 +20,12 @@ const api = {
     onLog: (callback) => {
         electron_1.ipcRenderer.on(types_1.IPC_CHANNELS.APP_LOG, (_event, entry) => callback(entry));
     },
+    // 设置
+    getSettings: () => electron_1.ipcRenderer.invoke(types_1.IPC_CHANNELS.GET_SETTINGS),
+    setSettings: (settings) => electron_1.ipcRenderer.invoke(types_1.IPC_CHANNELS.SET_SETTINGS, settings),
+    onMobilePortChanged: (callback) => {
+        electron_1.ipcRenderer.on(types_1.IPC_CHANNELS.MOBILE_PORT_CHANGED, (_event, port) => callback(port));
+    },
     // 事件监听
     onFramebufferUpdate: (callback) => {
         electron_1.ipcRenderer.on(types_1.IPC_CHANNELS.FRAMEBUFFER_UPDATE, (_event, rect) => callback(rect));
@@ -62,6 +68,9 @@ const api = {
     },
     onMenuShowLogs: (callback) => {
         electron_1.ipcRenderer.on('menu:show-logs', () => callback());
+    },
+    onMenuShowSettings: (callback) => {
+        electron_1.ipcRenderer.on('menu:show-settings', () => callback());
     },
 };
 electron_1.contextBridge.exposeInMainWorld('vncApi', api);

@@ -39,6 +39,7 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", { value: true });
 const electron_1 = require("electron");
 const path = __importStar(require("path"));
+const fs = __importStar(require("fs"));
 const client_1 = require("../rfb/client");
 const types_1 = require("../rfb/types");
 const mobileServer_1 = require("../server/mobileServer");
@@ -47,6 +48,40 @@ let mainWindow = null;
 let rfbClient = null;
 let currentConnectionParams = null;
 let mobileServer = null;
+// ---- 配置管理 ----
+const CONFIG_PATH = path.join(electron_1.app.getPath('userData'), 'config.json');
+function loadConfig() {
+    try {
+        if (fs.existsSync(CONFIG_PATH)) {
+            const data = fs.readFileSync(CONFIG_PATH, 'utf8');
+            return JSON.parse(data);
+        }
+    }
+    catch (e) {
+        (0, logger_1.warn)(`读取配置文件失败: ${e}`);
+    }
+    return { mobilePort: 5933 };
+}
+function saveConfig(config) {
+    try {
+        const dir = path.dirname(CONFIG_PATH);
+        if (!fs.existsSync(dir))
+            fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), 'utf8');
+    }
+    catch (e) {
+        (0, logger_1.error)(`保存配置文件失败: ${e}`);
+    }
+}
+function restartMobileServer(port) {
+    if (mobileServer) {
+        mobileServer.stop();
+        mobileServer = null;
+    }
+    mobileServer = new mobileServer_1.MobileServer(port);
+    mobileServer.start();
+    (0, logger_1.info)(`手机代理已重启，端口: ${port}`);
+}
 function createWindow() {
     mainWindow = new electron_1.BrowserWindow({
         width: 1024,
@@ -115,6 +150,12 @@ function createWindow() {
                                 });
                             }
                         },
+                    },
+                    { type: 'separator' },
+                    {
+                        label: '设置...',
+                        accelerator: 'CmdOrCtrl+,',
+                        click: () => mainWindow?.webContents.send('menu:show-settings'),
                     },
                 ],
             },
@@ -200,6 +241,12 @@ function createWindow() {
                                 });
                             }
                         },
+                    },
+                    { type: 'separator' },
+                    {
+                        label: '设置',
+                        accelerator: 'Ctrl+,',
+                        click: () => mainWindow?.webContents.send('menu:show-settings'),
                     },
                 ],
             },
@@ -302,6 +349,18 @@ function setupIPC() {
         (0, logger_1.clearLogs)();
         return { success: true };
     });
+    // ---- 设置 ----
+    electron_1.ipcMain.handle(types_1.IPC_CHANNELS.GET_SETTINGS, async () => loadConfig());
+    electron_1.ipcMain.handle(types_1.IPC_CHANNELS.SET_SETTINGS, async (_event, settings) => {
+        const old = loadConfig();
+        saveConfig(settings);
+        (0, logger_1.info)(`设置已更新: 手机代理端口 ${old.mobilePort} → ${settings.mobilePort}`);
+        if (settings.mobilePort !== old.mobilePort) {
+            restartMobileServer(settings.mobilePort);
+            mainWindow?.webContents.send(types_1.IPC_CHANNELS.MOBILE_PORT_CHANGED, settings.mobilePort);
+        }
+        return { success: true };
+    });
 }
 // 连接状态的中文描述，便于日志查看
 function connectionStateLabel(state) {
@@ -330,8 +389,9 @@ electron_1.app.whenReady().then(() => {
     createWindow();
     (0, logger_1.info)('VNC Viewer 已启动');
     (0, logger_1.info)(`平台: ${process.platform} ${process.arch}`);
-    // 启动手机代理服务器
-    mobileServer = new mobileServer_1.MobileServer();
+    // 启动手机代理服务器（使用配置中的端口）
+    const config = loadConfig();
+    mobileServer = new mobileServer_1.MobileServer(config.mobilePort);
     mobileServer.start();
     electron_1.app.on('activate', () => {
         if (electron_1.BrowserWindow.getAllWindows().length === 0) {

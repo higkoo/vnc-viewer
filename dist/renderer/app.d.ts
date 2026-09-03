@@ -22,6 +22,7 @@ interface VncApi {
     onMenuZoomFit: (callback: () => void) => void;
     onMenuZoom100: (callback: () => void) => void;
     onMenuShowLogs: (callback: () => void) => void;
+    onMenuShowSettings: (callback: () => void) => void;
     getLogs: () => Promise<any>;
     clearLogs: () => Promise<any>;
     onLog: (callback: (entry: {
@@ -29,6 +30,9 @@ interface VncApi {
         level: string;
         msg: string;
     }) => void) => void;
+    getSettings: () => Promise<any>;
+    setSettings: (settings: any) => Promise<any>;
+    onMobilePortChanged: (callback: (port: number) => void) => void;
 }
 declare var vncApi: VncApi;
 declare enum ConnectionState {
@@ -74,6 +78,11 @@ declare const logBody: HTMLDivElement;
 declare const logAutoScroll: HTMLInputElement;
 declare const btnLogClear: HTMLButtonElement;
 declare const btnLogClose: HTMLButtonElement;
+declare const settingsDialog: HTMLDivElement;
+declare const settingsPortInput: HTMLInputElement;
+declare const settingsErrorMsg: HTMLDivElement;
+declare const btnSettingsSave: HTMLButtonElement;
+declare const btnSettingsCancel: HTMLButtonElement;
 declare let isConnected: boolean;
 declare let isFullscreen: boolean;
 declare let zoomLevel: number;
@@ -97,6 +106,9 @@ declare function appendLog(entry: {
     msg: string;
 }): void;
 declare function scrollLogToBottom(): void;
+declare function showSettings(): void;
+declare function closeSettings(): void;
+declare function saveSettings(): void;
 declare function handleConnect(): void;
 declare function handleDisconnect(): void;
 declare function showConnectionDialog(): void;
