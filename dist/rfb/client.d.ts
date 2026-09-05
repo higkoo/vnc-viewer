@@ -22,6 +22,10 @@ export declare class RfbClient extends EventEmitter {
     private buffer;
     updateState(state: ConnectionState): void;
     getParams(): ConnectionParams;
+    /** 从 buffer 中读取 n 字节，并移除已读部分 */
+    readBuffer(n: number): Buffer | null;
+    /** 获取 buffer 当前长度 */
+    bufferLength(): number;
     constructor();
     getState(): ConnectionState;
     getFbWidth(): number;
@@ -74,6 +78,7 @@ export declare class RfbClient extends EventEmitter {
     send(data: Buffer): void;
     /**
      * 处理接收到的数据
+     * 循环处理，直到缓冲区数据不足或状态不再变化
      */
     private processData;
     /**
