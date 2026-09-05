@@ -40,6 +40,15 @@ export class RfbClient extends EventEmitter {
   // 公开方法用于 handshake 模块
   updateState(state: ConnectionState): void { this.setState(state); }
   getParams(): ConnectionParams { return this.params; }
+  /** 从 buffer 中读取 n 字节，并移除已读部分 */
+  readBuffer(n: number): Buffer | null {
+    if (this.buffer.length < n) return null;
+    const data = this.buffer.slice(0, n);
+    this.buffer = this.buffer.slice(n);
+    return data;
+  }
+  /** 获取 buffer 当前长度 */
+  bufferLength(): number { return this.buffer.length; }
 
   constructor() {
     super();
@@ -86,7 +95,7 @@ export class RfbClient extends EventEmitter {
     this.socket.on('connect', () => {
       this.buffer = Buffer.alloc(0);
       this.setState(ConnectionState.ProtocolVersion);
-      this.handshake.startProtocolVersionHandshake();
+      // processData 会在 socket.on('data') 中自动调用
     });
 
     this.socket.on('data', (data: Buffer) => {
@@ -284,28 +293,32 @@ export class RfbClient extends EventEmitter {
 
   /**
    * 处理接收到的数据
+   * 循环处理，直到缓冲区数据不足或状态不再变化
    */
   private processData(): void {
-    if (this.buffer.length === 0) return;
-
-    switch (this.state) {
-      case ConnectionState.ProtocolVersion:
-        this.handshake.processProtocolVersion();
-        break;
-      case ConnectionState.Security:
-        this.handshake.processSecurity();
-        break;
-      case ConnectionState.Authentication:
-        this.handshake.processAuthentication();
-        break;
-      case ConnectionState.ServerInit:
-        this.handshake.processServerInit();
-        break;
-      case ConnectionState.Connected:
-        this.processServerMessage();
-        break;
-      default:
-        break;
+    while (this.buffer.length > 0) {
+      const prevLen = this.buffer.length;
+      switch (this.state) {
+        case ConnectionState.ProtocolVersion:
+          this.handshake.processProtocolVersion();
+          break;
+        case ConnectionState.Security:
+          this.handshake.processSecurity();
+          break;
+        case ConnectionState.Authentication:
+          this.handshake.processAuthentication();
+          break;
+        case ConnectionState.ServerInit:
+          this.handshake.processServerInit();
+          break;
+        case ConnectionState.Connected:
+          this.processServerMessage();
+          break;
+        default:
+          return;
+      }
+      // 如果缓冲区没有变化，说明数据不足，等待下一次 data 事件
+      if (this.buffer.length === prevLen) break;
     }
   }
 

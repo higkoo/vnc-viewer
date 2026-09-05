@@ -2,6 +2,9 @@
  * RFB 协议握手和认证
  * 参考 UltraVNC vncviewer/ClientConnection.cpp
  * 参考 RFC 6143 Section 7.1
+ *
+ * 所有数据读取均通过 client.readBuffer() 从缓冲区读取，
+ * 不再直接读取 socket，以兼容 client.ts 的 data 事件处理机制。
  */
 
 import * as crypto from 'crypto';
@@ -11,12 +14,7 @@ import { SecurityType, ConnectionState, RFB_VERSIONS, RfbVersion } from './types
 export class RfbHandshake {
   private client: RfbClient;
   private securityTypes: SecurityType[] = [];
-  private authChallenge: Buffer | null = null;
-
-  // DES 密码用于 VNC 认证 (VNC 使用反向 DES)
-  private static readonly VNC_PASSWORD_KEY = Buffer.from([
-    0x23, 0x82, 0x07, 0x6a, 0x63, 0x2b, 0x55, 0x52,
-  ]);
+  private authChallengeSent: boolean = false;
 
   constructor(client: RfbClient) {
     this.client = client;
@@ -27,15 +25,8 @@ export class RfbHandshake {
    * 服务器发送: "RFB XXX.XXX\n" (12字节)
    * 客户端回复: "RFB XXX.XXX\n" (使用双方都支持的版本)
    */
-  startProtocolVersionHandshake(): void {
-    // 等待服务器发送协议版本
-    this.client.getSocket()?.once('data', () => {
-      this.processProtocolVersion();
-    });
-  }
-
   processProtocolVersion(): void {
-    const buf = this.client.getSocket()?.read(12);
+    const buf = this.client.readBuffer(12);
     if (!buf) return;
 
     const versionStr = buf.toString('ascii', 0, 12).trim();
@@ -74,9 +65,6 @@ export class RfbHandshake {
    * RFB 3.7+: 服务器发送 1-byte 安全类型数量 + 类型列表
    */
   processSecurity(): void {
-    const socket = this.client.getSocket();
-    if (!socket) return;
-
     const version = this.client.getServerVersion();
 
     switch (version) {
@@ -94,17 +82,11 @@ export class RfbHandshake {
   }
 
   private processSecurityV33(): void {
-    const socket = this.client.getSocket()!;
-    // 4-byte 安全类型
-    const buf = socket.read(4);
-    if (!buf) {
-      socket.once('readable', () => this.processSecurityV33());
-      return;
-    }
+    const buf = this.client.readBuffer(4);
+    if (!buf) return;
 
     const secType = buf.readUInt32BE(0);
     if (secType === 0) {
-      // 连接失败
       this.readConnectionFailed();
       return;
     }
@@ -114,27 +96,17 @@ export class RfbHandshake {
   }
 
   private processSecurityV37(): void {
-    const socket = this.client.getSocket()!;
-    // 1-byte 安全类型数量
-    const numBuf = socket.read(1);
-    if (!numBuf) {
-      socket.once('readable', () => this.processSecurityV37());
-      return;
-    }
+    const numBuf = this.client.readBuffer(1);
+    if (!numBuf) return;
 
     const numTypes = numBuf[0];
     if (numTypes === 0) {
-      // 连接失败
       this.readConnectionFailed();
       return;
     }
 
-    // 读取安全类型列表
-    const typesBuf = socket.read(numTypes);
-    if (!typesBuf) {
-      socket.once('readable', () => this.processSecurityV37());
-      return;
-    }
+    const typesBuf = this.client.readBuffer(numTypes);
+    if (!typesBuf) return;
 
     this.securityTypes = [];
     for (let i = 0; i < numTypes; i++) {
@@ -147,18 +119,11 @@ export class RfbHandshake {
   }
 
   private readConnectionFailed(): void {
-    const socket = this.client.getSocket()!;
-    const reasonLenBuf = socket.read(4);
-    if (!reasonLenBuf) {
-      socket.once('readable', () => this.readConnectionFailed());
-      return;
-    }
+    const reasonLenBuf = this.client.readBuffer(4);
+    if (!reasonLenBuf) return;
     const reasonLen = reasonLenBuf.readUInt32BE(0);
-    const reasonBuf = socket.read(reasonLen);
-    if (!reasonBuf) {
-      socket.once('readable', () => this.readConnectionFailed());
-      return;
-    }
+    const reasonBuf = this.client.readBuffer(reasonLen);
+    if (!reasonBuf) return;
     this.client.emitError(`连接被拒绝: ${reasonBuf.toString('utf8')}`);
   }
 
@@ -204,17 +169,23 @@ export class RfbHandshake {
    * 阶段 3: 认证
    */
   private handleAuthentication(type: SecurityType): void {
-    this.client.updateState(ConnectionState.Authentication);
-
     switch (type) {
       case SecurityType.None:
-        this.handleAuthNone();
+        console.log('[RFB] None 认证');
+        this.client.updateState(ConnectionState.ClientInit);
+        this.sendClientInit();
         break;
       case SecurityType.VncAuth:
-        this.handleAuthVnc();
+        console.log('[RFB] VNC 认证 - 等待挑战码');
+        this.authChallengeSent = false;
+        this.client.updateState(ConnectionState.Authentication);
+        // processAuthentication 会在数据到达时由 processData 调用
+        // 它会先读 16 字节挑战码，再读 4 字节安全结果
         break;
       case SecurityType.MSLogon:
-        this.handleAuthMSLogon();
+        console.log('[RFB] MS-Logon 认证简化处理');
+        this.client.updateState(ConnectionState.ClientInit);
+        this.sendClientInit();
         break;
       default:
         this.client.emitError(`不支持的安全类型: ${SecurityType[type]}`);
@@ -222,67 +193,10 @@ export class RfbHandshake {
     }
   }
 
-  private handleAuthNone(): void {
-    // None 认证: 直接检查安全结果
-    this.client.updateState(ConnectionState.ClientInit);
-    this.sendClientInit();
-  }
-
-  private handleAuthVnc(): void {
-    const socket = this.client.getSocket()!;
-    // 服务器发送 16 字节挑战码
-    const challenge = socket.read(16);
-    if (!challenge) {
-      socket.once('readable', () => this.handleAuthVnc());
-      return;
-    }
-
-    this.authChallenge = challenge;
-
-    // 使用密码加密挑战码 (VNC 认证: 反向 DES)
-    const password = this.getPassword();
-    if (!password) {
-      this.client.emitError('需要密码');
-      return;
-    }
-
-    // 准备密码: 截断或填充到8字节
-    const keyBuf = Buffer.alloc(8, 0);
-    const pwd = Buffer.from(password, 'utf8');
-    pwd.copy(keyBuf, 0, 0, Math.min(pwd.length, 8));
-
-    // 翻转密码字节的位 (UltraVNC 兼容)
-    for (let i = 0; i < 8; i++) {
-      keyBuf[i] = this.reverseBits(keyBuf[i]);
-    }
-
-    // DES ECB 加密
-    const cipher = crypto.createCipheriv('des-ecb', keyBuf, null as any);
-    cipher.setAutoPadding(false);
-    const encrypted = Buffer.concat([
-      cipher.update(challenge),
-      cipher.final(),
-    ]);
-
-    this.client.send(encrypted);
-
-    // 等待安全结果
-    this.client.updateState(ConnectionState.ClientInit);
-    // 检查安全结果
-    setTimeout(() => this.sendClientInit(), 100);
-  }
-
   private handleAuthMSLogon(): void {
-    // UltraVNC MS-Logon 认证简化处理
-    // 完整实现需要 NTLM 认证
-    // 这里使用 VNC 认证作为降级
     console.log('[RFB] MS-Logon 认证简化处理');
     this.client.updateState(ConnectionState.ClientInit);
     this.sendClientInit();
-  }
-
-  private getPassword(): string | undefined {
-    return this.client.getParams().password;
   }
 
   private reverseBits(b: number): number {
@@ -294,36 +208,66 @@ export class RfbHandshake {
   }
 
   /**
-   * 处理认证阶段的后续数据
-   * 在 VNC 认证中，发送加密挑战后需要读取安全结果
+   * 处理认证阶段数据，分两步：
+   * 1. 读 16 字节挑战码 → 发送加密响应
+   * 2. 读 4 字节安全结果 → 成功则进入 ClientInit
    */
   processAuthentication(): void {
-    const socket = this.client.getSocket();
-    if (!socket) return;
+    if (!this.authChallengeSent) {
+      // 第一步：读 16 字节挑战码
+      const challenge = this.client.readBuffer(16);
+      if (!challenge) return;
 
-    // 读取安全结果 (4-byte: 0=成功, 非0=失败)
-    const result = socket.read(4);
-    if (!result) {
-      socket.once('readable', () => this.processAuthentication());
+      const password = this.client.getParams().password;
+      if (!password) {
+        this.client.emitError('需要密码');
+        return;
+      }
+
+      // 准备密码: 截断或填充到8字节
+      const keyBuf = Buffer.alloc(8, 0);
+      const pwd = Buffer.from(password, 'utf8');
+      pwd.copy(keyBuf, 0, 0, Math.min(pwd.length, 8));
+
+      // 翻转密码字节的位 (UltraVNC 兼容)
+      for (let i = 0; i < 8; i++) {
+        keyBuf[i] = this.reverseBits(keyBuf[i]);
+      }
+
+      // DES ECB 加密
+      const cipher = crypto.createCipheriv('des-ecb', keyBuf, null as any);
+      cipher.setAutoPadding(false);
+      const encrypted = Buffer.concat([
+        cipher.update(challenge),
+        cipher.final(),
+      ]);
+
+      this.client.send(encrypted);
+      this.authChallengeSent = true;
+      console.log('[RFB] 已发送加密挑战码，等待安全结果');
       return;
     }
 
+    // 第二步：读 4 字节安全结果
+    const result = this.client.readBuffer(4);
+    if (!result) return;
+
     const status = result.readUInt32BE(0);
     if (status !== 0) {
-      // 认证失败，读取错误信息
-      const reasonLen = socket.read(4);
-      if (reasonLen) {
-        const len = reasonLen.readUInt32BE(0);
-        const reason = socket.read(len);
+      const reasonLenBuf = this.client.readBuffer(4);
+      if (reasonLenBuf) {
+        const len = reasonLenBuf.readUInt32BE(0);
+        const reason = this.client.readBuffer(len);
         if (reason) {
           this.client.emitError(`认证失败: ${reason.toString('utf8')}`);
+          return;
         }
       }
       this.client.emitError('VNC 认证失败');
       return;
     }
 
-    // 认证成功，进入客户端初始化
+    console.log('[RFB] VNC 认证成功');
     this.client.updateState(ConnectionState.ClientInit);
     this.sendClientInit();
   }
@@ -347,15 +291,8 @@ export class RfbHandshake {
    * 接收: framebuffer width, height, pixel format, name
    */
   processServerInit(): void {
-    const socket = this.client.getSocket()!;
-    if (!socket) return;
-
-    // 需要至少 24 字节: 2+2 + 16(pixel format) + 4(name length)
-    const header = socket.read(24);
-    if (!header) {
-      socket.once('readable', () => this.processServerInit());
-      return;
-    }
+    const header = this.client.readBuffer(24);
+    if (!header) return;
 
     const fbWidth = header.readUInt16BE(0);
     const fbHeight = header.readUInt16BE(2);
@@ -376,13 +313,8 @@ export class RfbHandshake {
     const nameLen = header.readUInt32BE(20);
 
     // 读取桌面名称
-    const nameBuf = socket.read(nameLen);
-    if (!nameBuf) {
-      // 如果数据不足，重新尝试
-      socket.unshift(header);
-      socket.once('readable', () => this.processServerInit());
-      return;
-    }
+    const nameBuf = this.client.readBuffer(nameLen);
+    if (!nameBuf) return;
 
     const name = nameBuf.toString('utf8', 0, nameLen);
 
