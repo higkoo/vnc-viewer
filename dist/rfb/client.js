@@ -364,122 +364,174 @@ class RfbClient extends events_1.EventEmitter {
     }
     /**
      * 处理 FramebufferUpdate 消息
+     *
+     * 采用「先完整解析整帧、再统一处理」的两阶段模型，消除 TCP 分片边界处
+     * 的状态错乱：
+     *
+     * 旧模型按数据到达即时消费矩形，并把已处理前缀从接收缓冲区移除；若某
+     * 个矩形恰好被 TCP 分片截断，会保留消息头等剩余分片，但消息头里的
+     * numRects 是整帧矩形总数，重解析时矩形数会与剩余数据不匹配，导致漏帧、
+     * 花屏甚至永久卡死；已喂入 ZRLE 累积流的压缩数据也可能被重复喂入而
+     * 解码错乱。
+     *
+     * 新模型第一阶段只确认每个矩形（含 ZRLE 压缩块、伪编码附加数据）已
+     * 完整到达并暂存，任一矩形不完整就返回 false，不做任何消费或副作用，
+     * 等后续分片补齐后重头解析；第二阶段整帧齐备后统一解码/派发，最后
+     * 一次性消费整帧字节。代价是帧要收齐才渲染，但 VNC 帧远小于 TCP 窗口，
+     * 实际延迟影响可忽略。
      */
     processFramebufferUpdate() {
+        try {
+            return this.processFramebufferUpdateInner();
+        }
+        catch (err) {
+            // 单帧解码异常（如服务器发送了非法/不支持的编码数据）不应拖垮整个连接：
+            // 丢弃本帧与累积解压状态，请求一次全量刷新以重新同步画面。
+            console.error('[RFB] 解码帧失败，请求全量刷新:', err);
+            this.encoders.resetStreams();
+            this.buffer = Buffer.alloc(0);
+            this.emit('framebuffer-resync');
+            return false;
+        }
+    }
+    /** 帧解析主体（模型说明见 processFramebufferUpdate） */
+    processFramebufferUpdateInner() {
         // 消息结构: 1-byte msg-type(0), 1-byte padding, 2-byte number-of-rectangles
         if (this.buffer.length < 4)
             return false;
         const numRects = this.buffer.readUInt16BE(2);
         // numRects 为 0xFFFF 表示"持续更新"模式：一直读取矩形，直到 LastRect 伪编码
         const continuous = numRects === 0xFFFF;
-        let offset = 4;
-        let safeOffset = 4; // 已完整处理的数据末尾，用于增量推进缓冲区
+        const pending = [];
+        let cursor = 4;
         let handled = 0;
         let lastRect = false;
-        /**
-         * 推进已处理数据，等待后续分片。
-         * 注意：一条消息可能跨多个 TCP 分片，推进时必须保留 4 字节消息头，
-         * 否则后续分片会被当成新消息解析导致错位。
-         */
-        const flush = () => {
-            if (safeOffset > 4) {
-                const header = Buffer.from(this.buffer.subarray(0, 4));
-                this.buffer = Buffer.concat([header, this.buffer.subarray(safeOffset)]);
-            }
-            safeOffset = 4;
-            offset = 4;
-            if (continuous && handled > 0)
-                this.emit('framebuffer-done');
-            return false;
-        };
+        // ---- 第一阶段：扫描并确认整帧数据齐备（无副作用） ----
         while (continuous ? !lastRect : handled < numRects) {
             // 每个矩形: 2-byte x, 2-byte y, 2-byte width, 2-byte height, 4-byte encoding
-            if (this.buffer.length < offset + 12)
-                return flush();
-            const x = this.buffer.readUInt16BE(offset);
-            const y = this.buffer.readUInt16BE(offset + 2);
-            const width = this.buffer.readUInt16BE(offset + 4);
-            const height = this.buffer.readUInt16BE(offset + 6);
+            if (this.buffer.length < cursor + 12)
+                return false;
+            const x = this.buffer.readUInt16BE(cursor);
+            const y = this.buffer.readUInt16BE(cursor + 2);
+            const width = this.buffer.readUInt16BE(cursor + 4);
+            const height = this.buffer.readUInt16BE(cursor + 6);
             // 必须按无符号读取：伪编码（如 0xFFFFFF11）用 readInt32BE 会得到负数
-            const encoding = this.buffer.readUInt32BE(offset + 8);
-            offset += 12;
+            const encoding = this.buffer.readUInt32BE(cursor + 8);
+            cursor += 12;
             if (encoding >= 0xFFFFFF00) {
-                const consumed = this.pseudoEncodingDataLength(encoding, width, height, offset);
-                if (consumed < 0)
-                    return flush(); // 数据不足
-                if (encoding === types_1.EncodingType.LastRect)
+                // 伪编码：收齐其附加数据
+                if (encoding === types_1.EncodingType.LastRect) {
+                    pending.push({ kind: 'pseudo', x, y, width, height, encoding });
                     lastRect = true;
-                offset += consumed;
+                    continue;
+                }
+                const payload = this.readPseudoEncodingPayload(encoding, width, height, cursor);
+                if (payload === null)
+                    return false; // 数据不足
+                pending.push({ kind: 'pseudo', x, y, width, height, encoding, payload });
+                cursor += payload.length;
             }
             else if (encoding === types_1.EncodingType.ZRLE) {
-                // ZRLE: 服务器可能跨矩形复用 zlib 流，喂入压缩数据后由解码器择机回调
-                if (this.buffer.length < offset + 4)
-                    return flush();
-                const compressedLen = this.buffer.readUInt32BE(offset);
-                if (this.buffer.length < offset + 4 + compressedLen)
-                    return flush(); // 数据不足
-                this.encoders.feedZrle(Buffer.from(this.buffer.subarray(offset + 4, offset + 4 + compressedLen)), x, y, width, height, this.pixelFormat, (rect) => this.emit('framebuffer-update', rect));
-                offset += 4 + compressedLen;
+                // ZRLE: 压缩块长度由 4 字节前缀给定，可精确预知；累积解压留到第二阶段
+                if (this.buffer.length < cursor + 4)
+                    return false;
+                const compressedLen = this.buffer.readUInt32BE(cursor);
+                if (this.buffer.length < cursor + 4 + compressedLen)
+                    return false; // 数据不足
+                pending.push({
+                    kind: 'zrle', x, y, width, height, encoding,
+                    payload: Buffer.from(this.buffer.subarray(cursor + 4, cursor + 4 + compressedLen)),
+                });
+                cursor += 4 + compressedLen;
             }
             else {
-                const result = this.encoders.decode(this.buffer, offset, encoding, width, height, this.pixelFormat);
+                // 常规编码：数据长度需解码器确认（如 Hextile 依内容而定），不足则整帧等待
+                const result = this.encoders.decode(this.buffer, cursor, encoding, width, height, this.pixelFormat);
                 if (result === null)
-                    return flush(); // 数据不足
-                offset += result.consumed;
-                this.currentEncoding = encoding;
-                this.emit('framebuffer-update', {
-                    x, y, width, height, encoding, data: result.pixels,
-                });
+                    return false; // 数据不足
+                pending.push({ kind: 'decode', x, y, width, height, encoding, pixels: result.pixels });
+                cursor += result.consumed;
             }
             handled++;
-            safeOffset = offset;
         }
-        if (safeOffset > 0)
-            this.buffer = this.buffer.subarray(safeOffset);
+        // ---- 第二阶段：整帧齐备，按线序统一处理 ----
+        for (const p of pending) {
+            if (p.kind === 'zrle') {
+                // 服务器可能跨矩形复用同一 zlib 流，按线序喂入后由解码器同步回调
+                this.encoders.feedZrle(p.payload, p.x, p.y, p.width, p.height, this.pixelFormat, (rect) => this.emit('framebuffer-update', rect));
+            }
+            else if (p.kind === 'decode') {
+                this.currentEncoding = p.encoding;
+                this.emit('framebuffer-update', {
+                    x: p.x, y: p.y, width: p.width, height: p.height,
+                    encoding: p.encoding, data: p.pixels,
+                });
+            }
+            else {
+                this.applyPseudoEncoding(p.encoding, p.x, p.y, p.width, p.height, p.payload);
+            }
+        }
+        this.buffer = this.buffer.subarray(cursor);
         this.emit('framebuffer-done');
         return true;
     }
     /**
-     * 计算伪编码矩形携带的数据长度（从 dataOffset 起）
-     * @returns 数据字节数；-1 表示数据尚未收全
+     * 读取伪编码矩形的附加数据（纯读取，不产生副作用）。
+     * @returns 附加数据 Buffer；null 表示数据尚未收全
      */
-    pseudoEncodingDataLength(encoding, width, height, dataOffset) {
+    readPseudoEncodingPayload(encoding, width, height, dataOffset) {
         switch (encoding) {
             case types_1.EncodingType.LastRect:
-                return 0;
             case types_1.EncodingType.NewFBSize:
-                this.fbWidth = width;
-                this.fbHeight = height;
-                this.emit('desktop-size', { width, height });
-                return 0;
             case types_1.EncodingType.PointerPos:
-                // 指针位置伪编码，无附加数据
-                return 0;
+                // 无附加数据
+                return Buffer.alloc(0);
             case types_1.EncodingType.DesktopName: {
                 if (this.buffer.length < dataOffset + 4)
-                    return -1;
+                    return null;
                 const nameLen = this.buffer.readUInt32BE(dataOffset);
                 if (this.buffer.length < dataOffset + 4 + nameLen)
-                    return -1;
-                this.desktopName = this.buffer.toString('utf8', dataOffset + 4, dataOffset + 4 + nameLen);
-                this.emit('desktop-name', this.desktopName);
-                return 4 + nameLen;
+                    return null;
+                return Buffer.from(this.buffer.subarray(dataOffset + 4, dataOffset + 4 + nameLen));
             }
             case types_1.EncodingType.Cursor:
             case types_1.EncodingType.RichCursor: {
-                const bytesPerPixel = Math.max(1, Math.ceil(this.pixelFormat.bitsPerPixel / 8));
                 // 光标像素 + 位掩码（每行按字节对齐）
+                const bytesPerPixel = Math.max(1, Math.ceil(this.pixelFormat.bitsPerPixel / 8));
                 const pixelsLen = width * height * bytesPerPixel;
                 const maskLen = Math.ceil(width / 8) * height;
                 const total = pixelsLen + maskLen;
                 if (this.buffer.length < dataOffset + total)
-                    return -1;
-                this.emit('cursor', { width, height });
-                return total;
+                    return null;
+                return Buffer.from(this.buffer.subarray(dataOffset, dataOffset + total));
             }
             default:
-                // 未知伪编码，无附加数据
-                return 0;
+                // 未知伪编码按无附加数据处理（保守推进，避免帧卡死）
+                return Buffer.alloc(0);
+        }
+    }
+    /**
+     * 应用伪编码的副作用（整帧齐备后调用，保证副作用只发生一次）
+     */
+    applyPseudoEncoding(encoding, x, y, width, height, payload) {
+        switch (encoding) {
+            case types_1.EncodingType.LastRect:
+                break;
+            case types_1.EncodingType.NewFBSize:
+                this.fbWidth = width;
+                this.fbHeight = height;
+                this.emit('desktop-size', { width, height });
+                break;
+            case types_1.EncodingType.DesktopName:
+                this.desktopName = payload.toString('utf8');
+                this.emit('desktop-name', this.desktopName);
+                break;
+            case types_1.EncodingType.Cursor:
+            case types_1.EncodingType.RichCursor:
+                this.emit('cursor', { width, height });
+                break;
+            default:
+                break;
         }
     }
     /**

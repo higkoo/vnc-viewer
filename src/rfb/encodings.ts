@@ -251,6 +251,13 @@ export class EncodingDecoders {
     let consumed = 0;
     let remaining = buffer.length - offset;
 
+    // Hextile 的背景/前景色跨 tile 延续（RFC 6143 §7.7.3）：
+    // 某 tile 未携带 BackgroundSpecified / ForegroundSpecified 时，应沿用
+    // 上一 tile 的颜色。原实现对每个 tile 都从黑色重算，导致第二块起
+    // 出现黑底/错色（服务端普遍依赖该状态以压缩数据）。
+    let prevBg: number[] = [0, 0, 0, 255];
+    let prevFg: number[] = [0, 0, 0, 255];
+
     // 处理 16x16 的块
     for (let ty = 0; ty < height; ty += 16) {
       for (let tx = 0; tx < width; tx += 16) {
@@ -269,26 +276,14 @@ export class EncodingDecoders {
         const anySub = (subEnc & 0x08) !== 0;
         const subCol = (subEnc & 0x10) !== 0;
 
-        // 读取背景色
-        let bgColor: number[] = [0, 0, 0, 255];
-        if (bgSpec || isRaw) {
-          if (remaining < bpp) return null;
-          bgColor = this.readPixel(buffer, offset + consumed, format);
-          consumed += bpp;
-          remaining -= bpp;
-
-          // 填充背景色
-          this.fillRect(fb, tx, ty, tw, th, bgColor, width);
-        }
-
         if (isRaw) {
-          // Raw 子编码: 直接传输像素数据
+          // Raw tile (RFC 6143 §7.7.3): Raw 位置位时后续直接是像素数据，
+          // 没有背景色前缀（其余位应被忽略），且不改变背景/前景状态。
           const rawLen = tw * th * bpp;
           if (remaining < rawLen) return null;
           const rawData = buffer.subarray(offset + consumed, offset + consumed + rawLen);
           const rgbaData = this.convertToRGBA(rawData, tw, th, format);
 
-          // 将 RGBA 数据复制到帧缓冲的对应位置
           for (let row = 0; row < th; row++) {
             const srcOff = row * tw * 4;
             const dstOff = ((ty + row) * width + tx) * 4;
@@ -297,56 +292,104 @@ export class EncodingDecoders {
 
           consumed += rawLen;
           remaining -= rawLen;
-        } else {
-          // 读取前景色
-          let fgColor: number[] = [0, 0, 0, 255];
-          if (fgSpec) {
-            if (remaining < bpp) return null;
-            fgColor = this.readPixel(buffer, offset + consumed, format);
-            consumed += bpp;
-            remaining -= bpp;
-          }
+          continue;
+        }
 
-          // 处理子矩形
-          if (anySub) {
-            const numSubRects = buffer[offset + consumed];
-            consumed++;
-            remaining--;
+        // 背景色：本 tile 指定则更新状态；否则沿用上一 tile 的背景色
+        if (bgSpec) {
+          if (remaining < bpp) return null;
+          prevBg = this.readPixel(buffer, offset + consumed, format);
+          consumed += bpp;
+          remaining -= bpp;
+        }
+        // 前景色同理
+        if (fgSpec) {
+          if (remaining < bpp) return null;
+          prevFg = this.readPixel(buffer, offset + consumed, format);
+          consumed += bpp;
+          remaining -= bpp;
+        }
 
-            for (let s = 0; s < numSubRects; s++) {
-              let scolor = fgColor;
-              if (subCol) {
-                if (remaining < bpp + 2) return null;
-                scolor = this.readPixel(buffer, offset + consumed, format);
-                consumed += bpp;
-                remaining -= bpp;
-              } else {
-                if (remaining < 2) return null;
-              }
+        // 整个 tile 先铺背景（含「本 tile 未显式发背景」的延续背景）
+        this.fillRect(fb, tx, ty, tw, th, prevBg, width);
 
-              // 子矩形位置和大小编码在2字节中
-              const posByte = buffer[offset + consumed];
-              const sizeByte = buffer[offset + consumed + 1];
-              consumed += 2;
-              remaining -= 2;
+        // 子矩形用前景覆盖
+        if (anySub) {
+          const numSubRects = buffer[offset + consumed];
+          consumed++;
+          remaining--;
 
-              const sx = (posByte >> 4) & 0x0F;
-              const sy = posByte & 0x0F;
-              const sw = (sizeByte >> 4) & 0x0F;
-              const sh = sizeByte & 0x0F;
-
-              // 限制子矩形在块范围内
-              const actualSw = Math.min(sw + 1, tw - sx);
-              const actualSh = Math.min(sh + 1, th - sy);
-
-              this.fillRect(fb, tx + sx, ty + sy, actualSw, actualSh, scolor, width);
+          for (let s = 0; s < numSubRects; s++) {
+            let scolor = prevFg;
+            if (subCol) {
+              if (remaining < bpp + 2) return null;
+              scolor = this.readPixel(buffer, offset + consumed, format);
+              consumed += bpp;
+              remaining -= bpp;
+            } else {
+              if (remaining < 2) return null;
             }
+
+            // 子矩形位置和大小编码在2字节中
+            const posByte = buffer[offset + consumed];
+            const sizeByte = buffer[offset + consumed + 1];
+            consumed += 2;
+            remaining -= 2;
+
+            const sx = (posByte >> 4) & 0x0F;
+            const sy = posByte & 0x0F;
+            const sw = (sizeByte >> 4) & 0x0F;
+            const sh = sizeByte & 0x0F;
+
+            // 限制子矩形在块范围内
+            const actualSw = Math.min(sw + 1, tw - sx);
+            const actualSh = Math.min(sh + 1, th - sy);
+
+            this.fillRect(fb, tx + sx, ty + sy, actualSw, actualSh, scolor, width);
           }
         }
       }
     }
 
     return { pixels: fb, consumed };
+  }
+
+  /**
+   * 解码 ZRLE 的 packed palette 像素并写入帧缓冲。
+   *
+   * 打包布局以 RealVNC 官方授权实现为准（libvncserver zrleencodetemplate.c，
+   * QEMU vnc-enc-zrle.c.inc 同源，neatvnc 同）：调色板 2..16 色时每个像素用
+   * ceil(log2(paletteSize)) 位表示（2 色=1bit、3-4 色=2bit、5-16 色=4bit），
+   * 每行独立成段：行内像素从字节 MSB 开始顺序取位，行尾不足一字节时左移
+   * 补零凑整，故每行固定占用 ceil(tw*bits/8) 字节，行与行互不跨接。tile
+   * 宽恰为 64 时位流模型与之等价，仅在右/下边缘的窄条 tile 有差异。
+   *
+   * @returns 消耗的字节数；数据不足返回 null
+   */
+  private blitPackedPalette(
+    buffer: Buffer, offset: number, palette: number[][], bits: number,
+    tw: number, th: number, fb: Buffer, tx: number, ty: number, fbWidth: number
+  ): number | null {
+    const rowBytes = Math.ceil((tw * bits) / 8);
+    const packedLen = rowBytes * th;
+    if (buffer.length < offset + packedLen) return null;
+
+    const mask = (1 << bits) - 1;
+    for (let row = 0; row < th; row++) {
+      const rowOff = row * rowBytes;
+      for (let col = 0; col < tw; col++) {
+        const bitIndex = col * bits;
+        const byte = buffer[offset + rowOff + (bitIndex >> 3)];
+        const shift = 8 - bits - (bitIndex & 7);
+        const color = palette[(byte >> shift) & mask] || [0, 0, 0, 255];
+        const dstOff = ((ty + row) * fbWidth + tx + col) * 4;
+        fb[dstOff] = color[0];
+        fb[dstOff + 1] = color[1];
+        fb[dstOff + 2] = color[2];
+        fb[dstOff + 3] = 255;
+      }
+    }
+    return packedLen;
   }
 
   /**
@@ -404,26 +447,13 @@ export class EncodingDecoders {
             // 纯色 tile: 无像素数据
             this.fillRect(fb, tx, ty, tw, th, palette[0], width);
           } else if (paletteSize <= 16) {
-            // Plain palette 且调色板 <= 16 色时按位打包，每行按字节对齐
+            // Plain palette 且调色板 2..16 色：像素为跨行连续的位打包索引
             const bits = paletteSize <= 2 ? 1 : (paletteSize <= 4 ? 2 : 4);
-            const rowBytes = Math.ceil((tw * bits) / 8);
-            const packedLen = rowBytes * th;
-            if (buffer.length < offset + consumed + packedLen) return null;
-
-            const mask = (1 << bits) - 1;
-            for (let row = 0; row < th; row++) {
-              for (let col = 0; col < tw; col++) {
-                const bitIndex = col * bits;
-                const byte = buffer[offset + consumed + row * rowBytes + (bitIndex >> 3)];
-                const shift = 8 - bits - (bitIndex & 7);
-                const color = palette[(byte >> shift) & mask] || [0, 0, 0, 255];
-                const dstOff = ((ty + row) * width + tx + col) * 4;
-                fb[dstOff] = color[0];
-                fb[dstOff + 1] = color[1];
-                fb[dstOff + 2] = color[2];
-                fb[dstOff + 3] = 255;
-              }
-            }
+            const packedLen = this.blitPackedPalette(
+              buffer, offset + consumed, palette, bits,
+              tw, th, fb, tx, ty, width
+            );
+            if (packedLen === null) return null;
             consumed += packedLen;
           } else {
             // 调色板 > 16 色: 每个像素 1 字节索引
@@ -462,8 +492,10 @@ export class EncodingDecoders {
           }
           consumed += rawLen;
         } else {
-          // 未知 tile 类型（注：subType = tileType & 0x7F 恒 < 128，
-          // 位打包调色板实际由 subType 2..16 分支处理）
+          // subType = tileType & 0x7F 恒为 0..127，已在上方全部分支覆盖。
+          // （此前曾有人添加 subType 128..130 的 packed palette 分支，但该条件
+          // 永不可达——packed palette（2..16 色位打包）由上面的 subType 2..16
+          // 分支处理，RLE 置位时由 decodeRLEPixels 处理。）
           return null;
         }
       }
@@ -472,56 +504,60 @@ export class EncodingDecoders {
     return { pixels: fb, consumed };
   }
 
+  /**
+   * 解码 ZRLE palette tile 的 RLE 像素流。
+   *
+   * 线上格式（RealVNC/libvncserver/QEMU/neatvnc 编码器一致）：
+   * - 每个像素值为 1 字节 palette index（paletteSize ≤ 127，因此 index < 128）；
+   * - 一段重复 run 编码为 [index | 0x80][len-1 拆段...]：
+   *   先写「调色板索引 | 高位标记」，再写 (run长度-1)，超过 255 时拆成
+   *   多个 255 字节后跟一个 ≤254 的余数；解码时累加这些长度字节；
+   * - 单像素 run（长度 1..2）直接写裸 index，无高位标记。
+   *
+   * 注意：早先实现把 run 误解为 [长度|0x80][index]（与真实格式相反），
+   * 导致含大段重复色的 ZRLE tile（如窗口底色、文字行）整块花屏。
+   */
   private decodeRLEPixels(
     buffer: Buffer, offset: number,
     width: number, height: number, palette: number[][]
   ): { pixels: Buffer; consumed: number } | null {
-    const totalPixels = width * height * 4;
-    const fb = Buffer.alloc(totalPixels);
+    const total = width * height;
+    const fb = Buffer.alloc(total * 4);
     let consumed = 0;
     let pixelIdx = 0;
 
-    while (pixelIdx < width * height) {
-      if (buffer.length < offset + consumed + 1) return null;
+    const fillColor = (color: number[], count: number): void => {
+      const limit = Math.min(count, total - pixelIdx);
+      for (let i = 0; i < limit; i++) {
+        const dstOff = pixelIdx * 4;
+        fb[dstOff] = color[0];
+        fb[dstOff + 1] = color[1];
+        fb[dstOff + 2] = color[2];
+        fb[dstOff + 3] = 255;
+        pixelIdx++;
+      }
+    };
 
+    while (pixelIdx < total) {
+      if (buffer.length < offset + consumed + 1) return null;
       const b = buffer[offset + consumed];
       consumed++;
 
       if (b & 0x80) {
-        // RLE run: 重复 (b & 0x7F) + 1 次
-        const runLen = (b & 0x7F) + 1;
-        if (buffer.length < offset + consumed + 1) return null;
-        const paletteIdx = buffer[offset + consumed];
-        consumed++;
-
-        const color = palette[paletteIdx] || [0, 0, 0, 255];
-        for (let i = 0; i < runLen && pixelIdx < width * height; i++) {
-          const row = Math.floor(pixelIdx / width);
-          const col = pixelIdx % width;
-          const dstOff = (row * width + col) * 4;
-          fb[dstOff] = color[0];
-          fb[dstOff + 1] = color[1];
-          fb[dstOff + 2] = color[2];
-          fb[dstOff + 3] = 255;
-          pixelIdx++;
-        }
-      } else {
-        // 非 run: 后续 (b + 1) 个字节，每个都是调色板索引
-        const count = b + 1;
-        if (buffer.length < offset + consumed + count) return null;
-
-        for (let i = 0; i < count && pixelIdx < width * height; i++) {
-          const color = palette[buffer[offset + consumed]] || [0, 0, 0, 255];
+        // RLE run: 低 7 位为 palette index，后续为 (长度-1) 的 255 分段
+        const index = b & 0x7F;
+        let runLen = 1;
+        for (;;) {
+          if (buffer.length < offset + consumed + 1) return null;
+          const c = buffer[offset + consumed];
           consumed++;
-          const row = Math.floor(pixelIdx / width);
-          const col = pixelIdx % width;
-          const dstOff = (row * width + col) * 4;
-          fb[dstOff] = color[0];
-          fb[dstOff + 1] = color[1];
-          fb[dstOff + 2] = color[2];
-          fb[dstOff + 3] = 255;
-          pixelIdx++;
+          runLen += c;
+          if (c < 255) break;
         }
+        fillColor(palette[index] || [0, 0, 0, 255], runLen);
+      } else {
+        // 单像素：字节本身即 palette index
+        fillColor(palette[b] || [0, 0, 0, 255], 1);
       }
     }
 
