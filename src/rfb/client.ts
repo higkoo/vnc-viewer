@@ -37,6 +37,17 @@ export class RfbClient extends EventEmitter {
   // 接收缓冲区
   private buffer: Buffer = Buffer.alloc(0);
 
+  // 帧覆盖追踪：记录 32x32 块级别的覆盖状态，
+  // 连接后首帧请求全屏时服务器可能只返回脏区域（x11vnc 行为），
+  // 追踪未覆盖块并在 framebuffer-done 后补发请求
+  private coverageCols = 0;
+  private coverageRows = 0;
+  private coverageBits: Uint8Array = new Uint8Array(0);
+  private coverageRequestPending = false;
+  private coverageRetries = 0;
+  private static readonly COVERAGE_BLOCK_SIZE = 32;
+  private static readonly COVERAGE_MAX_RETRIES = 8;
+
   // 公开方法用于 handshake 模块
   updateState(state: ConnectionState): void { this.setState(state); }
   getParams(): ConnectionParams { return this.params; }
@@ -130,6 +141,8 @@ export class RfbClient extends EventEmitter {
       } catch (_) { /* ignore */ }
       this.socket = null;
     }
+    this.coverageBits = new Uint8Array(0);
+    this.coverageRequestPending = false;
     this.setState(ConnectionState.Disconnected);
     this.buffer = Buffer.alloc(0);
   }
@@ -265,6 +278,8 @@ export class RfbClient extends EventEmitter {
     this.fbHeight = height;
     this.pixelFormat = format;
     this.desktopName = name;
+    // 桌面大小变化时重置覆盖追踪
+    this.initCoverage(width, height);
   }
 
   setConnected(): void {
@@ -276,6 +291,9 @@ export class RfbClient extends EventEmitter {
       name: this.desktopName,
       version: this.serverVersion,
     });
+
+    // 初始化覆盖追踪网格
+    this.initCoverage(this.fbWidth, this.fbHeight);
 
     // 请求首次全量更新
     this.requestFramebufferUpdate(false);
@@ -412,6 +430,8 @@ export class RfbClient extends EventEmitter {
         const compressedLen = this.buffer.readUInt32BE(offset);
         if (this.buffer.length < offset + 4 + compressedLen) return flush(); // 数据不足
 
+        // 标记覆盖范围（ZRLE 矩形在 feedZrle 中异步 emit，此处先标记）
+        this.markCoverage(x, y, width, height);
         this.encoders.feedZrle(
           Buffer.from(this.buffer.subarray(offset + 4, offset + 4 + compressedLen)),
           x, y, width, height, this.pixelFormat,
@@ -427,6 +447,9 @@ export class RfbClient extends EventEmitter {
         offset += result.consumed;
         this.currentEncoding = encoding;
 
+        // 标记覆盖范围
+        this.markCoverage(x, y, width, height);
+
         this.emit('framebuffer-update', {
           x, y, width, height, encoding, data: result.pixels,
         } as FramebufferRect);
@@ -438,7 +461,115 @@ export class RfbClient extends EventEmitter {
 
     if (safeOffset > 0) this.buffer = this.buffer.subarray(safeOffset);
     this.emit('framebuffer-done');
+    // 检查覆盖率，如有未覆盖区域则补发请求（x11vnc 首帧只发脏区域）
+    this.checkCoverageAndRequest();
     return true;
+  }
+
+  // ---- 帧覆盖追踪 ----
+  // x11vnc 等服务器在非增量 FramebufferUpdateRequest 时仍只发送脏区域，
+  // 导致首帧后大量像素保持黑色。这里用 32x32 块的位图追踪覆盖，
+  // 并在 framebuffer-done 后对未覆盖块补发非增量请求。
+
+  private initCoverage(width: number, height: number): void {
+    this.coverageCols = Math.ceil(width / RfbClient.COVERAGE_BLOCK_SIZE);
+    this.coverageRows = Math.ceil(height / RfbClient.COVERAGE_BLOCK_SIZE);
+    this.coverageBits = new Uint8Array(this.coverageCols * this.coverageRows);
+    this.coverageRequestPending = false;
+    this.coverageRetries = 0;
+  }
+
+  private markCoverage(x: number, y: number, w: number, h: number): void {
+    if (this.coverageBits.length === 0) return;
+    const bs = RfbClient.COVERAGE_BLOCK_SIZE;
+    const startCol = Math.floor(x / bs);
+    const endCol = Math.floor((x + w - 1) / bs);
+    const startRow = Math.floor(y / bs);
+    const endRow = Math.floor((y + h - 1) / bs);
+    for (let row = startRow; row <= endRow; row++) {
+      for (let col = startCol; col <= endCol; col++) {
+        if (row >= 0 && row < this.coverageRows && col >= 0 && col < this.coverageCols) {
+          this.coverageBits[row * this.coverageCols + col] = 1;
+        }
+      }
+    }
+  }
+
+  private checkCoverageAndRequest(): void {
+    if (this.coverageBits.length === 0) return;
+    if (this.coverageRequestPending) return;
+    if (this.state !== ConnectionState.Connected) return;
+    if (this.coverageRetries >= RfbClient.COVERAGE_MAX_RETRIES) return;
+
+    const bs = RfbClient.COVERAGE_BLOCK_SIZE;
+    let uncoveredCount = 0;
+    // 收集所有未覆盖块，按行分组
+    const uncoveredByRow = new Map<number, number[]>();
+    for (let row = 0; row < this.coverageRows; row++) {
+      for (let col = 0; col < this.coverageCols; col++) {
+        if (!this.coverageBits[row * this.coverageCols + col]) {
+          uncoveredCount++;
+          if (!uncoveredByRow.has(row)) uncoveredByRow.set(row, []);
+          uncoveredByRow.get(row)!.push(col);
+        }
+      }
+    }
+    if (uncoveredCount === 0) return; // 全屏已覆盖
+
+    // 策略：重试次数少时请求整行连续区域，重试次数多时逐块请求
+    // （某些服务器对大矩形不响应，但对小矩形或整行有响应）
+    const rects: Array<[number, number, number, number]> = [];
+    const maxRectsPerBatch = this.coverageRetries < 4 ? 16 : 4;
+
+    if (this.coverageRetries % 2 === 0) {
+      // 偶数次：按行合并连续块为大矩形
+      for (const [row, cols] of uncoveredByRow) {
+        cols.sort((a, b) => a - b);
+        let start = cols[0], prev = cols[0];
+        for (let i = 1; i <= cols.length; i++) {
+          if (i < cols.length && cols[i] === prev + 1) {
+            prev = cols[i];
+          } else {
+            const x = start * bs;
+            const y = row * bs;
+            const w = Math.min((prev + 1) * bs, this.fbWidth) - x;
+            const h = Math.min(bs, this.fbHeight) - (y - row * bs);
+            rects.push([x, y, w, h]);
+            if (i < cols.length) { start = cols[i]; prev = cols[i]; }
+          }
+        }
+      }
+    } else {
+      // 奇数次：每个未覆盖块独立请求
+      for (const [row, cols] of uncoveredByRow) {
+        for (const col of cols) {
+          const x = col * bs;
+          const y = row * bs;
+          const w = Math.min(bs, this.fbWidth - x);
+          const h = Math.min(bs, this.fbHeight - y);
+          rects.push([x, y, w, h]);
+        }
+      }
+    }
+
+    if (rects.length === 0) return;
+
+    this.coverageRequestPending = true;
+    this.coverageRetries++;
+
+    // 异步批量发送请求
+    setTimeout(() => {
+      this.coverageRequestPending = false;
+      if (this.state !== ConnectionState.Connected) return;
+      const batch = rects.slice(0, maxRectsPerBatch);
+      for (const [rx, ry, rw, rh] of batch) {
+        this.requestFramebufferUpdate(false, rx, ry, rw, rh);
+      }
+      // 如果还有更多未覆盖区域，下次 frame-done 继续
+      if (rects.length > maxRectsPerBatch) {
+        setTimeout(() => this.checkCoverageAndRequest(), 100);
+      }
+    }, 50);
   }
 
   /**

@@ -90,6 +90,9 @@ declare let zoomMode: 'fit' | '100';
 declare let fbWidth: number;
 declare let fbHeight: number;
 declare let fbCanvas: ImageData | null;
+declare let bgFillTimer: ReturnType<typeof setTimeout> | null;
+declare let lastFrameTime: number;
+declare let bgFillDone: boolean;
 declare let mouseButtonMask: number;
 declare let lastMouseX: number;
 declare let lastMouseY: number;
@@ -124,6 +127,12 @@ declare function renderRect(rect: {
     data: number[] | Buffer;
     encoding: number;
 }): void;
+/**
+ * 背景填充：x11vnc 等服务器不发送静态背景区域，导致帧缓冲中保留黑色(0,0,0)。
+ * 检测纯黑像素，用上下左右最近的非黑像素颜色填充。
+ * 这是一个简单的一遍扫描修复，适用于纯色或渐变背景。
+ */
+declare function fillBackground(): void;
 declare function handleMouseDown(e: MouseEvent): void;
 declare function handleMouseUp(e: MouseEvent): void;
 declare function handleMouseMove(e: MouseEvent): void;
