@@ -150,5 +150,21 @@ RfbInput.KEY_MAP = {
     220: 0x5C, // \
     221: 0x5D, // ]
     222: 0x27, // '
+    // 小键盘（未映射时 keyCode 会与 ASCII 冲突，如 96 会撞上反引号 0x60）
+    96: 0xFFB0, // KP_0
+    97: 0xFFB1, // KP_1
+    98: 0xFFB2, // KP_2
+    99: 0xFFB3, // KP_3
+    100: 0xFFB4, // KP_4
+    101: 0xFFB5, // KP_5
+    102: 0xFFB6, // KP_6
+    103: 0xFFB7, // KP_7
+    104: 0xFFB8, // KP_8
+    105: 0xFFB9, // KP_9
+    106: 0xFFAA, // KP_Multiply
+    107: 0xFFAB, // KP_Add
+    109: 0xFFAD, // KP_Subtract
+    110: 0xFFAE, // KP_Decimal
+    111: 0xFFAF, // KP_Divide
 };
 //# sourceMappingURL=input.js.map
