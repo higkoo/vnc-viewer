@@ -213,6 +213,9 @@ function setupIPCListeners(): void {
     emptyState.classList.add('hidden');
     isConnected = true;
 
+    // 连接成功后聚焦画布，否则键盘事件无法到达 canvas
+    canvas.focus();
+
     if (zoomMode === 'fit') applyZoomFit();
   });
 
@@ -452,11 +455,9 @@ function renderRect(rect: { x: number; y: number; width: number; height: number;
   const ctx = canvas.getContext('2d')!;
 
   if (rect.encoding === 1) {
-    // CopyRect: 从源位置复制
-    // rect.data 包含 srcX, srcY
-    // 无法用 ImageData 直接实现，使用 drawImage
-    const srcX = rect.data[0] + rect.data[1] * 256;
-    const srcY = rect.data[2] + rect.data[3] * 256;
+    // CopyRect: data 为大端序 srcX/srcY（各 2 字节）
+    const srcX = (rect.data[0] << 8) | rect.data[1];
+    const srcY = (rect.data[2] << 8) | rect.data[3];
     ctx.drawImage(
       canvas,
       srcX, srcY, rect.width, rect.height,
