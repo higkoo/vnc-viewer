@@ -469,7 +469,8 @@ class EncodingDecoders {
                     consumed += packedLen;
                 }
                 else {
-                    // 未知 tile 类型
+                    // 未知 tile 类型（注：subType = tileType & 0x7F 恒 < 128，
+                    // 位打包调色板实际由 subType 2..16 分支处理）
                     return null;
                 }
             }
