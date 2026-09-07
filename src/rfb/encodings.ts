@@ -22,48 +22,40 @@ export class EncodingDecoders {
   /**
    * ZRLE 持久化 zlib 流状态。
    *
-   * 部分服务器（如 x11vnc/TigerVNC）对一个连接上的所有 ZRLE 矩形复用同一个 zlib 流：
-   * 只有第一个矩形带 zlib 头（78 9c...），后续矩形是 deflate 续流，每块以 Z_SYNC_FLUSH 结束。
-   * 由于 zlib 的 LZ77 会回溯 32KB 历史，这里用「raw deflate + 32KB 滑动字典」同步还原，
-   * 既保持解析逻辑同步，又避免 O(n²) 的重解压。
+   * 服务器（x11vnc / TigerVNC）通常跨矩形复用同一个 zlib 流：首块带 zlib 头，
+   * 后续块是 raw deflate 续流并以 Z_SYNC_FLUSH 结尾。
+   *
+   * 这里采用「全缓冲区重复解压」模型：
+   * - 每到达一个矩形的压缩数据就追加到累积缓冲；
+   * - 每次把累积的全部压缩数据交给 zlib 重新解压——zlib 自己维护滑动窗口与
+   *   回溯引用状态，无需手动管理 32KB 字典，从根源消除字典失配导致的像素错位；
+   * - 解压输出中只取「上次已消费位置之后」的新数据解析矩形，避免重复解析；
+   * - 全部矩形解出后清空累积缓冲，防止无界增长。
+   *
+   * 复杂度 O(n²)（n = 矩形数），但 VNC 帧通常 < 30 矩形、累积压缩数据 < 1MB，
+   * 重复解压耗时在毫秒级，可忽略。
    */
-  private zrleStarted: boolean = false;
-  private zrleHistory: Buffer = Buffer.alloc(0);
-  /** 已累积但尚未解出完整 tile 数据的压缩数据 */
-  private zrlePending: Buffer = Buffer.alloc(0);
-  /** 已消费的解压输出字节数（相对当前累积解压结果） */
+  /** 累积的全部压缩数据（从连接/帧开始） */
+  private zrleAccumulated: Buffer = Buffer.alloc(0);
+  /** 已解压输出中已被解析消费的字节数 */
   private zrleOutConsumed: number = 0;
   /** 已喂入压缩数据、等待 tile 数据齐备的矩形 */
   private zrleQueue: {
     x: number; y: number; width: number; height: number; format: PixelFormat;
   }[] = [];
-  private static readonly ZLIB_WINDOW = 32768;
   private static readonly MAX_OUTPUT = 64 * 1024 * 1024;
 
   /** 新建连接或重连时重置流状态 */
   resetStreams(): void {
-    this.zrleStarted = false;
-    this.zrleHistory = Buffer.alloc(0);
-    this.zrlePending = Buffer.alloc(0);
+    this.zrleAccumulated = Buffer.alloc(0);
     this.zrleOutConsumed = 0;
     this.zrleQueue = [];
-  }
-
-  /** 记录已解压输出，仅保留窗口需要的尾部数据 */
-  private appendZrleHistory(out: Buffer): void {
-    this.zrleHistory = Buffer.concat([this.zrleHistory, out]);
-    const keep = EncodingDecoders.ZLIB_WINDOW * 2;
-    if (this.zrleHistory.length > keep) {
-      this.zrleHistory = this.zrleHistory.subarray(this.zrleHistory.length - keep);
-    }
   }
 
   /**
    * 喂入一个 ZRLE 矩形的压缩数据。
    *
-   * 由于服务器的 zlib flush 边界与矩形边界不一定对齐，单个矩形的压缩数据可能无法
-   * 立刻解出完整 tile 数据。这里把压缩数据累积起来，能解出多少矩形就回调多少，
-   * 剩下的等后续矩形的数据到达后再解（顺序不变）。
+   * 把压缩块追加到累积缓冲，记录矩形元信息，然后尝试从解压输出中解出积压矩形。
    */
   feedZrle(
     compressed: Buffer,
@@ -71,38 +63,23 @@ export class EncodingDecoders {
     format: PixelFormat,
     emit: (rect: FramebufferRect) => void
   ): void {
-    this.zrlePending = Buffer.concat([this.zrlePending, compressed]);
+    this.zrleAccumulated = Buffer.concat([this.zrleAccumulated, compressed]);
     this.zrleQueue.push({ x, y, width, height, format });
     this.drainZrle(emit);
   }
 
-  /** 解压当前累积的压缩数据 */
-  private inflateZrlePending(): Buffer | null {
-    if (!this.zrleStarted) {
-      // 首个块带 zlib 头
-      try {
-        return zlib.inflateSync(this.zrlePending, {
-          finishFlush: zlib.constants.Z_SYNC_FLUSH,
-          maxOutputLength: EncodingDecoders.MAX_OUTPUT,
-        });
-      } catch (err) {
-        return null;
-      }
-    }
-
-    const win = this.zrleHistory.length > EncodingDecoders.ZLIB_WINDOW
-      ? this.zrleHistory.subarray(this.zrleHistory.length - EncodingDecoders.ZLIB_WINDOW)
-      : this.zrleHistory;
+  /** 解压当前累积的全部压缩数据 */
+  private inflateAll(): Buffer | null {
+    if (this.zrleAccumulated.length === 0) return null;
     try {
-      return zlib.inflateRawSync(this.zrlePending, {
+      return zlib.inflateSync(this.zrleAccumulated, {
         finishFlush: zlib.constants.Z_SYNC_FLUSH,
-        dictionary: win,
         maxOutputLength: EncodingDecoders.MAX_OUTPUT,
       });
     } catch (err) {
-      // 兜底：个别服务器每个矩形都是独立 zlib 流
+      // 兜底：首块可能为 raw deflate（无 zlib 头）
       try {
-        return zlib.inflateSync(this.zrlePending, {
+        return zlib.inflateRawSync(this.zrleAccumulated, {
           finishFlush: zlib.constants.Z_SYNC_FLUSH,
           maxOutputLength: EncodingDecoders.MAX_OUTPUT,
         });
@@ -112,19 +89,19 @@ export class EncodingDecoders {
     }
   }
 
-  /** 尽可能多地解出积压矩形的 tile 数据 */
+  /** 从解压输出中尽可能多地解出积压矩形的 tile 数据 */
   private drainZrle(emit: (rect: FramebufferRect) => void): void {
     if (this.zrleQueue.length === 0) return;
 
-    const out = this.inflateZrlePending();
-    if (out === null) return;
+    const out = this.inflateAll();
+    if (out === null || out.length === 0) return;
 
     let cursor = this.zrleOutConsumed;
     let drained = 0;
 
     for (const q of this.zrleQueue) {
       const res = this.decodeZRLETiles(out, cursor, q.width, q.height, q.format);
-      if (res === null) break; // tile 数据尚未解出，等待更多压缩数据
+      if (res === null) break; // tile 数据尚未解出，等待后续块
       emit({
         x: q.x, y: q.y, width: q.width, height: q.height,
         encoding: EncodingType.ZRLE, data: res.pixels,
@@ -135,17 +112,16 @@ export class EncodingDecoders {
 
     if (drained === 0) return;
 
-    this.appendZrleHistory(out.subarray(this.zrleOutConsumed, cursor));
     this.zrleOutConsumed = cursor;
     this.zrleQueue = this.zrleQueue.slice(drained);
-    this.zrleStarted = true;
 
-    // 全部解出且输出消费干净：重置累积，后续用字典续流，避免无界增长
-    if (this.zrleQueue.length === 0 && this.zrleOutConsumed === out.length) {
-      this.zrlePending = Buffer.alloc(0);
+    // 全部解出：重置累积，避免无界增长
+    if (this.zrleQueue.length === 0) {
+      this.zrleAccumulated = Buffer.alloc(0);
       this.zrleOutConsumed = 0;
     }
   }
+
 
   /**
    * 解码矩形数据
@@ -485,40 +461,9 @@ export class EncodingDecoders {
             }
           }
           consumed += rawLen;
-        } else if (subType >= 128 && subType <= 130) {
-          // Packed palette tile: 调色板 + 位打包索引
-          const bitsPerPixel = subType - 127; // 128 -> 1bit, 129 -> 2bit, 130 -> 4bit
-          const paletteSize = 1 << bitsPerPixel;
-          if (buffer.length < offset + consumed + paletteSize * cpi) return null;
-
-          const palette: number[][] = [];
-          for (let i = 0; i < paletteSize; i++) {
-            palette.push(this.readCPixel(buffer, offset + consumed, format, cpi));
-            consumed += cpi;
-          }
-
-          // 每行按字节对齐
-          const rowBytes = Math.ceil((tw * bitsPerPixel) / 8);
-          const packedLen = rowBytes * th;
-          if (buffer.length < offset + consumed + packedLen) return null;
-
-          const mask = paletteSize - 1;
-          for (let row = 0; row < th; row++) {
-            for (let col = 0; col < tw; col++) {
-              const bitIndex = col * bitsPerPixel;
-              const byte = buffer[offset + consumed + row * rowBytes + (bitIndex >> 3)];
-              const shift = 8 - bitsPerPixel - (bitIndex & 7);
-              const color = palette[(byte >> shift) & mask] || [0, 0, 0, 255];
-              const dstOff = ((ty + row) * width + tx + col) * 4;
-              fb[dstOff] = color[0];
-              fb[dstOff + 1] = color[1];
-              fb[dstOff + 2] = color[2];
-              fb[dstOff + 3] = 255;
-            }
-          }
-          consumed += packedLen;
         } else {
-          // 未知 tile 类型
+          // 未知 tile 类型（注：subType = tileType & 0x7F 恒 < 128，
+          // 位打包调色板实际由 subType 2..16 分支处理）
           return null;
         }
       }
@@ -597,11 +542,33 @@ export class EncodingDecoders {
 
   /**
    * 读取 CPIXEL (压缩像素)
+   * 3 字节 CPIXEL = 像素值的低 3 字节（最高字节省略，RFC 6143 §7.7.5）：
+   * - 小端格式：线序为 [低,中,高] → value = b0 | b1<<8 | b2<<16
+   * - 大端格式：线序为 [高,中,低] → value = b0<<16 | b1<<8 | b2
+   * 取回像素值后仍需按 redShift/greenShift/blueShift 提取通道，
+   * 不能直接把线序字节当 RGB（对 LE + redShift=16 的服务器会导致红蓝互换）。
    */
   private readCPixel(
     buffer: Buffer, offset: number, format: PixelFormat, size: number = 3
   ): number[] {
-    if (size === 3) return [buffer[offset], buffer[offset + 1], buffer[offset + 2], 255];
+    if (size === 3) {
+      const value = format.bigEndian
+        ? ((buffer[offset] << 16) | (buffer[offset + 1] << 8) | buffer[offset + 2])
+        : (buffer[offset] | (buffer[offset + 1] << 8) | (buffer[offset + 2] << 16));
+
+      if (format.trueColor) {
+        const r = (value >> format.redShift) & format.redMax;
+        const g = (value >> format.greenShift) & format.greenMax;
+        const b = (value >> format.blueShift) & format.blueMax;
+        return [
+          Math.round((r / format.redMax) * 255),
+          Math.round((g / format.greenMax) * 255),
+          Math.round((b / format.blueMax) * 255),
+          255,
+        ];
+      }
+      return [value & 0xFF, (value >> 8) & 0xFF, (value >> 16) & 0xFF, 255];
+    }
     if (size === 1) return this.readPixel(buffer, offset, { ...format, bitsPerPixel: 8 });
     if (size === 2) return this.readPixel(buffer, offset, { ...format, bitsPerPixel: 16 });
     return this.readPixel(buffer, offset, format);
