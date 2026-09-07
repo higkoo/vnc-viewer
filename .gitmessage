@@ -1,0 +1,9 @@
+
+# ── 提交署名模板 ──────────────────────────────
+# 由 CatPaw (美团 AI 编程助手) 完成的提交，请保留末尾的 Co-authored-by 尾注，
+# GitHub 会在提交页面渲染出共同作者 "CatPaw" 的名字和头像。
+#
+# 纯手工提交时可删除下面这行；以 # 开头的行在提交时会被自动忽略。
+# 本地已配置：git config commit.template .gitmessage
+
+Co-authored-by: CatPaw <catpaw@meituan.com>
