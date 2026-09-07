@@ -34,8 +34,11 @@ vnc-viewer/
 │       ├── types.ts       #   类型定义（RFC 6143）
 │       ├── client.ts      #   RFB 客户端核心
 │       ├── handshake.ts   #   握手和认证
+│       ├── des.ts         #   纯 JS DES（VNC 认证，兼容 OpenSSL 3）
 │       ├── encodings.ts   #   编码解码器
 │       └── input.ts       #   键盘/鼠标事件映射
+├── scripts/
+│   └── copy-assets.js     # 构建后复制 HTML/CSS 到 dist（tsc 不会复制）
 ├── dist/                  # TypeScript 编译输出
 ├── package.json
 └── tsconfig.json
@@ -52,7 +55,7 @@ vnc-viewer/
 │  └──────────┘           └────────────┘           └─────┘│
 │                         ┌────────────┐                   │
 │                         │ MobileServer│── WebSocket ──┐   │
-│                         │ :5800      │               │   │
+│                         │ :5933      │               │   │
 │                         └────────────┘               │   │
 └───────────────────────────────────────────────────────┼───┘
                                                         │
@@ -73,7 +76,7 @@ vnc-viewer/
 | 渲染层 | Canvas 2D API | 像素数据渲染 |
 | 语言 | TypeScript | 全栈类型安全 |
 | 编码 | Node.js `zlib` | ZRLE 解压（桌面端） |
-| 认证 | Node.js `crypto` | DES 加密（桌面端） |
+| 认证 | 纯 JS DES（`src/rfb/des.ts`） | VNC 挑战-响应加密；OpenSSL 3（Node 17+）已禁用 `crypto` 的 DES（桌面端） |
 | WebSocket | `ws` | 手机代理服务器 WebSocket 支持 |
 | 浏览器解压 | `pako` | 手机端 ZRLE 解压 |
 | 浏览器 DES | 纯 JS 实现 | 手机端 VNC 认证 |
@@ -114,14 +117,14 @@ npm start
 
 ### 手机连接
 
-启动应用后，应用会自动启动手机代理服务器（默认端口 5800）。
+启动应用后，应用会自动启动手机代理服务器（默认端口 5933）。
 
 **使用步骤：**
 
 1. 确保手机和电脑在同一个局域网
 2. 在电脑上启动 VNC Viewer
 3. 在电脑菜单栏中选择「手机」→「显示手机连接信息」
-4. 在手机浏览器中打开显示的地址（如 `http://192.168.1.100:5800`）
+4. 在手机浏览器中打开显示的地址（如 `http://192.168.1.100:5933`）
 5. 输入 VNC 服务器地址和密码，点击「连接」
 
 **手机端特性：**
@@ -141,6 +144,32 @@ npm start
 | `src/rfb/` | 桌面端 RFB 协议实现 |
 | `src/server/` | 手机代理服务器（WebSocket ↔ TCP） |
 | `src/mobile/` | 手机端 Web 页面（内嵌 RFB 客户端） |
+
+## 平台验证状态
+
+| 平台 | 状态 | 验证版本 | 说明 |
+|------|------|----------|------|
+| macOS (Apple Silicon) | ✅ 已验证 | 0.1.1 | RFB 3.8 + VncAuth 认证、ZRLE/RRE 解码、画面渲染均正常 |
+| Windows (x64) | ✅ 已验证 | 0.1.0 | 修复连接后界面无响应 |
+| Linux | ⏳ 待验证 | — | 基于 Electron，理论支持 |
+
+## 版本历史
+
+### 0.1.1
+
+- macOS (Apple Silicon) 实机验证通过：连接 `dify:5900`（RFB 3.8 + VncAuth），DES 挑战-响应认证、ZRLE/RRE 全量解码、1280×800 画面渲染均正常，连续运行无停滞
+- 确认 0.1.0 的关键修复在 macOS 同样生效（preload 沙箱内联常量、纯 JS DES、构建资源复制）
+- README 修正：手机代理默认端口 5800 → 5933；DES 认证实现说明更新为纯 JS；项目架构补充 `des.ts` / `scripts/copy-assets.js`
+
+### 0.1.0
+
+- 修复 Windows 版连接后界面无响应：
+  - 新增纯 JS DES 实现（OpenSSL 3 默认禁用 DES，原 `crypto.createCipheriv('des-ecb')` 认证必崩）
+  - preload 内联 IPC 通道常量（Electron 20+ 沙箱禁止 require 项目文件）
+  - 伪编码判定改用无符号读取；SetEncodings 用 `writeUInt32BE` 写入
+  - 支持 numRects=0xFFFF 持续更新模式与 LastRect 终止标记
+  - ZRLE 解码器全面修复（CPIXEL 动态尺寸、调色板位打包、跨矩形 zlib 流复用）
+  - 构建流程新增 `scripts/copy-assets.js` 同步静态资源
 
 ## 参考实现
 
