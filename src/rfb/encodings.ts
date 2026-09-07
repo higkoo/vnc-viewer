@@ -251,6 +251,13 @@ export class EncodingDecoders {
     let consumed = 0;
     let remaining = buffer.length - offset;
 
+    // Hextile 的背景/前景色跨 tile 延续（RFC 6143 §7.7.3）：
+    // 某 tile 未携带 BackgroundSpecified / ForegroundSpecified 时，应沿用
+    // 上一 tile 的颜色。原实现对每个 tile 都从黑色重算，导致第二块起
+    // 出现黑底/错色（服务端普遍依赖该状态以压缩数据）。
+    let prevBg: number[] = [0, 0, 0, 255];
+    let prevFg: number[] = [0, 0, 0, 255];
+
     // 处理 16x16 的块
     for (let ty = 0; ty < height; ty += 16) {
       for (let tx = 0; tx < width; tx += 16) {
@@ -271,14 +278,12 @@ export class EncodingDecoders {
 
         if (isRaw) {
           // Raw tile (RFC 6143 §7.7.3): Raw 位置位时后续直接是像素数据，
-          // 没有背景色前缀（其余位应被忽略）。原实现对 Raw tile 也先读
-          // 一个像素当背景色并填充，会把数据整体错位 bpp 字节，导致花屏。
+          // 没有背景色前缀（其余位应被忽略），且不改变背景/前景状态。
           const rawLen = tw * th * bpp;
           if (remaining < rawLen) return null;
           const rawData = buffer.subarray(offset + consumed, offset + consumed + rawLen);
           const rgbaData = this.convertToRGBA(rawData, tw, th, format);
 
-          // 将 RGBA 数据复制到帧缓冲的对应位置
           for (let row = 0; row < th; row++) {
             const srcOff = row * tw * 4;
             const dstOff = ((ty + row) * width + tx) * 4;
@@ -287,62 +292,60 @@ export class EncodingDecoders {
 
           consumed += rawLen;
           remaining -= rawLen;
-        } else {
-          // 读取背景色（仅 bgSpec 置位时存在）
-          let bgColor: number[] = [0, 0, 0, 255];
-          if (bgSpec) {
-            if (remaining < bpp) return null;
-            bgColor = this.readPixel(buffer, offset + consumed, format);
-            consumed += bpp;
-            remaining -= bpp;
+          continue;
+        }
 
-            // 填充背景色
-            this.fillRect(fb, tx, ty, tw, th, bgColor, width);
-          }
+        // 背景色：本 tile 指定则更新状态；否则沿用上一 tile 的背景色
+        if (bgSpec) {
+          if (remaining < bpp) return null;
+          prevBg = this.readPixel(buffer, offset + consumed, format);
+          consumed += bpp;
+          remaining -= bpp;
+        }
+        // 前景色同理
+        if (fgSpec) {
+          if (remaining < bpp) return null;
+          prevFg = this.readPixel(buffer, offset + consumed, format);
+          consumed += bpp;
+          remaining -= bpp;
+        }
 
-          // 读取前景色
-          let fgColor: number[] = [0, 0, 0, 255];
-          if (fgSpec) {
-            if (remaining < bpp) return null;
-            fgColor = this.readPixel(buffer, offset + consumed, format);
-            consumed += bpp;
-            remaining -= bpp;
-          }
+        // 整个 tile 先铺背景（含「本 tile 未显式发背景」的延续背景）
+        this.fillRect(fb, tx, ty, tw, th, prevBg, width);
 
-          // 处理子矩形
-          if (anySub) {
-            const numSubRects = buffer[offset + consumed];
-            consumed++;
-            remaining--;
+        // 子矩形用前景覆盖
+        if (anySub) {
+          const numSubRects = buffer[offset + consumed];
+          consumed++;
+          remaining--;
 
-            for (let s = 0; s < numSubRects; s++) {
-              let scolor = fgColor;
-              if (subCol) {
-                if (remaining < bpp + 2) return null;
-                scolor = this.readPixel(buffer, offset + consumed, format);
-                consumed += bpp;
-                remaining -= bpp;
-              } else {
-                if (remaining < 2) return null;
-              }
-
-              // 子矩形位置和大小编码在2字节中
-              const posByte = buffer[offset + consumed];
-              const sizeByte = buffer[offset + consumed + 1];
-              consumed += 2;
-              remaining -= 2;
-
-              const sx = (posByte >> 4) & 0x0F;
-              const sy = posByte & 0x0F;
-              const sw = (sizeByte >> 4) & 0x0F;
-              const sh = sizeByte & 0x0F;
-
-              // 限制子矩形在块范围内
-              const actualSw = Math.min(sw + 1, tw - sx);
-              const actualSh = Math.min(sh + 1, th - sy);
-
-              this.fillRect(fb, tx + sx, ty + sy, actualSw, actualSh, scolor, width);
+          for (let s = 0; s < numSubRects; s++) {
+            let scolor = prevFg;
+            if (subCol) {
+              if (remaining < bpp + 2) return null;
+              scolor = this.readPixel(buffer, offset + consumed, format);
+              consumed += bpp;
+              remaining -= bpp;
+            } else {
+              if (remaining < 2) return null;
             }
+
+            // 子矩形位置和大小编码在2字节中
+            const posByte = buffer[offset + consumed];
+            const sizeByte = buffer[offset + consumed + 1];
+            consumed += 2;
+            remaining -= 2;
+
+            const sx = (posByte >> 4) & 0x0F;
+            const sy = posByte & 0x0F;
+            const sw = (sizeByte >> 4) & 0x0F;
+            const sh = sizeByte & 0x0F;
+
+            // 限制子矩形在块范围内
+            const actualSw = Math.min(sw + 1, tw - sx);
+            const actualSh = Math.min(sh + 1, th - sy);
+
+            this.fillRect(fb, tx + sx, ty + sy, actualSw, actualSh, scolor, width);
           }
         }
       }
