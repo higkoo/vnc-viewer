@@ -383,31 +383,48 @@ function renderRect(rect) {
     const ctx = canvas.getContext('2d');
     if (rect.encoding === 1) {
         // CopyRect: data 为大端序 srcX/srcY（各 2 字节）
+        // 直接在帧缓冲内按行复制（copyWithin 为 memmove 语义，重叠区域安全，
+        // 且避免 drawImage + 全屏 getImageData 的高开销）
+        if (rect.data.length < 4)
+            return;
         const srcX = (rect.data[0] << 8) | rect.data[1];
         const srcY = (rect.data[2] << 8) | rect.data[3];
-        ctx.drawImage(canvas, srcX, srcY, rect.width, rect.height, rect.x, rect.y, rect.width, rect.height);
-        // 更新 ImageData 缓存
-        const imageData = ctx.getImageData(0, 0, fbWidth, fbHeight);
-        fbCanvas = imageData;
+        const px = fbCanvas.data;
+        const copyW = Math.min(rect.width, fbWidth - Math.max(srcX, rect.x));
+        for (let row = 0; row < rect.height; row++) {
+            const sy = srcY + row;
+            const dy = rect.y + row;
+            if (sy < 0 || sy >= fbHeight || dy < 0 || dy >= fbHeight)
+                continue;
+            const srcOff = (sy * fbWidth + srcX) * 4;
+            const dstOff = (dy * fbWidth + rect.x) * 4;
+            px.copyWithin(dstOff, srcOff, srcOff + copyW * 4);
+        }
+        ctx.putImageData(fbCanvas, 0, 0, rect.x, rect.y, rect.width, rect.height);
         return;
     }
-    // 直接写入像素数据
     const data = Array.isArray(rect.data)
         ? new Uint8ClampedArray(rect.data)
         : new Uint8ClampedArray(rect.data.buffer, rect.data.byteOffset, rect.data.byteLength);
-    // 更新帧缓冲
-    for (let row = 0; row < rect.height; row++) {
-        for (let col = 0; col < rect.width; col++) {
-            const srcOff = (row * rect.width + col) * 4;
-            const dstOff = ((rect.y + row) * fbWidth + rect.x + col) * 4;
-            fbCanvas.data[dstOff] = data[srcOff];
-            fbCanvas.data[dstOff + 1] = data[srcOff + 1];
-            fbCanvas.data[dstOff + 2] = data[srcOff + 2];
-            fbCanvas.data[dstOff + 3] = 255;
-        }
+    // 裁剪到帧缓冲范围，防止越界
+    const x = Math.max(0, rect.x);
+    const y = Math.max(0, rect.y);
+    const w = Math.min(rect.width, fbWidth - x);
+    const h = Math.min(rect.height, fbHeight - y);
+    if (w <= 0 || h <= 0)
+        return;
+    const skipX = x - rect.x;
+    const skipY = y - rect.y;
+    // 用 32 位视图按行整块拷贝（解码器已保证 alpha=255），比逐像素循环快一个数量级
+    const src32 = new Uint32Array(data.buffer, data.byteOffset, data.byteLength >> 2);
+    const dst32 = new Uint32Array(fbCanvas.data.buffer);
+    for (let row = 0; row < h; row++) {
+        const srcStart = (skipY + row) * rect.width + skipX;
+        const dstStart = (y + row) * fbWidth + x;
+        dst32.set(src32.subarray(srcStart, srcStart + w), dstStart);
     }
     // 只渲染更新区域
-    ctx.putImageData(fbCanvas, 0, 0, rect.x, rect.y, rect.width, rect.height);
+    ctx.putImageData(fbCanvas, 0, 0, x, y, w, h);
 }
 // ---- 鼠标事件 ----
 function handleMouseDown(e) {
@@ -441,13 +458,32 @@ function handleMouseUp(e) {
     const pos = getCanvasPosition(e);
     vncApi.pointerEvent(mouseButtonMask, pos.x, pos.y);
 }
+// 鼠标移动节流：mousemove 触发频率远高于屏幕刷新率，逐条走 IPC 会拖垮渲染与主进程
+const MOUSE_MOVE_INTERVAL = 15;
+let lastMoveSentAt = 0;
+let moveTimer = null;
+let pendingMove = null;
 function handleMouseMove(e) {
     if (!isConnected)
         return;
     const pos = getCanvasPosition(e);
     lastMouseX = pos.x;
     lastMouseY = pos.y;
-    vncApi.pointerEvent(mouseButtonMask, pos.x, pos.y);
+    pendingMove = { mask: mouseButtonMask, x: pos.x, y: pos.y };
+    scheduleMouseMove();
+}
+function scheduleMouseMove() {
+    if (moveTimer !== null)
+        return;
+    const wait = Math.max(0, MOUSE_MOVE_INTERVAL - (Date.now() - lastMoveSentAt));
+    moveTimer = setTimeout(() => {
+        moveTimer = null;
+        if (!pendingMove)
+            return;
+        vncApi.pointerEvent(pendingMove.mask, pendingMove.x, pendingMove.y);
+        lastMoveSentAt = Date.now();
+        pendingMove = null;
+    }, wait);
 }
 function handleMouseWheel(e) {
     if (!isConnected)
