@@ -1,6 +1,6 @@
 {
   "name": "vnc-viewer",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "跨平台 VNC 查看器 - 参考 UltraVNC 实现",
   "main": "dist/main/main.js",
   "scripts": {
