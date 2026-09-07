@@ -20,6 +20,13 @@ export declare class RfbClient extends EventEmitter {
     private preferredEncodings;
     private currentEncoding;
     private buffer;
+    private coverageCols;
+    private coverageRows;
+    private coverageBits;
+    private coverageRequestPending;
+    private coverageRetries;
+    private static readonly COVERAGE_BLOCK_SIZE;
+    private static readonly COVERAGE_MAX_RETRIES;
     updateState(state: ConnectionState): void;
     getParams(): ConnectionParams;
     /** 从 buffer 中读取 n 字节，并移除已读部分 */
@@ -89,6 +96,9 @@ export declare class RfbClient extends EventEmitter {
      * 处理 FramebufferUpdate 消息
      */
     private processFramebufferUpdate;
+    private initCoverage;
+    private markCoverage;
+    private checkCoverageAndRequest;
     /**
      * 计算伪编码矩形携带的数据长度（从 dataOffset 起）
      * @returns 数据字节数；-1 表示数据尚未收全
