@@ -269,20 +269,10 @@ export class EncodingDecoders {
         const anySub = (subEnc & 0x08) !== 0;
         const subCol = (subEnc & 0x10) !== 0;
 
-        // 读取背景色
-        let bgColor: number[] = [0, 0, 0, 255];
-        if (bgSpec || isRaw) {
-          if (remaining < bpp) return null;
-          bgColor = this.readPixel(buffer, offset + consumed, format);
-          consumed += bpp;
-          remaining -= bpp;
-
-          // 填充背景色
-          this.fillRect(fb, tx, ty, tw, th, bgColor, width);
-        }
-
         if (isRaw) {
-          // Raw 子编码: 直接传输像素数据
+          // Raw tile (RFC 6143 §7.7.3): Raw 位置位时后续直接是像素数据，
+          // 没有背景色前缀（其余位应被忽略）。原实现对 Raw tile 也先读
+          // 一个像素当背景色并填充，会把数据整体错位 bpp 字节，导致花屏。
           const rawLen = tw * th * bpp;
           if (remaining < rawLen) return null;
           const rawData = buffer.subarray(offset + consumed, offset + consumed + rawLen);
@@ -298,6 +288,18 @@ export class EncodingDecoders {
           consumed += rawLen;
           remaining -= rawLen;
         } else {
+          // 读取背景色（仅 bgSpec 置位时存在）
+          let bgColor: number[] = [0, 0, 0, 255];
+          if (bgSpec) {
+            if (remaining < bpp) return null;
+            bgColor = this.readPixel(buffer, offset + consumed, format);
+            consumed += bpp;
+            remaining -= bpp;
+
+            // 填充背景色
+            this.fillRect(fb, tx, ty, tw, th, bgColor, width);
+          }
+
           // 读取前景色
           let fgColor: number[] = [0, 0, 0, 255];
           if (fgSpec) {
@@ -347,6 +349,50 @@ export class EncodingDecoders {
     }
 
     return { pixels: fb, consumed };
+  }
+
+  /**
+   * 解码 ZRLE 的 packed palette 位流并写入帧缓冲。
+   *
+   * RFC 6143 §7.7.5（及 noVNC/TigerVNC 解码实现）：调色板 2..16 色时，
+   * tile 的全部像素（行优先顺序）打包成一段连续位流，MSB 优先、跨行连续，
+   * 不在行边界对齐字节。tile 右边缘宽度不是 8/bits 的整倍数时，若按
+   * 「每行字节对齐」解位会从第二行起逐行错位，表现为条状花屏。
+   *
+   * @returns 消耗的字节数；数据不足返回 null
+   */
+  private blitPackedPalette(
+    buffer: Buffer, offset: number, palette: number[][], bits: number,
+    tw: number, th: number, fb: Buffer, tx: number, ty: number, fbWidth: number
+  ): number | null {
+    const totalPx = tw * th;
+    const packedLen = Math.ceil((totalPx * bits) / 8);
+    if (buffer.length < offset + packedLen) return null;
+
+    const mask = (1 << bits) - 1;
+    let byteAcc = 0;
+    let bitsInAcc = 0;
+    let src = 0;
+    let rowBase = ty * fbWidth + tx;
+
+    for (let i = 0; i < totalPx; i++) {
+      while (bitsInAcc < bits) {
+        byteAcc = (byteAcc << 8) | buffer[offset + src++];
+        bitsInAcc += 8;
+      }
+      const idx = (byteAcc >>> (bitsInAcc - bits)) & mask;
+      bitsInAcc -= bits;
+
+      const color = palette[idx] || [0, 0, 0, 255];
+      const dstOff = (rowBase + (i % tw)) * 4;
+      fb[dstOff] = color[0];
+      fb[dstOff + 1] = color[1];
+      fb[dstOff + 2] = color[2];
+      fb[dstOff + 3] = 255;
+
+      if (i % tw === tw - 1) rowBase += fbWidth;
+    }
+    return packedLen;
   }
 
   /**
@@ -404,26 +450,13 @@ export class EncodingDecoders {
             // 纯色 tile: 无像素数据
             this.fillRect(fb, tx, ty, tw, th, palette[0], width);
           } else if (paletteSize <= 16) {
-            // Plain palette 且调色板 <= 16 色时按位打包，每行按字节对齐
+            // Plain palette 且调色板 2..16 色：像素为跨行连续的位打包索引
             const bits = paletteSize <= 2 ? 1 : (paletteSize <= 4 ? 2 : 4);
-            const rowBytes = Math.ceil((tw * bits) / 8);
-            const packedLen = rowBytes * th;
-            if (buffer.length < offset + consumed + packedLen) return null;
-
-            const mask = (1 << bits) - 1;
-            for (let row = 0; row < th; row++) {
-              for (let col = 0; col < tw; col++) {
-                const bitIndex = col * bits;
-                const byte = buffer[offset + consumed + row * rowBytes + (bitIndex >> 3)];
-                const shift = 8 - bits - (bitIndex & 7);
-                const color = palette[(byte >> shift) & mask] || [0, 0, 0, 255];
-                const dstOff = ((ty + row) * width + tx + col) * 4;
-                fb[dstOff] = color[0];
-                fb[dstOff + 1] = color[1];
-                fb[dstOff + 2] = color[2];
-                fb[dstOff + 3] = 255;
-              }
-            }
+            const packedLen = this.blitPackedPalette(
+              buffer, offset + consumed, palette, bits,
+              tw, th, fb, tx, ty, width
+            );
+            if (packedLen === null) return null;
             consumed += packedLen;
           } else {
             // 调色板 > 16 色: 每个像素 1 字节索引
@@ -461,41 +494,11 @@ export class EncodingDecoders {
             }
           }
           consumed += rawLen;
-        } else if (subType >= 128 && subType <= 130) {
-          // Packed palette tile: 调色板 + 位打包索引
-          // 128 -> 1bit/2 色, 129 -> 2bit/4 色, 130 -> 4bit/16 色
-          const bitsPerPixel = 1 << (subType - 127);
-          const paletteSize = 1 << bitsPerPixel;
-          if (buffer.length < offset + consumed + paletteSize * cpi) return null;
-
-          const palette: number[][] = [];
-          for (let i = 0; i < paletteSize; i++) {
-            palette.push(this.readCPixel(buffer, offset + consumed, format, cpi));
-            consumed += cpi;
-          }
-
-          // 每行按字节对齐
-          const rowBytes = Math.ceil((tw * bitsPerPixel) / 8);
-          const packedLen = rowBytes * th;
-          if (buffer.length < offset + consumed + packedLen) return null;
-
-          const mask = paletteSize - 1;
-          for (let row = 0; row < th; row++) {
-            for (let col = 0; col < tw; col++) {
-              const bitIndex = col * bitsPerPixel;
-              const byte = buffer[offset + consumed + row * rowBytes + (bitIndex >> 3)];
-              const shift = 8 - bitsPerPixel - (bitIndex & 7);
-              const color = palette[(byte >> shift) & mask] || [0, 0, 0, 255];
-              const dstOff = ((ty + row) * width + tx + col) * 4;
-              fb[dstOff] = color[0];
-              fb[dstOff + 1] = color[1];
-              fb[dstOff + 2] = color[2];
-              fb[dstOff + 3] = 255;
-            }
-          }
-          consumed += packedLen;
         } else {
-          // 未知 tile 类型
+          // subType = tileType & 0x7F 恒为 0..127，已在上方全部分支覆盖。
+          // （此前曾有人添加 subType 128..130 的 packed palette 分支，但该条件
+          // 永不可达——packed palette（2..16 色位打包）由上面的 subType 2..16
+          // 分支处理，RLE 置位时由 decodeRLEPixels 处理。）
           return null;
         }
       }
