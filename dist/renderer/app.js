@@ -129,10 +129,16 @@ function setupEventListeners() {
     canvas.addEventListener('wheel', handleMouseWheel);
     canvas.addEventListener('mouseenter', () => { isPointerInside = true; });
     canvas.addEventListener('mouseleave', () => { isPointerInside = false; });
-    // 画布键盘事件
-    canvas.addEventListener('keydown', handleKeyDown);
-    canvas.addEventListener('keyup', handleKeyUp);
+    // 画布外释放 / 窗口失焦时清掉残留按键，防止远程鼠标键一直处于按下状态
+    // （拖拽移出窗口后松键是鼠标操作的常见失效场景）
+    window.addEventListener('mouseup', handleWindowMouseUp);
+    window.addEventListener('blur', handleWindowBlur);
+    // 画布右键菜单
     canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+    // 键盘事件提升到 window 级：即使画布因点击工具栏等操作失焦，
+    // 键盘仍能送达远程（此前画布失焦后按键会"消失"，表现为无法操作）。
+    window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('keyup', handleKeyUp);
     // 窗口大小变化
     window.addEventListener('resize', () => {
         if (zoomMode === 'fit')
@@ -145,8 +151,15 @@ function setupIPCListeners() {
     vncApi.onLog((entry) => {
         appendLog(entry);
     });
+    // 主进程按帧批量推送矩形（数组），兼容旧版单个矩形
     vncApi.onFramebufferUpdate((rect) => {
-        renderRect(rect);
+        if (Array.isArray(rect)) {
+            for (const r of rect)
+                renderRect(r);
+        }
+        else {
+            renderRect(rect);
+        }
     });
     vncApi.onConnectionState((state) => {
         currentState = state;
@@ -458,6 +471,30 @@ function handleMouseUp(e) {
     const pos = getCanvasPosition(e);
     vncApi.pointerEvent(mouseButtonMask, pos.x, pos.y);
 }
+// 在画布外释放鼠标：使用最后一次画布内坐标发送抬起，避免掩码残留
+function handleWindowMouseUp(e) {
+    if (!isConnected)
+        return;
+    const btn = e.button;
+    let mask = 0;
+    if (btn === 0)
+        mask = 1;
+    else if (btn === 1)
+        mask = 4;
+    else if (btn === 2)
+        mask = 2;
+    if (mask === 0 || (mouseButtonMask & mask) === 0)
+        return; // 画布内已处理
+    mouseButtonMask &= ~mask;
+    vncApi.pointerEvent(mouseButtonMask, lastMouseX, lastMouseY);
+}
+// 窗口失焦（如切换应用/Alt-Tab）时释放全部鼠标键
+function handleWindowBlur() {
+    if (!isConnected || mouseButtonMask === 0)
+        return;
+    mouseButtonMask = 0;
+    vncApi.pointerEvent(0, lastMouseX, lastMouseY);
+}
 // 鼠标移动节流：mousemove 触发频率远高于屏幕刷新率，逐条走 IPC 会拖垮渲染与主进程
 const MOUSE_MOVE_INTERVAL = 15;
 let lastMoveSentAt = 0;
@@ -518,8 +555,17 @@ function getCanvasPosition(e) {
     };
 }
 // ---- 键盘事件 ----
+// 焦点在输入控件/按钮上时按键归控件所有，不应转发给远程
+function isTypingTarget(target) {
+    const el = target;
+    if (!el || !el.tagName)
+        return false;
+    const tag = el.tagName;
+    return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT'
+        || tag === 'BUTTON' || el.isContentEditable;
+}
 function handleKeyDown(e) {
-    if (!isConnected)
+    if (!isConnected || isTypingTarget(e.target))
         return;
     e.preventDefault();
     // 特殊键组合
@@ -542,7 +588,7 @@ function handleKeyDown(e) {
     vncApi.keyEvent(e.keyCode, true);
 }
 function handleKeyUp(e) {
-    if (!isConnected)
+    if (!isConnected || isTypingTarget(e.target))
         return;
     e.preventDefault();
     vncApi.keyEvent(e.keyCode, false);

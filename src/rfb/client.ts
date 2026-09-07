@@ -376,6 +376,21 @@ export class RfbClient extends EventEmitter {
    * 实际延迟影响可忽略。
    */
   private processFramebufferUpdate(): boolean {
+    try {
+      return this.processFramebufferUpdateInner();
+    } catch (err) {
+      // 单帧解码异常（如服务器发送了非法/不支持的编码数据）不应拖垮整个连接：
+      // 丢弃本帧与累积解压状态，请求一次全量刷新以重新同步画面。
+      console.error('[RFB] 解码帧失败，请求全量刷新:', err);
+      this.encoders.resetStreams();
+      this.buffer = Buffer.alloc(0);
+      this.emit('framebuffer-resync');
+      return false;
+    }
+  }
+
+  /** 帧解析主体（模型说明见 processFramebufferUpdate） */
+  private processFramebufferUpdateInner(): boolean {
     // 消息结构: 1-byte msg-type(0), 1-byte padding, 2-byte number-of-rectangles
     if (this.buffer.length < 4) return false;
 

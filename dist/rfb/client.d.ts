@@ -87,13 +87,34 @@ export declare class RfbClient extends EventEmitter {
     private processServerMessage;
     /**
      * 处理 FramebufferUpdate 消息
+     *
+     * 采用「先完整解析整帧、再统一处理」的两阶段模型，消除 TCP 分片边界处
+     * 的状态错乱：
+     *
+     * 旧模型按数据到达即时消费矩形，并把已处理前缀从接收缓冲区移除；若某
+     * 个矩形恰好被 TCP 分片截断，会保留消息头等剩余分片，但消息头里的
+     * numRects 是整帧矩形总数，重解析时矩形数会与剩余数据不匹配，导致漏帧、
+     * 花屏甚至永久卡死；已喂入 ZRLE 累积流的压缩数据也可能被重复喂入而
+     * 解码错乱。
+     *
+     * 新模型第一阶段只确认每个矩形（含 ZRLE 压缩块、伪编码附加数据）已
+     * 完整到达并暂存，任一矩形不完整就返回 false，不做任何消费或副作用，
+     * 等后续分片补齐后重头解析；第二阶段整帧齐备后统一解码/派发，最后
+     * 一次性消费整帧字节。代价是帧要收齐才渲染，但 VNC 帧远小于 TCP 窗口，
+     * 实际延迟影响可忽略。
      */
     private processFramebufferUpdate;
+    /** 帧解析主体（模型说明见 processFramebufferUpdate） */
+    private processFramebufferUpdateInner;
     /**
-     * 计算伪编码矩形携带的数据长度（从 dataOffset 起）
-     * @returns 数据字节数；-1 表示数据尚未收全
+     * 读取伪编码矩形的附加数据（纯读取，不产生副作用）。
+     * @returns 附加数据 Buffer；null 表示数据尚未收全
      */
-    private pseudoEncodingDataLength;
+    private readPseudoEncodingPayload;
+    /**
+     * 应用伪编码的副作用（整帧齐备后调用，保证副作用只发生一次）
+     */
+    private applyPseudoEncoding;
     /**
      * 处理 SetColorMapEntries 消息
      */

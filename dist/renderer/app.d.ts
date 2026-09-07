@@ -126,6 +126,8 @@ declare function renderRect(rect: {
 }): void;
 declare function handleMouseDown(e: MouseEvent): void;
 declare function handleMouseUp(e: MouseEvent): void;
+declare function handleWindowMouseUp(e: MouseEvent): void;
+declare function handleWindowBlur(): void;
 declare const MOUSE_MOVE_INTERVAL = 15;
 declare let lastMoveSentAt: number;
 declare let moveTimer: ReturnType<typeof setTimeout> | null;
@@ -141,6 +143,7 @@ declare function getCanvasPosition(e: MouseEvent): {
     x: number;
     y: number;
 };
+declare function isTypingTarget(target: EventTarget | null): boolean;
 declare function handleKeyDown(e: KeyboardEvent): void;
 declare function handleKeyUp(e: KeyboardEvent): void;
 declare function sendCtrlAltDel(): void;

@@ -81,10 +81,36 @@ export declare class EncodingDecoders {
      */
     private decodeHextile;
     /**
+     * 解码 ZRLE 的 packed palette 像素并写入帧缓冲。
+     *
+     * 打包布局以 RealVNC 官方授权实现为准（libvncserver zrleencodetemplate.c，
+     * QEMU vnc-enc-zrle.c.inc 同源，neatvnc 同）：调色板 2..16 色时每个像素用
+     * ceil(log2(paletteSize)) 位表示（2 色=1bit、3-4 色=2bit、5-16 色=4bit），
+     * 每行独立成段：行内像素从字节 MSB 开始顺序取位，行尾不足一字节时左移
+     * 补零凑整，故每行固定占用 ceil(tw*bits/8) 字节，行与行互不跨接。tile
+     * 宽恰为 64 时位流模型与之等价，仅在右/下边缘的窄条 tile 有差异。
+     *
+     * @returns 消耗的字节数；数据不足返回 null
+     */
+    private blitPackedPalette;
+    /**
      * 解码 ZRLE tile 数据
      * ZRLE 使用 64x64 的 tile 和 CPIXEL (压缩像素) 格式
      */
     private decodeZRLETiles;
+    /**
+     * 解码 ZRLE palette tile 的 RLE 像素流。
+     *
+     * 线上格式（RealVNC/libvncserver/QEMU/neatvnc 编码器一致）：
+     * - 每个像素值为 1 字节 palette index（paletteSize ≤ 127，因此 index < 128）；
+     * - 一段重复 run 编码为 [index | 0x80][len-1 拆段...]：
+     *   先写「调色板索引 | 高位标记」，再写 (run长度-1)，超过 255 时拆成
+     *   多个 255 字节后跟一个 ≤254 的余数；解码时累加这些长度字节；
+     * - 单像素 run（长度 1..2）直接写裸 index，无高位标记。
+     *
+     * 注意：早先实现把 run 误解为 [长度|0x80][index]（与真实格式相反），
+     * 导致含大段重复色的 ZRLE tile（如窗口底色、文字行）整块花屏。
+     */
     private decodeRLEPixels;
     /**
      * CPIXEL 字节数 (RFC 6143 7.7.5)
