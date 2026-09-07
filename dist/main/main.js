@@ -48,6 +48,7 @@ let mainWindow = null;
 let rfbClient = null;
 let currentConnectionParams = null;
 let mobileServer = null;
+let lastUpdateRequestAt = 0;
 // ---- 配置管理 ----
 const CONFIG_PATH = path.join(electron_1.app.getPath('userData'), 'config.json');
 function loadConfig() {
@@ -278,6 +279,7 @@ function setupIPC() {
         }
         currentConnectionParams = params;
         rfbClient = new client_1.RfbClient();
+        lastUpdateRequestAt = 0;
         (0, logger_1.info)(`正在连接 ${params.host}:${params.port} ${params.shared ? '(共享模式)' : ''}`);
         // 状态变更
         rfbClient.on('state', (state) => {
@@ -292,6 +294,11 @@ function setupIPC() {
         rfbClient.on('framebuffer-done', () => {
             // 请求增量更新
             if (rfbClient && rfbClient.getState() === types_1.ConnectionState.Connected) {
+                // 持续更新模式下该事件会频繁触发，做节流避免请求风暴
+                const now = Date.now();
+                if (now - lastUpdateRequestAt < 50)
+                    return;
+                lastUpdateRequestAt = now;
                 rfbClient.requestFramebufferUpdate(true);
             }
         });

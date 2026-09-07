@@ -17,6 +17,7 @@ let mainWindow: BrowserWindow | null = null;
 let rfbClient: RfbClient | null = null;
 let currentConnectionParams: ConnectionParams | null = null;
 let mobileServer: MobileServer | null = null;
+let lastUpdateRequestAt: number = 0;
 
 // ---- 配置管理 ----
 const CONFIG_PATH = path.join(app.getPath('userData'), 'config.json');
@@ -259,6 +260,7 @@ function setupIPC(): void {
 
     currentConnectionParams = params;
     rfbClient = new RfbClient();
+    lastUpdateRequestAt = 0;
 
     info(`正在连接 ${params.host}:${params.port} ${params.shared ? '(共享模式)' : ''}`);
 
@@ -277,6 +279,10 @@ function setupIPC(): void {
     rfbClient.on('framebuffer-done', () => {
       // 请求增量更新
       if (rfbClient && rfbClient.getState() === ConnectionState.Connected) {
+        // 持续更新模式下该事件会频繁触发，做节流避免请求风暴
+        const now = Date.now();
+        if (now - lastUpdateRequestAt < 50) return;
+        lastUpdateRequestAt = now;
         rfbClient.requestFramebufferUpdate(true);
       }
     });

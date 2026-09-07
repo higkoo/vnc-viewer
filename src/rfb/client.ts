@@ -74,6 +74,8 @@ export class RfbClient extends EventEmitter {
 
     this.params = params;
     this.setState(ConnectionState.Connecting);
+    // 新连接重置持久化压缩流状态（ZRLE 可能跨矩形复用同一个 zlib 流）
+    this.encoders.resetStreams();
     this.preferredEncodings = [
       EncodingType.CopyRect,
       EncodingType.ZRLE,
@@ -166,7 +168,8 @@ export class RfbClient extends EventEmitter {
     msg.writeUInt16BE(encodings.length, 2);
 
     for (let i = 0; i < encodings.length; i++) {
-      msg.writeInt32BE(encodings[i], 4 + i * 4);
+      // 伪编码（如 0xFFFFFF11）超过 int32 上限，必须用无符号写入
+      msg.writeUInt32BE(encodings[i] >>> 0, 4 + i * 4);
     }
     this.send(msg);
   }
@@ -362,84 +365,127 @@ export class RfbClient extends EventEmitter {
     if (this.buffer.length < 4) return false;
 
     const numRects = this.buffer.readUInt16BE(2);
+    // numRects 为 0xFFFF 表示"持续更新"模式：一直读取矩形，直到 LastRect 伪编码
+    const continuous = numRects === 0xFFFF;
     let offset = 4;
+    let safeOffset = 4; // 已完整处理的数据末尾，用于增量推进缓冲区
+    let handled = 0;
+    let lastRect = false;
 
-    for (let i = 0; i < numRects; i++) {
+    /**
+     * 推进已处理数据，等待后续分片。
+     * 注意：一条消息可能跨多个 TCP 分片，推进时必须保留 4 字节消息头，
+     * 否则后续分片会被当成新消息解析导致错位。
+     */
+    const flush = (): boolean => {
+      if (safeOffset > 4) {
+        const header = Buffer.from(this.buffer.subarray(0, 4));
+        this.buffer = Buffer.concat([header, this.buffer.subarray(safeOffset)]);
+      }
+      safeOffset = 4;
+      offset = 4;
+      if (continuous && handled > 0) this.emit('framebuffer-done');
+      return false;
+    };
+
+    while (continuous ? !lastRect : handled < numRects) {
       // 每个矩形: 2-byte x, 2-byte y, 2-byte width, 2-byte height, 4-byte encoding
-      if (this.buffer.length < offset + 12) return false;
+      if (this.buffer.length < offset + 12) return flush();
 
       const x = this.buffer.readUInt16BE(offset);
       const y = this.buffer.readUInt16BE(offset + 2);
       const width = this.buffer.readUInt16BE(offset + 4);
       const height = this.buffer.readUInt16BE(offset + 6);
-      const encoding = this.buffer.readInt32BE(offset + 8);
+      // 必须按无符号读取：伪编码（如 0xFFFFFF11）用 readInt32BE 会得到负数
+      const encoding = this.buffer.readUInt32BE(offset + 8);
 
       offset += 12;
 
-      // 处理伪编码
-      const isPseudoEncoding = encoding >= 0xFFFFFF00;
+      if (encoding >= 0xFFFFFF00) {
+        const consumed = this.pseudoEncodingDataLength(encoding, width, height, offset);
+        if (consumed < 0) return flush(); // 数据不足
+        if (encoding === EncodingType.LastRect) lastRect = true;
+        offset += consumed;
+      } else if (encoding === EncodingType.ZRLE) {
+        // ZRLE: 服务器可能跨矩形复用 zlib 流，喂入压缩数据后由解码器择机回调
+        if (this.buffer.length < offset + 4) return flush();
+        const compressedLen = this.buffer.readUInt32BE(offset);
+        if (this.buffer.length < offset + 4 + compressedLen) return flush(); // 数据不足
 
-      if (isPseudoEncoding) {
-        const handled = this.handlePseudoEncoding(encoding, width, height);
-        if (!handled) return false;
-        continue;
+        this.encoders.feedZrle(
+          Buffer.from(this.buffer.subarray(offset + 4, offset + 4 + compressedLen)),
+          x, y, width, height, this.pixelFormat,
+          (rect) => this.emit('framebuffer-update', rect)
+        );
+        offset += 4 + compressedLen;
+      } else {
+        const result = this.encoders.decode(
+          this.buffer, offset, encoding, width, height, this.pixelFormat
+        );
+        if (result === null) return flush(); // 数据不足
+
+        offset += result.consumed;
+        this.currentEncoding = encoding;
+
+        this.emit('framebuffer-update', {
+          x, y, width, height, encoding, data: result.pixels,
+        } as FramebufferRect);
       }
 
-      // 解码矩形数据
-      const result = this.encoders.decode(
-        this.buffer, offset, encoding, width, height, this.pixelFormat
-      );
-
-      if (result === null) return false; // 数据不足
-
-      offset += result.consumed;
-      this.currentEncoding = encoding;
-
-      this.emit('framebuffer-update', {
-        x, y, width, height, encoding, data: result.pixels,
-      } as FramebufferRect);
+      handled++;
+      safeOffset = offset;
     }
 
-    this.buffer = this.buffer.subarray(offset);
+    if (safeOffset > 0) this.buffer = this.buffer.subarray(safeOffset);
     this.emit('framebuffer-done');
     return true;
   }
 
   /**
-   * 处理伪编码
+   * 计算伪编码矩形携带的数据长度（从 dataOffset 起）
+   * @returns 数据字节数；-1 表示数据尚未收全
    */
-  private handlePseudoEncoding(encoding: number, width: number, height: number): boolean {
+  private pseudoEncodingDataLength(
+    encoding: number, width: number, height: number, dataOffset: number
+  ): number {
     switch (encoding) {
       case EncodingType.LastRect:
-        // 无数据，仅标记
-        return true;
+        return 0;
 
       case EncodingType.NewFBSize:
         this.fbWidth = width;
         this.fbHeight = height;
         this.emit('desktop-size', { width, height });
-        return true;
+        return 0;
 
-      case EncodingType.DesktopName:
-        if (this.buffer.length < 4) return false;
-        // 实际上这里需要处理不同实现
-        return true;
+      case EncodingType.PointerPos:
+        // 指针位置伪编码，无附加数据
+        return 0;
+
+      case EncodingType.DesktopName: {
+        if (this.buffer.length < dataOffset + 4) return -1;
+        const nameLen = this.buffer.readUInt32BE(dataOffset);
+        if (this.buffer.length < dataOffset + 4 + nameLen) return -1;
+        this.desktopName = this.buffer.toString('utf8', dataOffset + 4, dataOffset + 4 + nameLen);
+        this.emit('desktop-name', this.desktopName);
+        return 4 + nameLen;
+      }
 
       case EncodingType.Cursor:
-      case EncodingType.RichCursor:
-        // 光标数据 - 需要解析光标像素和掩码
-        // 简单实现: 跳过光标数据
-        const cursorDataLen = width * height * (this.pixelFormat.bitsPerPixel / 8);
-        // 光标掩码 (按行对齐到4字节)
+      case EncodingType.RichCursor: {
+        const bytesPerPixel = Math.max(1, Math.ceil(this.pixelFormat.bitsPerPixel / 8));
+        // 光标像素 + 位掩码（每行按字节对齐）
+        const pixelsLen = width * height * bytesPerPixel;
         const maskLen = Math.ceil(width / 8) * height;
-        const totalLen = cursorDataLen + maskLen;
-        if (this.buffer.length < totalLen) return false;
-        this.buffer = this.buffer.subarray(totalLen);
+        const total = pixelsLen + maskLen;
+        if (this.buffer.length < dataOffset + total) return -1;
         this.emit('cursor', { width, height });
-        return true;
+        return total;
+      }
 
       default:
-        return true;
+        // 未知伪编码，无附加数据
+        return 0;
     }
   }
 

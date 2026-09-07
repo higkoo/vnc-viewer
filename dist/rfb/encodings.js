@@ -49,7 +49,119 @@ const zlib = __importStar(require("zlib"));
 const types_1 = require("./types");
 class EncodingDecoders {
     constructor() {
-        this.inflatePool = new Map();
+        /**
+         * ZRLE 持久化 zlib 流状态。
+         *
+         * 部分服务器（如 x11vnc/TigerVNC）对一个连接上的所有 ZRLE 矩形复用同一个 zlib 流：
+         * 只有第一个矩形带 zlib 头（78 9c...），后续矩形是 deflate 续流，每块以 Z_SYNC_FLUSH 结束。
+         * 由于 zlib 的 LZ77 会回溯 32KB 历史，这里用「raw deflate + 32KB 滑动字典」同步还原，
+         * 既保持解析逻辑同步，又避免 O(n²) 的重解压。
+         */
+        this.zrleStarted = false;
+        this.zrleHistory = Buffer.alloc(0);
+        /** 已累积但尚未解出完整 tile 数据的压缩数据 */
+        this.zrlePending = Buffer.alloc(0);
+        /** 已消费的解压输出字节数（相对当前累积解压结果） */
+        this.zrleOutConsumed = 0;
+        /** 已喂入压缩数据、等待 tile 数据齐备的矩形 */
+        this.zrleQueue = [];
+    }
+    /** 新建连接或重连时重置流状态 */
+    resetStreams() {
+        this.zrleStarted = false;
+        this.zrleHistory = Buffer.alloc(0);
+        this.zrlePending = Buffer.alloc(0);
+        this.zrleOutConsumed = 0;
+        this.zrleQueue = [];
+    }
+    /** 记录已解压输出，仅保留窗口需要的尾部数据 */
+    appendZrleHistory(out) {
+        this.zrleHistory = Buffer.concat([this.zrleHistory, out]);
+        const keep = EncodingDecoders.ZLIB_WINDOW * 2;
+        if (this.zrleHistory.length > keep) {
+            this.zrleHistory = this.zrleHistory.subarray(this.zrleHistory.length - keep);
+        }
+    }
+    /**
+     * 喂入一个 ZRLE 矩形的压缩数据。
+     *
+     * 由于服务器的 zlib flush 边界与矩形边界不一定对齐，单个矩形的压缩数据可能无法
+     * 立刻解出完整 tile 数据。这里把压缩数据累积起来，能解出多少矩形就回调多少，
+     * 剩下的等后续矩形的数据到达后再解（顺序不变）。
+     */
+    feedZrle(compressed, x, y, width, height, format, emit) {
+        this.zrlePending = Buffer.concat([this.zrlePending, compressed]);
+        this.zrleQueue.push({ x, y, width, height, format });
+        this.drainZrle(emit);
+    }
+    /** 解压当前累积的压缩数据 */
+    inflateZrlePending() {
+        if (!this.zrleStarted) {
+            // 首个块带 zlib 头
+            try {
+                return zlib.inflateSync(this.zrlePending, {
+                    finishFlush: zlib.constants.Z_SYNC_FLUSH,
+                    maxOutputLength: EncodingDecoders.MAX_OUTPUT,
+                });
+            }
+            catch (err) {
+                return null;
+            }
+        }
+        const win = this.zrleHistory.length > EncodingDecoders.ZLIB_WINDOW
+            ? this.zrleHistory.subarray(this.zrleHistory.length - EncodingDecoders.ZLIB_WINDOW)
+            : this.zrleHistory;
+        try {
+            return zlib.inflateRawSync(this.zrlePending, {
+                finishFlush: zlib.constants.Z_SYNC_FLUSH,
+                dictionary: win,
+                maxOutputLength: EncodingDecoders.MAX_OUTPUT,
+            });
+        }
+        catch (err) {
+            // 兜底：个别服务器每个矩形都是独立 zlib 流
+            try {
+                return zlib.inflateSync(this.zrlePending, {
+                    finishFlush: zlib.constants.Z_SYNC_FLUSH,
+                    maxOutputLength: EncodingDecoders.MAX_OUTPUT,
+                });
+            }
+            catch (e) {
+                return null;
+            }
+        }
+    }
+    /** 尽可能多地解出积压矩形的 tile 数据 */
+    drainZrle(emit) {
+        if (this.zrleQueue.length === 0)
+            return;
+        const out = this.inflateZrlePending();
+        if (out === null)
+            return;
+        let cursor = this.zrleOutConsumed;
+        let drained = 0;
+        for (const q of this.zrleQueue) {
+            const res = this.decodeZRLETiles(out, cursor, q.width, q.height, q.format);
+            if (res === null)
+                break; // tile 数据尚未解出，等待更多压缩数据
+            emit({
+                x: q.x, y: q.y, width: q.width, height: q.height,
+                encoding: types_1.EncodingType.ZRLE, data: res.pixels,
+            });
+            cursor += res.consumed;
+            drained++;
+        }
+        if (drained === 0)
+            return;
+        this.appendZrleHistory(out.subarray(this.zrleOutConsumed, cursor));
+        this.zrleOutConsumed = cursor;
+        this.zrleQueue = this.zrleQueue.slice(drained);
+        this.zrleStarted = true;
+        // 全部解出且输出消费干净：重置累积，后续用字典续流，避免无界增长
+        if (this.zrleQueue.length === 0 && this.zrleOutConsumed === out.length) {
+            this.zrlePending = Buffer.alloc(0);
+            this.zrleOutConsumed = 0;
+        }
     }
     /**
      * 解码矩形数据
@@ -64,8 +176,7 @@ class EncodingDecoders {
                 return this.decodeRRE(buffer, offset, width, height, format);
             case types_1.EncodingType.Hextile:
                 return this.decodeHextile(buffer, offset, width, height, format);
-            case types_1.EncodingType.ZRLE:
-                return this.decodeZRLE(buffer, offset, width, height, format);
+            // ZRLE 走 feedZrle(): 服务器可能跨矩形复用 zlib 流，需要累积解压后回调
             default:
                 // 未知编码，尝试跳过
                 return null;
@@ -239,27 +350,6 @@ class EncodingDecoders {
         return { pixels: fb, consumed };
     }
     /**
-     * ZRLE (Zlib Run-Length Encoding) 编码
-     * 数据: 4-byte length, zlib-compressed data
-     * 解压后: tiles 使用 CPIXEL 格式
-     */
-    decodeZRLE(buffer, offset, width, height, format) {
-        if (buffer.length < offset + 4)
-            return null;
-        const compressedLen = buffer.readUInt32BE(offset);
-        if (buffer.length < offset + 4 + compressedLen)
-            return null;
-        const compressedData = buffer.subarray(offset + 4, offset + 4 + compressedLen);
-        try {
-            // 解压 Zlib 数据
-            const decompressed = zlib.inflateSync(compressedData);
-            return this.decodeZRLETiles(decompressed, 0, width, height, format);
-        }
-        catch (err) {
-            return null;
-        }
-    }
-    /**
      * 解码 ZRLE tile 数据
      * ZRLE 使用 64x64 的 tile 和 CPIXEL (压缩像素) 格式
      */
@@ -267,6 +357,8 @@ class EncodingDecoders {
         const totalPixels = width * height * 4;
         const fb = Buffer.alloc(totalPixels);
         let consumed = 0;
+        // ZRLE 内部使用 CPIXEL：32bpp 且三分量均 <= 255 时为 3 字节 RGB
+        const cpi = this.cpixelSize(format);
         // 处理 64x64 的 tile
         for (let ty = 0; ty < height; ty += 64) {
             for (let tx = 0; tx < width; tx += 64) {
@@ -279,18 +371,15 @@ class EncodingDecoders {
                 consumed++;
                 const subType = tileType & 0x7F;
                 const isRLE = (tileType & 0x80) !== 0;
-                // 跳过 palette 模式
-                // 简化处理: 使用 Raw 子类型
-                if (subType >= 1 && subType <= 99) {
-                    // Raw palette RLE
+                if (subType >= 1 && subType <= 127) {
+                    // 调色板 tile: subType 即调色板大小
                     const paletteSize = subType;
+                    if (buffer.length < offset + consumed + paletteSize * cpi)
+                        return null;
                     const palette = [];
                     for (let i = 0; i < paletteSize; i++) {
-                        if (buffer.length < offset + consumed + 3)
-                            return null;
-                        const cpixel = this.readCPixel(buffer, offset + consumed, format);
-                        palette.push(cpixel);
-                        consumed += 3; // CPIXEL 总是 3 字节
+                        palette.push(this.readCPixel(buffer, offset + consumed, format, cpi));
+                        consumed += cpi;
                     }
                     if (isRLE) {
                         // RLE 编码的像素索引
@@ -305,8 +394,35 @@ class EncodingDecoders {
                             result.pixels.copy(fb, dstOff, srcOff, srcOff + tw * 4);
                         }
                     }
+                    else if (paletteSize === 1) {
+                        // 纯色 tile: 无像素数据
+                        this.fillRect(fb, tx, ty, tw, th, palette[0], width);
+                    }
+                    else if (paletteSize <= 16) {
+                        // Plain palette 且调色板 <= 16 色时按位打包，每行按字节对齐
+                        const bits = paletteSize <= 2 ? 1 : (paletteSize <= 4 ? 2 : 4);
+                        const rowBytes = Math.ceil((tw * bits) / 8);
+                        const packedLen = rowBytes * th;
+                        if (buffer.length < offset + consumed + packedLen)
+                            return null;
+                        const mask = (1 << bits) - 1;
+                        for (let row = 0; row < th; row++) {
+                            for (let col = 0; col < tw; col++) {
+                                const bitIndex = col * bits;
+                                const byte = buffer[offset + consumed + row * rowBytes + (bitIndex >> 3)];
+                                const shift = 8 - bits - (bitIndex & 7);
+                                const color = palette[(byte >> shift) & mask] || [0, 0, 0, 255];
+                                const dstOff = ((ty + row) * width + tx + col) * 4;
+                                fb[dstOff] = color[0];
+                                fb[dstOff + 1] = color[1];
+                                fb[dstOff + 2] = color[2];
+                                fb[dstOff + 3] = 255;
+                            }
+                        }
+                        consumed += packedLen;
+                    }
                     else {
-                        // Plain palette: 每个像素1字节索引
+                        // 调色板 > 16 色: 每个像素 1 字节索引
                         const pixelLen = tw * th;
                         if (buffer.length < offset + consumed + pixelLen)
                             return null;
@@ -325,33 +441,61 @@ class EncodingDecoders {
                     }
                 }
                 else if (subType === 0) {
-                    // Raw pixel data
-                    const bpp = Math.min(format.bitsPerPixel / 8, 4);
-                    const rawLen = tw * th * bpp;
+                    // Raw tile: CPIXEL 序列
+                    const rawLen = tw * th * cpi;
                     if (buffer.length < offset + consumed + rawLen)
                         return null;
-                    const rawData = buffer.subarray(offset + consumed, offset + consumed + rawLen);
-                    const rgbaData = this.convertToRGBA(rawData, tw, th, format);
                     for (let row = 0; row < th; row++) {
-                        const srcOff = row * tw * 4;
-                        const dstOff = ((ty + row) * width + tx) * 4;
-                        rgbaData.copy(fb, dstOff, srcOff, srcOff + tw * 4);
+                        for (let col = 0; col < tw; col++) {
+                            const color = this.readCPixel(buffer, offset + consumed + (row * tw + col) * cpi, format, cpi);
+                            const dstOff = ((ty + row) * width + tx + col) * 4;
+                            fb[dstOff] = color[0];
+                            fb[dstOff + 1] = color[1];
+                            fb[dstOff + 2] = color[2];
+                            fb[dstOff + 3] = 255;
+                        }
                     }
                     consumed += rawLen;
                 }
-                else if (subType >= 100 && subType <= 127) {
-                    // Solid color tile: 只有一种颜色
-                    const cpixel = this.readCPixel(buffer, offset + consumed, format);
-                    consumed += 3;
-                    this.fillRect(fb, tx, ty, tw, th, cpixel, width);
+                else if (subType >= 128 && subType <= 130) {
+                    // Packed palette tile: 调色板 + 位打包索引
+                    const bitsPerPixel = subType - 127; // 128 -> 1bit, 129 -> 2bit, 130 -> 4bit
+                    const paletteSize = 1 << bitsPerPixel;
+                    if (buffer.length < offset + consumed + paletteSize * cpi)
+                        return null;
+                    const palette = [];
+                    for (let i = 0; i < paletteSize; i++) {
+                        palette.push(this.readCPixel(buffer, offset + consumed, format, cpi));
+                        consumed += cpi;
+                    }
+                    // 每行按字节对齐
+                    const rowBytes = Math.ceil((tw * bitsPerPixel) / 8);
+                    const packedLen = rowBytes * th;
+                    if (buffer.length < offset + consumed + packedLen)
+                        return null;
+                    const mask = paletteSize - 1;
+                    for (let row = 0; row < th; row++) {
+                        for (let col = 0; col < tw; col++) {
+                            const bitIndex = col * bitsPerPixel;
+                            const byte = buffer[offset + consumed + row * rowBytes + (bitIndex >> 3)];
+                            const shift = 8 - bitsPerPixel - (bitIndex & 7);
+                            const color = palette[(byte >> shift) & mask] || [0, 0, 0, 255];
+                            const dstOff = ((ty + row) * width + tx + col) * 4;
+                            fb[dstOff] = color[0];
+                            fb[dstOff + 1] = color[1];
+                            fb[dstOff + 2] = color[2];
+                            fb[dstOff + 3] = 255;
+                        }
+                    }
+                    consumed += packedLen;
                 }
                 else {
-                    // Packed palette tiles - 简化处理，跳过
+                    // 未知 tile 类型
                     return null;
                 }
             }
         }
-        return { pixels: fb, consumed: consumed + 4 + 4 }; // +4 for length +4 for consumed header
+        return { pixels: fb, consumed };
     }
     decodeRLEPixels(buffer, offset, width, height, palette) {
         const totalPixels = width * height * 4;
@@ -383,26 +527,50 @@ class EncodingDecoders {
                 }
             }
             else {
-                // Single pixel + palette index (b & 0x3F) + 1 个单一像素
-                // 简化: 将 b 直接作为 palette 索引（无重复）
-                const color = palette[b & 0x7F] || [0, 0, 0, 255];
-                const row = Math.floor(pixelIdx / width);
-                const col = pixelIdx % width;
-                const dstOff = (row * width + col) * 4;
-                fb[dstOff] = color[0];
-                fb[dstOff + 1] = color[1];
-                fb[dstOff + 2] = color[2];
-                fb[dstOff + 3] = 255;
-                pixelIdx++;
+                // 非 run: 后续 (b + 1) 个字节，每个都是调色板索引
+                const count = b + 1;
+                if (buffer.length < offset + consumed + count)
+                    return null;
+                for (let i = 0; i < count && pixelIdx < width * height; i++) {
+                    const color = palette[buffer[offset + consumed]] || [0, 0, 0, 255];
+                    consumed++;
+                    const row = Math.floor(pixelIdx / width);
+                    const col = pixelIdx % width;
+                    const dstOff = (row * width + col) * 4;
+                    fb[dstOff] = color[0];
+                    fb[dstOff + 1] = color[1];
+                    fb[dstOff + 2] = color[2];
+                    fb[dstOff + 3] = 255;
+                    pixelIdx++;
+                }
             }
         }
         return { pixels: fb, consumed };
     }
     /**
-     * 读取 CPIXEL (压缩像素，总是3字节 RGB)
+     * CPIXEL 字节数 (RFC 6143 7.7.5)
+     * - 8bpp: 1 字节
+     * - 16bpp: 2 字节
+     * - 32bpp: 三分量均不超过 255 时为 3 字节 RGB，否则 4 字节
      */
-    readCPixel(buffer, offset, format) {
-        return [buffer[offset], buffer[offset + 1], buffer[offset + 2], 255];
+    cpixelSize(format) {
+        if (format.bitsPerPixel === 8)
+            return 1;
+        if (format.bitsPerPixel === 16)
+            return 2;
+        return (format.redMax <= 255 && format.greenMax <= 255 && format.blueMax <= 255) ? 3 : 4;
+    }
+    /**
+     * 读取 CPIXEL (压缩像素)
+     */
+    readCPixel(buffer, offset, format, size = 3) {
+        if (size === 3)
+            return [buffer[offset], buffer[offset + 1], buffer[offset + 2], 255];
+        if (size === 1)
+            return this.readPixel(buffer, offset, { ...format, bitsPerPixel: 8 });
+        if (size === 2)
+            return this.readPixel(buffer, offset, { ...format, bitsPerPixel: 16 });
+        return this.readPixel(buffer, offset, format);
     }
     /**
      * 读取一个像素值
@@ -467,4 +635,6 @@ class EncodingDecoders {
     }
 }
 exports.EncodingDecoders = EncodingDecoders;
+EncodingDecoders.ZLIB_WINDOW = 32768;
+EncodingDecoders.MAX_OUTPUT = 64 * 1024 * 1024;
 //# sourceMappingURL=encodings.js.map

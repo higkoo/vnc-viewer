@@ -90,9 +90,10 @@ export declare class RfbClient extends EventEmitter {
      */
     private processFramebufferUpdate;
     /**
-     * 处理伪编码
+     * 计算伪编码矩形携带的数据长度（从 dataOffset 起）
+     * @returns 数据字节数；-1 表示数据尚未收全
      */
-    private handlePseudoEncoding;
+    private pseudoEncodingDataLength;
     /**
      * 处理 SetColorMapEntries 消息
      */
