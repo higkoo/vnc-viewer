@@ -18,36 +18,37 @@ export declare class EncodingDecoders {
     /**
      * ZRLE 持久化 zlib 流状态。
      *
-     * 部分服务器（如 x11vnc/TigerVNC）对一个连接上的所有 ZRLE 矩形复用同一个 zlib 流：
-     * 只有第一个矩形带 zlib 头（78 9c...），后续矩形是 deflate 续流，每块以 Z_SYNC_FLUSH 结束。
-     * 由于 zlib 的 LZ77 会回溯 32KB 历史，这里用「raw deflate + 32KB 滑动字典」同步还原，
-     * 既保持解析逻辑同步，又避免 O(n²) 的重解压。
+     * 服务器（x11vnc / TigerVNC）通常跨矩形复用同一个 zlib 流：首块带 zlib 头，
+     * 后续块是 raw deflate 续流并以 Z_SYNC_FLUSH 结尾。
+     *
+     * 这里采用「全缓冲区重复解压」模型：
+     * - 每到达一个矩形的压缩数据就追加到累积缓冲；
+     * - 每次把累积的全部压缩数据交给 zlib 重新解压——zlib 自己维护滑动窗口与
+     *   回溯引用状态，无需手动管理 32KB 字典，从根源消除字典失配导致的像素错位；
+     * - 解压输出中只取「上次已消费位置之后」的新数据解析矩形，避免重复解析；
+     * - 全部矩形解出后清空累积缓冲，防止无界增长。
+     *
+     * 复杂度 O(n²)（n = 矩形数），但 VNC 帧通常 < 30 矩形、累积压缩数据 < 1MB，
+     * 重复解压耗时在毫秒级，可忽略。
      */
-    private zrleStarted;
-    private zrleHistory;
-    /** 已累积但尚未解出完整 tile 数据的压缩数据 */
-    private zrlePending;
-    /** 已消费的解压输出字节数（相对当前累积解压结果） */
+    /** 累积的全部压缩数据（从连接/帧开始） */
+    private zrleAccumulated;
+    /** 已解压输出中已被解析消费的字节数 */
     private zrleOutConsumed;
     /** 已喂入压缩数据、等待 tile 数据齐备的矩形 */
     private zrleQueue;
-    private static readonly ZLIB_WINDOW;
     private static readonly MAX_OUTPUT;
     /** 新建连接或重连时重置流状态 */
     resetStreams(): void;
-    /** 记录已解压输出，仅保留窗口需要的尾部数据 */
-    private appendZrleHistory;
     /**
      * 喂入一个 ZRLE 矩形的压缩数据。
      *
-     * 由于服务器的 zlib flush 边界与矩形边界不一定对齐，单个矩形的压缩数据可能无法
-     * 立刻解出完整 tile 数据。这里把压缩数据累积起来，能解出多少矩形就回调多少，
-     * 剩下的等后续矩形的数据到达后再解（顺序不变）。
+     * 把压缩块追加到累积缓冲，记录矩形元信息，然后尝试从解压输出中解出积压矩形。
      */
     feedZrle(compressed: Buffer, x: number, y: number, width: number, height: number, format: PixelFormat, emit: (rect: FramebufferRect) => void): void;
-    /** 解压当前累积的压缩数据 */
-    private inflateZrlePending;
-    /** 尽可能多地解出积压矩形的 tile 数据 */
+    /** 解压当前累积的全部压缩数据 */
+    private inflateAll;
+    /** 从解压输出中尽可能多地解出积压矩形的 tile 数据 */
     private drainZrle;
     /**
      * 解码矩形数据
@@ -94,6 +95,11 @@ export declare class EncodingDecoders {
     private cpixelSize;
     /**
      * 读取 CPIXEL (压缩像素)
+     * 3 字节 CPIXEL = 像素值的低 3 字节（最高字节省略，RFC 6143 §7.7.5）：
+     * - 小端格式：线序为 [低,中,高] → value = b0 | b1<<8 | b2<<16
+     * - 大端格式：线序为 [高,中,低] → value = b0<<16 | b1<<8 | b2
+     * 取回像素值后仍需按 redShift/greenShift/blueShift 提取通道，
+     * 不能直接把线序字节当 RGB（对 LE + redShift=16 的服务器会导致红蓝互换）。
      */
     private readCPixel;
     /**
