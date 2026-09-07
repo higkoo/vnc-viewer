@@ -12,6 +12,8 @@ export declare class RfbClient extends EventEmitter {
     private handshake;
     private encoders;
     private input;
+    /** 连接/握手超时（毫秒），防止目标不可达或无响应时界面永久卡在“连接中” */
+    private static readonly CONNECT_TIMEOUT;
     private serverVersion;
     private fbWidth;
     private fbHeight;
@@ -20,6 +22,13 @@ export declare class RfbClient extends EventEmitter {
     private preferredEncodings;
     private currentEncoding;
     private buffer;
+    private coverageCols;
+    private coverageRows;
+    private coverageBits;
+    private coverageRequestPending;
+    private coverageRetries;
+    private static readonly COVERAGE_BLOCK_SIZE;
+    private static readonly COVERAGE_MAX_RETRIES;
     updateState(state: ConnectionState): void;
     getParams(): ConnectionParams;
     /** 从 buffer 中读取 n 字节，并移除已读部分 */
@@ -106,6 +115,9 @@ export declare class RfbClient extends EventEmitter {
     private processFramebufferUpdate;
     /** 帧解析主体（模型说明见 processFramebufferUpdate） */
     private processFramebufferUpdateInner;
+    private initCoverage;
+    private markCoverage;
+    private checkCoverageAndRequest;
     /**
      * 读取伪编码矩形的附加数据（纯读取，不产生副作用）。
      * @returns 附加数据 Buffer；null 表示数据尚未收全

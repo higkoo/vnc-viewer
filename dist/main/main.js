@@ -430,6 +430,10 @@ electron_1.app.whenReady().then(() => {
     mobileServer.start();
     electron_1.app.on('activate', () => {
         if (electron_1.BrowserWindow.getAllWindows().length === 0) {
+            // macOS 关窗后 app 常驻，重新打开窗口时若手机代理已停止则按配置恢复
+            if (!mobileServer) {
+                restartMobileServer(loadConfig().mobilePort);
+            }
             createWindow();
         }
     });
