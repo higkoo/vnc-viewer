@@ -7,9 +7,9 @@
  * 不再直接读取 socket，以兼容 client.ts 的 data 事件处理机制。
  */
 
-import * as crypto from 'crypto';
 import { RfbClient } from './client';
 import { SecurityType, ConnectionState, RFB_VERSIONS, RfbVersion } from './types';
+import { desEcbEncrypt } from './des';
 
 export class RfbHandshake {
   private client: RfbClient;
@@ -234,13 +234,8 @@ export class RfbHandshake {
         keyBuf[i] = this.reverseBits(keyBuf[i]);
       }
 
-      // DES ECB 加密
-      const cipher = crypto.createCipheriv('des-ecb', keyBuf, null as any);
-      cipher.setAutoPadding(false);
-      const encrypted = Buffer.concat([
-        cipher.update(challenge),
-        cipher.final(),
-      ]);
+      // DES ECB 加密（纯 JS 实现，避免 OpenSSL 3 禁用 DES）
+      const encrypted = desEcbEncrypt(keyBuf, challenge);
 
       this.client.send(encrypted);
       this.authChallengeSent = true;

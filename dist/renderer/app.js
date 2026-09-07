@@ -295,11 +295,19 @@ function handleConnect() {
     errorMsg.textContent = '';
     connectBtn.disabled = true;
     connectBtn.textContent = '连接中...';
-    vncApi.connect({ host, port, password, shared }).catch((err) => {
-        errorMsg.textContent = `连接失败: ${err.message}`;
+    try {
+        vncApi.connect({ host, port, password, shared }).catch((err) => {
+            errorMsg.textContent = `连接失败: ${err.message}`;
+            connectBtn.disabled = false;
+            connectBtn.textContent = '连接';
+        });
+    }
+    catch (err) {
+        // preload 未加载等异常场景，避免按钮永久卡在“连接中...”
+        errorMsg.textContent = `连接失败: ${err?.message || err}`;
         connectBtn.disabled = false;
         connectBtn.textContent = '连接';
-    });
+    }
 }
 function handleDisconnect() {
     vncApi.disconnect().then(() => {
