@@ -6,6 +6,8 @@ import { WebSocketServer, WebSocket } from "ws";
 import { info, warn, error as logError } from "../main/logger";
 
 const PROJECT_ROOT = path.resolve(__dirname, "..", "..");
+// 允许移动端页面引用的静态根目录（仅项目内的 web 资源），防止路径穿越读取任意文件
+const MOBILE_ROOT = path.join(PROJECT_ROOT, "src", "mobile");
 
 interface MobileSession {
   ws: WebSocket;
@@ -51,17 +53,24 @@ export class MobileServer {
   }
 
   private handleHttp(req: http.IncomingMessage, res: http.ServerResponse): void {
-    const url = req.url || "/";
-    let filePath: string;
+    const pathname = (req.url || "/").split("?")[0];
 
-    if (url === "/" || url === "/index.html") {
-      filePath = path.join(PROJECT_ROOT, "src", "mobile", "index.html");
-    } else if (url === "/app.js") {
-      filePath = path.join(PROJECT_ROOT, "src", "mobile", "app.js");
-    } else if (url.startsWith("/node_modules/")) {
-      filePath = path.join(PROJECT_ROOT, url);
+    // 解析到允许的静态根目录内，规范化后校验真实路径，防止路径穿越
+    let filePath: string;
+    if (pathname === "/" || pathname === "/index.html") {
+      filePath = path.join(MOBILE_ROOT, "index.html");
+    } else if (pathname === "/app.js") {
+      filePath = path.join(MOBILE_ROOT, "app.js");
     } else {
-      filePath = path.join(PROJECT_ROOT, "src", "mobile", url);
+      // 仅允许移动端目录内的静态资源，并拒绝任何目录分隔符向上回溯
+      const relative = pathname.replace(/^\/+/, "");
+      filePath = path.resolve(MOBILE_ROOT, relative);
+    }
+
+    if (!filePath.startsWith(MOBILE_ROOT + path.sep)) {
+      res.writeHead(403, { "Content-Type": "text/plain" });
+      res.end("Forbidden");
+      return;
     }
 
     const ext = path.extname(filePath);
@@ -73,6 +82,7 @@ export class MobileServer {
       }
       res.writeHead(200, {
         "Content-Type": getMimeType(ext),
+        // 静态资源允许跨域；但该页面为项目自托管，不鼓励放开 CORS，仅用于调试。
         "Access-Control-Allow-Origin": "*",
       });
       res.end(data);
@@ -93,12 +103,7 @@ export class MobileServer {
       ws.on("message", (data: Buffer) => {
         if (data[0] === 0x00) {
           // Connect command: 0x00 + host + 0x00 + port (2 bytes big-endian)
-          const nullIdx1 = data.indexOf(0x00, 1);
-          const host = data.subarray(1, nullIdx1).toString("utf8");
-          const port = data.readUInt16BE(nullIdx1 + 1);
-          session.host = host;
-          session.port = port;
-          this.connectToVnc(session, host, port);
+          this.handleConnectCommand(session, data);
         } else if (session.tcp) {
           // Forward raw data to VNC server
           session.tcp.write(data);
@@ -121,6 +126,56 @@ export class MobileServer {
     });
   }
 
+  /**
+   * 解析并校验 connect 命令，之后发起 TCP 连接。
+   * 格式: 0x00 + host (非空, 含路径分隔符即拒绝) + 0x00 + port (2 bytes big-endian)
+   */
+  private handleConnectCommand(session: MobileSession, data: Buffer): void {
+    const nullIdx1 = data.indexOf(0x00, 1);
+    if (nullIdx1 <= 1 || data.length < nullIdx1 + 3) {
+      this.sendError(session, "无效的连接命令");
+      return;
+    }
+
+    const host = data.subarray(1, nullIdx1).toString("utf8");
+    // 拒绝 host 里夹带路径分隔符，避免代理被当作任意端口跳板/路径
+    if (!host || host.includes("/") || host.includes("..")) {
+      this.sendError(session, "非法的目标主机");
+      return;
+    }
+
+    const port = data.readUInt16BE(nullIdx1 + 1);
+    if (port === 0 || port > 65535) {
+      this.sendError(session, "非法的目标端口");
+      return;
+    }
+
+    // 若当前已有活动连接，先关闭旧的再建立新连接，避免 socket 泄漏
+    if (session.tcp) {
+      session.tcp.destroy();
+      session.tcp = null;
+    }
+
+    session.host = host;
+    session.port = port;
+    this.connectToVnc(session, host, port);
+  }
+
+  private sendError(session: MobileSession, msg: string): void {
+    warn(`[手机代理] 命令错误: ${msg}`);
+    if (session.ws.readyState !== WebSocket.OPEN) return;
+    try {
+      const errBytes = Buffer.byteLength(msg, "utf8");
+      const errMsg = Buffer.alloc(2 + errBytes);
+      errMsg[0] = 0x02; // Error signal
+      errMsg.writeUInt8(errBytes, 1);
+      errMsg.write(msg, 2, "utf8");
+      session.ws.send(errMsg);
+    } catch {
+      // ignore
+    }
+  }
+
   private connectToVnc(session: MobileSession, host: string, port: number): void {
     const tcp = new net.Socket();
     session.tcp = tcp;
@@ -128,7 +183,9 @@ export class MobileServer {
 
     tcp.connect(port, host, () => {
       info(`[手机代理] 已连接 ${host}:${port}`);
-      session.ws.send(Buffer.from([0x01])); // Connected signal
+      if (session.ws.readyState === WebSocket.OPEN) {
+        session.ws.send(Buffer.from([0x01])); // Connected signal
+      }
     });
 
     tcp.on("data", (data: Buffer) => {
@@ -139,21 +196,16 @@ export class MobileServer {
 
     tcp.on("error", (err) => {
       logError(`[手机代理] 连接 ${host}:${port} 失败: ${err.message}`);
-      try {
-        const errBytes = Buffer.byteLength(err.message, "utf8");
-        const errMsg = Buffer.alloc(2 + errBytes);
-        errMsg[0] = 0x02; // Error signal
-        errMsg.writeUInt8(errBytes, 1);
-        errMsg.write(err.message, 2, "utf8");
-        session.ws.send(errMsg);
-      } catch {
-        // ignore
-      }
+      this.sendError(session, err.message);
     });
 
     tcp.on("close", () => {
-      if (session.ws.readyState === WebSocket.OPEN) {
-        session.ws.send(Buffer.from([0x03])); // Closed signal
+      // 仅在当前 session 仍指向此 tcp 时发送关闭信号，避免旧连接关闭误报
+      if (session.tcp === tcp) {
+        session.tcp = null;
+        if (session.ws.readyState === WebSocket.OPEN) {
+          session.ws.send(Buffer.from([0x03])); // Closed signal
+        }
       }
     });
   }

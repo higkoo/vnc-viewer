@@ -21,6 +21,9 @@ export class RfbClient extends EventEmitter {
   private encoders: EncodingDecoders;
   private input: RfbInput;
 
+  /** 连接/握手超时（毫秒），防止目标不可达或无响应时界面永久卡在“连接中” */
+  private static readonly CONNECT_TIMEOUT = 15000;
+
   // 服务器信息
   private serverVersion: RfbVersion = '003.008';
   private fbWidth: number = 0;
@@ -104,6 +107,16 @@ export class RfbClient extends EventEmitter {
     this.socket = new net.Socket();
     this.socket.setNoDelay(true);
     this.socket.setKeepAlive(true);
+
+    // 连接/握手超时：目标不可达或无响应时主动报错并断开
+    this.socket.setTimeout(RfbClient.CONNECT_TIMEOUT);
+
+    this.socket.on('timeout', () => {
+      if (this.state !== ConnectionState.Connected && this.state !== ConnectionState.Disconnected) {
+        this.emitError('连接超时，服务器无响应');
+        this.disconnect();
+      }
+    });
 
     this.socket.on('connect', () => {
       this.buffer = Buffer.alloc(0);
