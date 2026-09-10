@@ -49,6 +49,8 @@ let rfbClient = null;
 let currentConnectionParams = null;
 let mobileServer = null;
 let lastUpdateRequestAt = 0;
+// 当前帧已解码但尚未发送到渲染进程的矩形（整帧收齐后批量发送，减少 IPC 次数）
+let pendingFrameRects = [];
 // ---- 配置管理 ----
 const CONFIG_PATH = path.join(electron_1.app.getPath('userData'), 'config.json');
 function loadConfig() {
@@ -280,20 +282,25 @@ function setupIPC() {
         currentConnectionParams = params;
         rfbClient = new client_1.RfbClient();
         lastUpdateRequestAt = 0;
+        pendingFrameRects = [];
         (0, logger_1.info)(`正在连接 ${params.host}:${params.port} ${params.shared ? '(共享模式)' : ''}`);
         // 状态变更
         rfbClient.on('state', (state) => {
             mainWindow?.webContents.send(types_1.IPC_CHANNELS.CONNECTION_STATE, state);
             (0, logger_1.info)(`连接状态: ${connectionStateLabel(state)}`);
         });
-        // 帧缓冲更新
+        // 帧缓冲更新：先累积到本帧，避免每个矩形都走一次 IPC
         rfbClient.on('framebuffer-update', (rect) => {
-            mainWindow?.webContents.send(types_1.IPC_CHANNELS.FRAMEBUFFER_UPDATE, rect);
+            pendingFrameRects.push(rect);
         });
-        // 帧缓冲完成
+        // 帧缓冲完成：整帧收齐后批量发给渲染进程，再请求下一帧增量更新
         rfbClient.on('framebuffer-done', () => {
-            // 请求增量更新
             if (rfbClient && rfbClient.getState() === types_1.ConnectionState.Connected) {
+                if (pendingFrameRects.length > 0) {
+                    const rects = pendingFrameRects;
+                    pendingFrameRects = [];
+                    mainWindow?.webContents.send(types_1.IPC_CHANNELS.FRAMEBUFFER_UPDATE, rects);
+                }
                 // 持续更新模式下该事件会频繁触发，做节流避免请求风暴
                 const now = Date.now();
                 if (now - lastUpdateRequestAt < 50)
@@ -306,6 +313,14 @@ function setupIPC() {
         rfbClient.on('server-info', (info_) => {
             mainWindow?.webContents.send(types_1.IPC_CHANNELS.SERVER_INFO, info_);
             (0, logger_1.info)(`收到服务器信息: ${info_.name} ${info_.width}x${info_.height}`);
+        });
+        // 解码异常后的画面重新同步：请求一次全量更新
+        rfbClient.on('framebuffer-resync', () => {
+            if (rfbClient && rfbClient.getState() === types_1.ConnectionState.Connected) {
+                pendingFrameRects = [];
+                lastUpdateRequestAt = 0;
+                rfbClient.requestFramebufferUpdate(false);
+            }
         });
         // 错误
         rfbClient.on('error', (msg) => {
@@ -336,6 +351,7 @@ function setupIPC() {
             rfbClient.disconnect();
             rfbClient = null;
         }
+        pendingFrameRects = [];
         return { success: true };
     });
     electron_1.ipcMain.handle(types_1.IPC_CHANNELS.KEY_EVENT, async (_event, keyCode, down) => {
@@ -414,6 +430,10 @@ electron_1.app.whenReady().then(() => {
     mobileServer.start();
     electron_1.app.on('activate', () => {
         if (electron_1.BrowserWindow.getAllWindows().length === 0) {
+            // macOS 关窗后 app 常驻，重新打开窗口时若手机代理已停止则按配置恢复
+            if (!mobileServer) {
+                restartMobileServer(loadConfig().mobilePort);
+            }
             createWindow();
         }
     });

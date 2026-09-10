@@ -5,6 +5,7 @@
   "main": "dist/main/main.js",
   "scripts": {
     "build": "tsc && node scripts/copy-assets.js",
+    "test": "npm run build && node scripts/rfb-connection-test.js",
     "start": "npm run build && electron .",
     "dev": "tsc && node scripts/copy-assets.js && electron .",
     "pack": "npm run build && electron-builder --dir --publish never",

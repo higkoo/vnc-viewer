@@ -18,6 +18,8 @@ let rfbClient: RfbClient | null = null;
 let currentConnectionParams: ConnectionParams | null = null;
 let mobileServer: MobileServer | null = null;
 let lastUpdateRequestAt: number = 0;
+// 当前帧已解码但尚未发送到渲染进程的矩形（整帧收齐后批量发送，减少 IPC 次数）
+let pendingFrameRects: FramebufferRect[] = [];
 
 // ---- 配置管理 ----
 const CONFIG_PATH = path.join(app.getPath('userData'), 'config.json');
@@ -261,6 +263,7 @@ function setupIPC(): void {
     currentConnectionParams = params;
     rfbClient = new RfbClient();
     lastUpdateRequestAt = 0;
+    pendingFrameRects = [];
 
     info(`正在连接 ${params.host}:${params.port} ${params.shared ? '(共享模式)' : ''}`);
 
@@ -270,15 +273,19 @@ function setupIPC(): void {
       info(`连接状态: ${connectionStateLabel(state)}`);
     });
 
-    // 帧缓冲更新
+    // 帧缓冲更新：先累积到本帧，避免每个矩形都走一次 IPC
     rfbClient.on('framebuffer-update', (rect: FramebufferRect) => {
-      mainWindow?.webContents.send(IPC_CHANNELS.FRAMEBUFFER_UPDATE, rect);
+      pendingFrameRects.push(rect);
     });
 
-    // 帧缓冲完成
+    // 帧缓冲完成：整帧收齐后批量发给渲染进程，再请求下一帧增量更新
     rfbClient.on('framebuffer-done', () => {
-      // 请求增量更新
       if (rfbClient && rfbClient.getState() === ConnectionState.Connected) {
+        if (pendingFrameRects.length > 0) {
+          const rects = pendingFrameRects;
+          pendingFrameRects = [];
+          mainWindow?.webContents.send(IPC_CHANNELS.FRAMEBUFFER_UPDATE, rects);
+        }
         // 持续更新模式下该事件会频繁触发，做节流避免请求风暴
         const now = Date.now();
         if (now - lastUpdateRequestAt < 50) return;
@@ -291,6 +298,15 @@ function setupIPC(): void {
     rfbClient.on('server-info', (info_: any) => {
       mainWindow?.webContents.send(IPC_CHANNELS.SERVER_INFO, info_);
       info(`收到服务器信息: ${info_.name} ${info_.width}x${info_.height}`);
+    });
+
+    // 解码异常后的画面重新同步：请求一次全量更新
+    rfbClient.on('framebuffer-resync', () => {
+      if (rfbClient && rfbClient.getState() === ConnectionState.Connected) {
+        pendingFrameRects = [];
+        lastUpdateRequestAt = 0;
+        rfbClient.requestFramebufferUpdate(false);
+      }
     });
 
     // 错误
@@ -327,6 +343,7 @@ function setupIPC(): void {
       rfbClient.disconnect();
       rfbClient = null;
     }
+    pendingFrameRects = [];
     return { success: true };
   });
 
@@ -420,6 +437,10 @@ app.whenReady().then(() => {
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
+      // macOS 关窗后 app 常驻，重新打开窗口时若手机代理已停止则按配置恢复
+      if (!mobileServer) {
+        restartMobileServer(loadConfig().mobilePort);
+      }
       createWindow();
     }
   });

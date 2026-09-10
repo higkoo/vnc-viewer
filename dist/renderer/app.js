@@ -66,6 +66,10 @@ let zoomMode = 'fit';
 let fbWidth = 0;
 let fbHeight = 0;
 let fbCanvas = null;
+// 背景填充计时器（x11vnc 等服务器不发送静态背景时，用邻近像素填充黑色区域）
+let bgFillTimer = null;
+let lastFrameTime = 0;
+let bgFillDone = false;
 // 鼠标状态
 let mouseButtonMask = 0;
 let lastMouseX = 0;
@@ -129,10 +133,16 @@ function setupEventListeners() {
     canvas.addEventListener('wheel', handleMouseWheel);
     canvas.addEventListener('mouseenter', () => { isPointerInside = true; });
     canvas.addEventListener('mouseleave', () => { isPointerInside = false; });
-    // 画布键盘事件
-    canvas.addEventListener('keydown', handleKeyDown);
-    canvas.addEventListener('keyup', handleKeyUp);
+    // 画布外释放 / 窗口失焦时清掉残留按键，防止远程鼠标键一直处于按下状态
+    // （拖拽移出窗口后松键是鼠标操作的常见失效场景）
+    window.addEventListener('mouseup', handleWindowMouseUp);
+    window.addEventListener('blur', handleWindowBlur);
+    // 画布右键菜单
     canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+    // 键盘事件提升到 window 级：即使画布因点击工具栏等操作失焦，
+    // 键盘仍能送达远程（此前画布失焦后按键会"消失"，表现为无法操作）。
+    window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('keyup', handleKeyUp);
     // 窗口大小变化
     window.addEventListener('resize', () => {
         if (zoomMode === 'fit')
@@ -145,8 +155,25 @@ function setupIPCListeners() {
     vncApi.onLog((entry) => {
         appendLog(entry);
     });
+    // 主进程按帧批量推送矩形（数组），兼容旧版单个矩形
     vncApi.onFramebufferUpdate((rect) => {
-        renderRect(rect);
+        if (Array.isArray(rect)) {
+            for (const r of rect)
+                renderRect(r);
+        }
+        else {
+            renderRect(rect);
+        }
+        lastFrameTime = Date.now();
+        bgFillDone = false;
+        // 重置背景填充计时器：如果 1.5 秒无新帧，触发背景填充
+        if (bgFillTimer)
+            clearTimeout(bgFillTimer);
+        if (isConnected && fbCanvas) {
+            bgFillTimer = setTimeout(() => {
+                fillBackground();
+            }, 1500);
+        }
     });
     vncApi.onConnectionState((state) => {
         currentState = state;
@@ -426,6 +453,106 @@ function renderRect(rect) {
     // 只渲染更新区域
     ctx.putImageData(fbCanvas, 0, 0, x, y, w, h);
 }
+/**
+ * 背景填充：x11vnc 等服务器不发送静态背景区域，导致帧缓冲中保留黑色(0,0,0)。
+ * 检测纯黑像素，用上下左右最近的非黑像素颜色填充。
+ * 这是一个简单的一遍扫描修复，适用于纯色或渐变背景。
+ */
+function fillBackground() {
+    if (!fbCanvas || bgFillDone)
+        return;
+    bgFillDone = true;
+    const data = fbCanvas.data;
+    const w = fbWidth;
+    const h = fbHeight;
+    const ctx = canvas.getContext('2d');
+    // 第一步：找到所有黑色像素，尝试用四邻域最近的非黑像素填充
+    const isBlack = new Uint8Array(w * h);
+    let blackCount = 0;
+    for (let i = 0; i < w * h; i++) {
+        const off = i * 4;
+        if (data[off] === 0 && data[off + 1] === 0 && data[off + 2] === 0) {
+            isBlack[i] = 1;
+            blackCount++;
+        }
+    }
+    if (blackCount === 0 || blackCount > w * h * 0.5)
+        return; // 无黑块或黑块过多（可能是正常内容）
+    // 多轮扩散填充（最多 6 轮，覆盖约 192px 的范围）
+    for (let round = 0; round < 6; round++) {
+        let filled = 0;
+        for (let y = 0; y < h; y++) {
+            for (let x = 0; x < w; x++) {
+                const idx = y * w + x;
+                if (!isBlack[idx])
+                    continue;
+                // 检查四邻域，找到最近的非黑像素
+                let r = 0, g = 0, b = 0, count = 0;
+                // 向左扫描
+                for (let dx = 1; dx <= 3 && x - dx >= 0; dx++) {
+                    const ni = idx - dx;
+                    if (!isBlack[ni]) {
+                        const no = ni * 4;
+                        r += data[no];
+                        g += data[no + 1];
+                        b += data[no + 2];
+                        count++;
+                        break;
+                    }
+                }
+                // 向右扫描
+                for (let dx = 1; dx <= 3 && x + dx < w; dx++) {
+                    const ni = idx + dx;
+                    if (!isBlack[ni]) {
+                        const no = ni * 4;
+                        r += data[no];
+                        g += data[no + 1];
+                        b += data[no + 2];
+                        count++;
+                        break;
+                    }
+                }
+                // 向上扫描
+                for (let dy = 1; dy <= 3 && y - dy >= 0; dy++) {
+                    const ni = idx - dy * w;
+                    if (!isBlack[ni]) {
+                        const no = ni * 4;
+                        r += data[no];
+                        g += data[no + 1];
+                        b += data[no + 2];
+                        count++;
+                        break;
+                    }
+                }
+                // 向下扫描
+                for (let dy = 1; dy <= 3 && y + dy < h; dy++) {
+                    const ni = idx + dy * w;
+                    if (!isBlack[ni]) {
+                        const no = ni * 4;
+                        r += data[no];
+                        g += data[no + 1];
+                        b += data[no + 2];
+                        count++;
+                        break;
+                    }
+                }
+                if (count > 0) {
+                    const off = idx * 4;
+                    data[off] = Math.round(r / count);
+                    data[off + 1] = Math.round(g / count);
+                    data[off + 2] = Math.round(b / count);
+                    data[off + 3] = 255;
+                    isBlack[idx] = 0;
+                    filled++;
+                }
+            }
+        }
+        if (filled === 0)
+            break; // 无法继续填充
+    }
+    // 渲染修复后的帧缓冲
+    ctx.putImageData(fbCanvas, 0, 0);
+}
 // ---- 鼠标事件 ----
 function handleMouseDown(e) {
     if (!isConnected)
@@ -457,6 +584,30 @@ function handleMouseUp(e) {
     mouseButtonMask &= ~mask;
     const pos = getCanvasPosition(e);
     vncApi.pointerEvent(mouseButtonMask, pos.x, pos.y);
+}
+// 在画布外释放鼠标：使用最后一次画布内坐标发送抬起，避免掩码残留
+function handleWindowMouseUp(e) {
+    if (!isConnected)
+        return;
+    const btn = e.button;
+    let mask = 0;
+    if (btn === 0)
+        mask = 1;
+    else if (btn === 1)
+        mask = 4;
+    else if (btn === 2)
+        mask = 2;
+    if (mask === 0 || (mouseButtonMask & mask) === 0)
+        return; // 画布内已处理
+    mouseButtonMask &= ~mask;
+    vncApi.pointerEvent(mouseButtonMask, lastMouseX, lastMouseY);
+}
+// 窗口失焦（如切换应用/Alt-Tab）时释放全部鼠标键
+function handleWindowBlur() {
+    if (!isConnected || mouseButtonMask === 0)
+        return;
+    mouseButtonMask = 0;
+    vncApi.pointerEvent(0, lastMouseX, lastMouseY);
 }
 // 鼠标移动节流：mousemove 触发频率远高于屏幕刷新率，逐条走 IPC 会拖垮渲染与主进程
 const MOUSE_MOVE_INTERVAL = 15;
@@ -518,8 +669,17 @@ function getCanvasPosition(e) {
     };
 }
 // ---- 键盘事件 ----
+// 焦点在输入控件/按钮上时按键归控件所有，不应转发给远程
+function isTypingTarget(target) {
+    const el = target;
+    if (!el || !el.tagName)
+        return false;
+    const tag = el.tagName;
+    return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT'
+        || tag === 'BUTTON' || el.isContentEditable;
+}
 function handleKeyDown(e) {
-    if (!isConnected)
+    if (!isConnected || isTypingTarget(e.target))
         return;
     e.preventDefault();
     // 特殊键组合
@@ -542,7 +702,7 @@ function handleKeyDown(e) {
     vncApi.keyEvent(e.keyCode, true);
 }
 function handleKeyUp(e) {
-    if (!isConnected)
+    if (!isConnected || isTypingTarget(e.target))
         return;
     e.preventDefault();
     vncApi.keyEvent(e.keyCode, false);
