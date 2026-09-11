@@ -457,6 +457,39 @@ class EncodingDecoders {
                     }
                     consumed += rawLen;
                 }
+                else if (subType >= 128 && subType <= 130) {
+                    // Packed palette tile: 调色板 + 位打包索引
+                    // 128 -> 1bit/2 色, 129 -> 2bit/4 色, 130 -> 4bit/16 色
+                    const bitsPerPixel = 1 << (subType - 127);
+                    const paletteSize = 1 << bitsPerPixel;
+                    if (buffer.length < offset + consumed + paletteSize * cpi)
+                        return null;
+                    const palette = [];
+                    for (let i = 0; i < paletteSize; i++) {
+                        palette.push(this.readCPixel(buffer, offset + consumed, format, cpi));
+                        consumed += cpi;
+                    }
+                    // 每行按字节对齐
+                    const rowBytes = Math.ceil((tw * bitsPerPixel) / 8);
+                    const packedLen = rowBytes * th;
+                    if (buffer.length < offset + consumed + packedLen)
+                        return null;
+                    const mask = paletteSize - 1;
+                    for (let row = 0; row < th; row++) {
+                        for (let col = 0; col < tw; col++) {
+                            const bitIndex = col * bitsPerPixel;
+                            const byte = buffer[offset + consumed + row * rowBytes + (bitIndex >> 3)];
+                            const shift = 8 - bitsPerPixel - (bitIndex & 7);
+                            const color = palette[(byte >> shift) & mask] || [0, 0, 0, 255];
+                            const dstOff = ((ty + row) * width + tx + col) * 4;
+                            fb[dstOff] = color[0];
+                            fb[dstOff + 1] = color[1];
+                            fb[dstOff + 2] = color[2];
+                            fb[dstOff + 3] = 255;
+                        }
+                    }
+                    consumed += packedLen;
+                }
                 else {
                     // subType = tileType & 0x7F 恒为 0..127，已在上方全部分支覆盖。
                     // （此前曾有人添加 subType 128..130 的 packed palette 分支，但该条件
