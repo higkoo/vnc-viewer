@@ -18,3 +18,4 @@ android/app/src/main/assets/public/
 # 其它
 *.log
 .DS_Store
+NUL
