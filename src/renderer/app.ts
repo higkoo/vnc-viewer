@@ -106,7 +106,6 @@ let fbCanvas: ImageData | null = null;
 // 背景填充计时器（x11vnc 等服务器不发送静态背景时，用邻近像素填充黑色区域）
 let bgFillTimer: ReturnType<typeof setTimeout> | null = null;
 let lastFrameTime = 0;
-let bgFillDone = false;
 
 // 鼠标状态
 let mouseButtonMask = 0;
@@ -214,13 +213,12 @@ function setupIPCListeners(): void {
       renderRect(rect);
     }
     lastFrameTime = Date.now();
-    bgFillDone = false;
-    // 重置背景填充计时器：如果 1.5 秒无新帧，触发背景填充
+    // 重置背景填充计时器：如果 800ms 无新帧，触发背景填充
     if (bgFillTimer) clearTimeout(bgFillTimer);
     if (isConnected && fbCanvas) {
       bgFillTimer = setTimeout(() => {
         fillBackground();
-      }, 1500);
+      }, 800);
     }
   });
 
@@ -530,19 +528,21 @@ function renderRect(rect: { x: number; y: number; width: number; height: number;
 
 /**
  * 背景填充：x11vnc 等服务器不发送静态背景区域，导致帧缓冲中保留黑色(0,0,0)。
- * 检测纯黑像素，用上下左右最近的非黑像素颜色填充。
- * 这是一个简单的一遍扫描修复，适用于纯色或渐变背景。
+ *
+ * 三段式策略：
+ * 1. 纯色推断：从边缘采样推断背景主色调，直接填充所有黑块（适合纯色桌面）
+ * 2. 扫描线扩散：32 轮四方向扫描，用最近非黑像素填充（适合渐变/纹理背景）
+ * 3. 孤立点修复：对仍未修复的黑点做螺旋采样，取 4-16px 范围内最近非黑像素
  */
 function fillBackground(): void {
-  if (!fbCanvas || bgFillDone) return;
-  bgFillDone = true;
+  if (!fbCanvas) return;
 
   const data = fbCanvas.data;
   const w = fbWidth;
   const h = fbHeight;
   const ctx = canvas.getContext('2d')!;
 
-  // 第一步：找到所有黑色像素，尝试用四邻域最近的非黑像素填充
+  // ---- 标记黑色像素 ----
   const isBlack = new Uint8Array(w * h);
   let blackCount = 0;
   for (let i = 0; i < w * h; i++) {
@@ -552,54 +552,91 @@ function fillBackground(): void {
       blackCount++;
     }
   }
+  if (blackCount === 0 || blackCount > w * h * 0.5) return;
 
-  if (blackCount === 0 || blackCount > w * h * 0.5) return; // 无黑块或黑块过多（可能是正常内容）
+  // ---- 阶段 1: 纯色推断 ----
+  // 从四边向内采样非黑像素，量化后取众数作为推断的"背景色"
+  const quantize = (v: number) => Math.floor(v / 16) * 16; // 16 级量化减少噪声
+  const colorFreq = new Map<number, number>();
 
-  // 多轮扩散填充（最多 6 轮，覆盖约 192px 的范围）
-  for (let round = 0; round < 6; round++) {
+  const sampleEdge = (x0: number, y0: number, x1: number, y1: number) => {
+    const steps = Math.max(Math.abs(x1 - x0), Math.abs(y1 - y0));
+    if (steps === 0) return;
+    for (let s = 0; s <= steps; s++) {
+      const x = Math.round(x0 + ((x1 - x0) * s) / steps);
+      const y = Math.round(y0 + ((y1 - y0) * s) / steps);
+      const idx = y * w + x;
+      if (!isBlack[idx]) {
+        const off = idx * 4;
+        const key = (quantize(data[off]) << 16) | (quantize(data[off + 1]) << 8) | quantize(data[off + 2]);
+        colorFreq.set(key, (colorFreq.get(key) || 0) + 1);
+      }
+    }
+  };
+
+  // 采样四条边 + 对角线（扩大采样范围到 1/4 区域）
+  const margin = Math.min(w, h) >> 2;
+  for (let i = 0; i < margin; i++) {
+    sampleEdge(i, i, w - 1 - i, i);               // 上边
+    sampleEdge(i, h - 1 - i, w - 1 - i, h - 1 - i); // 下边
+    sampleEdge(i, i, i, h - 1 - i);               // 左边
+    sampleEdge(w - 1 - i, i, w - 1 - i, h - 1 - i); // 右边
+  }
+
+  if (colorFreq.size > 0) {
+    // 找到最高频的量化色
+    let bestKey = 0, bestFreq = 0;
+    for (const [key, freq] of colorFreq) {
+      if (freq > bestFreq) { bestFreq = freq; bestKey = key; }
+    }
+    const bgR = (bestKey >> 16) & 0xFF;
+    const bgG = (bestKey >> 8) & 0xFF;
+    const bgB = bestKey & 0xFF;
+
+    // 置信度检查：如果采样众数占比足够高，直接用纯色填充（适合纯色桌面）
+    const totalSamples = [...colorFreq.values()].reduce((a, b) => a + b, 0);
+    if (bestFreq / totalSamples > 0.35) {
+      for (let i = 0; i < w * h; i++) {
+        if (isBlack[i]) {
+          const off = i * 4;
+          data[off] = bgR; data[off + 1] = bgG; data[off + 2] = bgB; data[off + 3] = 255;
+          isBlack[i] = 0;
+          blackCount--;
+        }
+      }
+    }
+  }
+
+  if (blackCount === 0) {
+    ctx.putImageData(fbCanvas, 0, 0);
+    return;
+  }
+
+  // ---- 阶段 2: 扫描线扩散（32 轮，最大覆盖 ~96px） ----
+  for (let round = 0; round < 32; round++) {
     let filled = 0;
     for (let y = 0; y < h; y++) {
       for (let x = 0; x < w; x++) {
         const idx = y * w + x;
         if (!isBlack[idx]) continue;
 
-        // 检查四邻域，找到最近的非黑像素
         let r = 0, g = 0, b = 0, count = 0;
-        // 向左扫描
+        // 四方向扫描，最大距离 3px
         for (let dx = 1; dx <= 3 && x - dx >= 0; dx++) {
           const ni = idx - dx;
-          if (!isBlack[ni]) {
-            const no = ni * 4;
-            r += data[no]; g += data[no + 1]; b += data[no + 2]; count++;
-            break;
-          }
+          if (!isBlack[ni]) { const no = ni * 4; r += data[no]; g += data[no + 1]; b += data[no + 2]; count++; break; }
         }
-        // 向右扫描
         for (let dx = 1; dx <= 3 && x + dx < w; dx++) {
           const ni = idx + dx;
-          if (!isBlack[ni]) {
-            const no = ni * 4;
-            r += data[no]; g += data[no + 1]; b += data[no + 2]; count++;
-            break;
-          }
+          if (!isBlack[ni]) { const no = ni * 4; r += data[no]; g += data[no + 1]; b += data[no + 2]; count++; break; }
         }
-        // 向上扫描
         for (let dy = 1; dy <= 3 && y - dy >= 0; dy++) {
           const ni = idx - dy * w;
-          if (!isBlack[ni]) {
-            const no = ni * 4;
-            r += data[no]; g += data[no + 1]; b += data[no + 2]; count++;
-            break;
-          }
+          if (!isBlack[ni]) { const no = ni * 4; r += data[no]; g += data[no + 1]; b += data[no + 2]; count++; break; }
         }
-        // 向下扫描
         for (let dy = 1; dy <= 3 && y + dy < h; dy++) {
           const ni = idx + dy * w;
-          if (!isBlack[ni]) {
-            const no = ni * 4;
-            r += data[no]; g += data[no + 1]; b += data[no + 2]; count++;
-            break;
-          }
+          if (!isBlack[ni]) { const no = ni * 4; r += data[no]; g += data[no + 1]; b += data[no + 2]; count++; break; }
         }
 
         if (count > 0) {
@@ -610,10 +647,54 @@ function fillBackground(): void {
           data[off + 3] = 255;
           isBlack[idx] = 0;
           filled++;
+          blackCount--;
         }
       }
     }
-    if (filled === 0) break; // 无法继续填充
+    if (filled === 0) break;
+    if (blackCount === 0) break;
+  }
+
+  if (blackCount === 0) {
+    ctx.putImageData(fbCanvas, 0, 0);
+    return;
+  }
+
+  // ---- 阶段 3: 孤立点修复（螺旋采样，4-16px 范围） ----
+  // 阶段 2 结束后剩余的黑点通常是"岛状"区域，距离已知像素较远；
+  // 用螺旋搜索在更大范围内找最近非黑像素，避免大块黑色残留。
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const idx = y * w + x;
+      if (!isBlack[idx]) continue;
+
+      let foundR = -1, foundG = 0, foundB = 0, foundDist = Infinity;
+      // 螺旋搜索：半径 4..16px，每隔 45°采样一次
+      for (let radius = 4; radius <= 16; radius += 2) {
+        for (let angle = 0; angle < 8; angle++) {
+          const theta = (angle * Math.PI) / 4;
+          const sx = Math.round(x + radius * Math.cos(theta));
+          const sy = Math.round(y + radius * Math.sin(theta));
+          if (sx < 0 || sx >= w || sy < 0 || sy >= h) continue;
+          const ni = sy * w + sx;
+          if (!isBlack[ni]) {
+            const dist = radius;
+            if (dist < foundDist) {
+              foundDist = dist;
+              const no = ni * 4;
+              foundR = data[no]; foundG = data[no + 1]; foundB = data[no + 2];
+            }
+          }
+        }
+        if (foundR >= 0) break; // 找到就停，避免远处像素污染
+      }
+
+      if (foundR >= 0) {
+        const off = idx * 4;
+        data[off] = foundR; data[off + 1] = foundG; data[off + 2] = foundB; data[off + 3] = 255;
+        isBlack[idx] = 0;
+      }
+    }
   }
 
   // 渲染修复后的帧缓冲
