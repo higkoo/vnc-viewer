@@ -89,7 +89,7 @@ jobs:
           echo "package.json version => $(node -p "require('./package.json').version")"
 
       - name: Install dependencies
-        run: npm install --ignore-scripts
+        run: npm install
 
       - name: Build TypeScript
         run: npm run build
@@ -158,8 +158,8 @@ jobs:
           packages: 'platform-tools platforms;android-36 build-tools;36.0.0'
           accept-android-sdk-licenses: true
 
-      - name: Install dependencies
-        run: npm install --ignore-scripts
+      - name: Install Dependencies
+        run: npm install
 
       - name: Prepare Capacitor Android project
         shell: bash
