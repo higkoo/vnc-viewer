@@ -1,38 +1,217 @@
 "use strict";
 /**
  * RFB 输入事件处理 (键盘/鼠标)
- * 参考 UltraVNC vncviewer 和 RFC 6143 Section 7.5
+ * 参考 bVNC RfbProto.java 的事件缓冲合并机制
+ * 参考 RFC 6143 Section 7.5
+ *
+ * 增强点：
+ * 1. 事件缓冲合并 — 合并修饰键+按键事件为单次 write，减少网络包
+ * 2. 远程修饰键状态追踪 — 避免冗余发送已按下的修饰键
+ * 3. 可配置缓冲窗口 — 平衡延迟与吞吐量
  */
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.RfbInput = void 0;
 const types_1 = require("./types");
+/**
+ * 修饰键的 RFB keysym 定义
+ * 用于追踪远程修饰键状态，避免冗余发送
+ */
+const ModifierKeys = {
+    Shift_L: 0xFFE1,
+    Shift_R: 0xFFE2,
+    Control_L: 0xFFE3,
+    Control_R: 0xFFE4,
+    Alt_L: 0xFFE9,
+    Alt_R: 0xFFE7,
+    Meta_L: 0xFFEB,
+    Meta_R: 0xFFEC,
+    Super_L: 0xFFEB,
+    Super_R: 0xFFEC,
+};
+/** 从 keysym 到 button mask bit 的映射（供指针事件修饰键使用） */
+const ModifierToButtonMask = {
+    [ModifierKeys.Shift_L]: 1 << 0,
+    [ModifierKeys.Shift_R]: 1 << 0,
+    [ModifierKeys.Control_L]: 1 << 2,
+    [ModifierKeys.Control_R]: 1 << 2,
+    [ModifierKeys.Alt_L]: 1 << 3,
+    [ModifierKeys.Alt_R]: 1 << 3,
+    [ModifierKeys.Meta_L]: 1 << 6,
+    [ModifierKeys.Meta_R]: 1 << 6,
+};
 class RfbInput {
     constructor(client) {
         // 鼠标按键状态
         this.buttonMask = 0;
+        /**
+         * 远程修饰键状态追踪（bVNC 模式）
+         * 记录服务器端当前按下的修饰键，避免重复发送
+         */
+        this.remoteModifiers = new Set();
+        /**
+         * 事件缓冲队列
+         * 在缓冲窗口内合并多个事件后一次性发送
+         */
+        this.eventBuffer = [];
+        this.flushTimer = null;
         this.client = client;
     }
     /**
-     * 发送键盘事件
-     * 消息: 1-byte msg-type(4), 1-byte down-flag, 2-byte padding, 4-byte keysym
+     * 发送键盘事件 — 带修饰键追踪和缓冲合并
+     *
+     * 参考 bVNC writeKeyEvent 逻辑：
+     * 1. 如果是按键按下(down=true)：先更新修饰键状态，再发送按键
+     * 2. 如果是按键释放(down=false)：先发送按键，再更新修饰键状态
+     * 3. 所有事件进入缓冲队列，在缓冲窗口内合并发送
      */
     sendKeyEvent(keyCode, down) {
         const keysym = this.mapKeyCode(keyCode);
         if (keysym === 0)
             return;
+        const isModifier = RfbInput.MODIFIER_KEYSYMS.has(keysym);
+        if (down) {
+            // 按下事件：先更新修饰键，再发送按键
+            if (isModifier) {
+                this.enqueueModifierKey(keysym, true);
+            }
+            this.enqueueKeyEvent(keysym, true);
+        }
+        else {
+            // 释放事件：先发送按键，再更新修饰键
+            this.enqueueKeyEvent(keysym, false);
+            if (isModifier) {
+                this.enqueueModifierKey(keysym, false);
+            }
+        }
+    }
+    /**
+     * 立即发送键盘事件（绕过缓冲，用于紧急按键如 Ctrl+Alt+Del）
+     */
+    sendKeyEventImmediate(keysym, down) {
+        // 先刷新缓冲队列，保证事件顺序
+        this.flushEventBuffer();
+        const msg = this.buildKeyEventMessage(keysym, down);
+        this.client.send(msg);
+    }
+    /**
+     * 将按键事件加入缓冲队列
+     */
+    enqueueKeyEvent(keysym, down) {
+        const msg = this.buildKeyEventMessage(keysym, down);
+        this.eventBuffer.push(msg);
+        this.scheduleFlush();
+    }
+    /**
+     * 将修饰键事件加入缓冲队列（带状态追踪，避免冗余）
+     */
+    enqueueModifierKey(keysym, down) {
+        if (down) {
+            if (this.remoteModifiers.has(keysym))
+                return; // 已按下，跳过
+            this.remoteModifiers.add(keysym);
+        }
+        else {
+            if (!this.remoteModifiers.has(keysym))
+                return; // 已释放，跳过
+            this.remoteModifiers.delete(keysym);
+        }
+        const msg = this.buildKeyEventMessage(keysym, down);
+        this.eventBuffer.push(msg);
+        this.scheduleFlush();
+    }
+    /**
+     * 构建按键事件消息
+     * 消息格式: 1-byte msg-type(4), 1-byte down-flag, 2-byte padding, 4-byte keysym
+     */
+    buildKeyEventMessage(keysym, down) {
         const msg = Buffer.alloc(8);
         msg[0] = types_1.ClientMsgType.KeyEvent; // 4
         msg[1] = down ? 1 : 0;
         msg[2] = 0; // padding
         msg[3] = 0; // padding
         msg.writeUInt32BE(keysym, 4);
-        this.client.send(msg);
+        return msg;
+    }
+    /**
+     * 调度缓冲队列刷新
+     */
+    scheduleFlush() {
+        if (this.flushTimer === null) {
+            this.flushTimer = setTimeout(() => {
+                this.flushEventBuffer();
+            }, RfbInput.FLUSH_INTERVAL_MS);
+        }
+    }
+    /**
+     * 刷新缓冲队列 — 合并所有事件为单次 write
+     */
+    flushEventBuffer() {
+        if (this.flushTimer !== null) {
+            clearTimeout(this.flushTimer);
+            this.flushTimer = null;
+        }
+        if (this.eventBuffer.length === 0)
+            return;
+        // 合并所有事件为单个 buffer，减少 write 系统调用和 TCP 包数
+        const totalLength = this.eventBuffer.reduce((sum, b) => sum + b.length, 0);
+        const merged = Buffer.alloc(totalLength);
+        let offset = 0;
+        for (const buf of this.eventBuffer) {
+            buf.copy(merged, offset);
+            offset += buf.length;
+        }
+        this.eventBuffer = [];
+        this.client.send(merged);
+    }
+    /**
+     * 清空缓冲队列（连接断开时调用）
+     */
+    clearEventBuffer() {
+        if (this.flushTimer !== null) {
+            clearTimeout(this.flushTimer);
+            this.flushTimer = null;
+        }
+        this.eventBuffer = [];
+        this.remoteModifiers.clear();
+    }
+    /**
+     * 重置远程修饰键状态（如重新连接后）
+     */
+    resetModifierState() {
+        this.remoteModifiers.clear();
+    }
+    /**
+     * 获取远程修饰键状态对应的 button mask
+     * 用于指针事件携带当前修饰键状态
+     */
+    getModifierButtonMask() {
+        let mask = 0;
+        for (const keysym of this.remoteModifiers) {
+            const bit = ModifierToButtonMask[keysym];
+            if (bit !== undefined) {
+                mask |= bit;
+            }
+        }
+        return mask;
     }
     /**
      * 发送指针（鼠标）事件
      * 消息: 1-byte msg-type(5), 1-byte button-mask, 2-byte x, 2-byte y
      */
     sendPointerEvent(buttonMask, x, y) {
+        // 合并远程修饰键状态到 button mask
+        const fullMask = buttonMask | this.getModifierButtonMask();
+        const msg = Buffer.alloc(6);
+        msg[0] = types_1.ClientMsgType.PointerEvent; // 5
+        msg[1] = fullMask & 0xFF;
+        msg.writeUInt16BE(Math.max(0, x), 2);
+        msg.writeUInt16BE(Math.max(0, y), 4);
+        this.client.send(msg);
+    }
+    /**
+     * 发送指针事件（不携带修饰键 — 用于精确控制）
+     */
+    sendPointerEventRaw(buttonMask, x, y) {
         const msg = Buffer.alloc(6);
         msg[0] = types_1.ClientMsgType.PointerEvent; // 5
         msg[1] = buttonMask;
@@ -55,6 +234,12 @@ class RfbInput {
         return this.buttonMask;
     }
     /**
+     * 获取远程修饰键状态 (keysym 集合)
+     */
+    getRemoteModifiers() {
+        return new Set(this.remoteModifiers);
+    }
+    /**
      * 将键盘按键码映射为 RFB keysym
      */
     mapKeyCode(keyCode) {
@@ -62,7 +247,8 @@ class RfbInput {
     }
 }
 exports.RfbInput = RfbInput;
-// X11 键码映射 (keysym -> RFB 标准)
+RfbInput.FLUSH_INTERVAL_MS = 8; // ~120Hz 的刷新率
+// X11 键码映射 (keyCode -> RFB keysym)
 RfbInput.KEY_MAP = {
     // 字母
     65: 0x41, // A
@@ -147,10 +333,10 @@ RfbInput.KEY_MAP = {
     191: 0x2F, // /
     192: 0x60, // `
     219: 0x5B, // [
-    220: 0x5C, // \
+    220: 0x5C, // backslash
     221: 0x5D, // ]
     222: 0x27, // '
-    // 小键盘（未映射时 keyCode 会与 ASCII 冲突，如 96 会撞上反引号 0x60）
+    // 小键盘
     96: 0xFFB0, // KP_0
     97: 0xFFB1, // KP_1
     98: 0xFFB2, // KP_2
@@ -167,4 +353,14 @@ RfbInput.KEY_MAP = {
     110: 0xFFAE, // KP_Decimal
     111: 0xFFAF, // KP_Divide
 };
+/** 修饰键集合（用于快速判断） */
+RfbInput.MODIFIER_KEYSYMS = new Set([
+    ModifierKeys.Shift_L, ModifierKeys.Shift_R,
+    ModifierKeys.Control_L, ModifierKeys.Control_R,
+    ModifierKeys.Alt_L, ModifierKeys.Alt_R,
+    ModifierKeys.Meta_L, ModifierKeys.Meta_R,
+    0xFFE5, // CapsLock
+    0xFF7F, // NumLock
+    0xFF14, // ScrollLock
+]);
 //# sourceMappingURL=input.js.map

@@ -24,6 +24,7 @@ var SecurityType;
     SecurityType[SecurityType["MD5"] = 21] = "MD5";
     SecurityType[SecurityType["ColinDeanXVP"] = 22] = "ColinDeanXVP";
     SecurityType[SecurityType["MSLogon"] = 129] = "MSLogon";
+    SecurityType[SecurityType["Plain"] = 256] = "Plain";
 })(SecurityType || (exports.SecurityType = SecurityType = {}));
 // ---- 编码类型 ----
 var EncodingType;
@@ -40,6 +41,14 @@ var EncodingType;
     EncodingType[EncodingType["NewFBSize"] = 4294967073] = "NewFBSize";
     EncodingType[EncodingType["DesktopName"] = 4294967074] = "DesktopName";
     EncodingType[EncodingType["UltraVNC_Ext"] = 4294967288] = "UltraVNC_Ext";
+    // Tight 编码
+    EncodingType[EncodingType["Tight"] = 7] = "Tight";
+    EncodingType[EncodingType["TightZstd"] = 17] = "TightZstd";
+    // Extended Clipboard 伪编码
+    EncodingType[EncodingType["ExtClipboard_Caps"] = 4294966976] = "ExtClipboard_Caps";
+    EncodingType[EncodingType["ExtClipboard_Request"] = 4294966977] = "ExtClipboard_Request";
+    EncodingType[EncodingType["ExtClipboard_Peek"] = 4294966978] = "ExtClipboard_Peek";
+    EncodingType[EncodingType["ExtClipboard_Notify"] = 4294966979] = "ExtClipboard_Notify";
 })(EncodingType || (exports.EncodingType = EncodingType = {}));
 // ---- 消息类型 (客户端→服务器) ----
 var ClientMsgType;
@@ -62,6 +71,7 @@ var ServerMsgType;
     ServerMsgType[ServerMsgType["ServerCutText"] = 3] = "ServerCutText";
     ServerMsgType[ServerMsgType["FileTransfer"] = 7] = "FileTransfer";
     ServerMsgType[ServerMsgType["DesktopSize"] = 251] = "DesktopSize";
+    ServerMsgType[ServerMsgType["ClientRedirect"] = 252] = "ClientRedirect";
 })(ServerMsgType || (exports.ServerMsgType = ServerMsgType = {}));
 // ---- 连接状态 ----
 var ConnectionState;
@@ -92,6 +102,10 @@ exports.IPC_CHANNELS = {
     SET_ENCODINGS: 'rfb:set-encodings',
     SET_PIXEL_FORMAT: 'rfb:set-pixel-format',
     SET_DESKTOP_SIZE: 'rfb:request-desktop-size',
+    // 带宽统计
+    BANDWIDTH: 'rfb:bandwidth',
+    // 服务器重定向
+    REDIRECT: 'rfb:redirect',
     // 应用日志
     APP_LOG: 'app:log',
     LOG_GET: 'app:log:get',

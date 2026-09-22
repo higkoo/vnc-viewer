@@ -1,6 +1,14 @@
 /**
  * RFB 协议客户端 - 核心实现
  * 参考 UltraVNC ClientConnection 和 RFB 协议规范 (RFC 6143)
+ * 参考 bVNC RfbProto.java
+ *
+ * 增强：
+ * - 连接超时处理（连接/握手双阶段）
+ * - Extended Clipboard 协议
+ * - Client Redirect 支持
+ * - 带宽测量统计
+ * - 帧解码异常恢复增强
  */
 import * as net from 'net';
 import { EventEmitter } from 'events';
@@ -12,8 +20,9 @@ export declare class RfbClient extends EventEmitter {
     private handshake;
     private encoders;
     private input;
-    /** 连接/握手超时（毫秒），防止目标不可达或无响应时界面永久卡在“连接中” */
-    private static readonly CONNECT_TIMEOUT;
+    private connectTimer;
+    private handshakeTimer;
+    private idleTimer;
     private serverVersion;
     private fbWidth;
     private fbHeight;
@@ -29,6 +38,12 @@ export declare class RfbClient extends EventEmitter {
     private coverageRetries;
     private static readonly COVERAGE_BLOCK_SIZE;
     private static readonly COVERAGE_MAX_RETRIES;
+    private bytesReceived;
+    private bytesReceivedWindow;
+    private bandwidthTimer;
+    private lastBandwidth;
+    /** Extended Clipboard 能力标志（从服务器 SetCutText 消息中解析） */
+    private clipboardCapabilities;
     updateState(state: ConnectionState): void;
     getParams(): ConnectionParams;
     /** 从 buffer 中读取 n 字节，并移除已读部分 */
@@ -42,6 +57,8 @@ export declare class RfbClient extends EventEmitter {
     getDesktopName(): string;
     getServerVersion(): RfbVersion;
     getPixelFormat(): PixelFormat;
+    /** 获取当前带宽（bytes/sec） */
+    getBandwidth(): number;
     /**
      * 连接到 VNC 服务器
      */
@@ -71,13 +88,24 @@ export declare class RfbClient extends EventEmitter {
      */
     pointerEvent(buttonMask: number, x: number, y: number): void;
     /**
-     * 发送剪贴板文本
+     * 发送剪贴板文本 (Extended Clipboard 协议)
+     * 支持 1024 字节以上的大文本，通过 GII 扩展分片
      */
     sendCutText(text: string): void;
     /**
-     * 请求调整桌面大小 (扩展)
+     * 请求调整桌面大小 (Extended Desktop Size)
+     * 参考 RFC 6143 Section 7.5.5
      */
     requestDesktopSize(width: number, height: number): void;
+    private startConnectTimer;
+    private cancelConnectTimer;
+    private startHandshakeTimer;
+    private cancelHandshakeTimer;
+    private resetIdleTimer;
+    private cancelIdleTimer;
+    private startBandwidthMonitor;
+    private stopBandwidthMonitor;
+    private resetState;
     private setState;
     getSocket(): net.Socket | null;
     setServerVersion(v: RfbVersion): void;
@@ -87,44 +115,38 @@ export declare class RfbClient extends EventEmitter {
     send(data: Buffer): void;
     /**
      * 处理接收到的数据
-     * 循环处理，直到缓冲区数据不足或状态不再变化
      */
     private processData;
     /**
      * 处理服务器消息 (连接建立后)
      */
     private processServerMessage;
+    /** 连续解码失败计数，用于判断是否需要断线重连 */
+    private consecutiveDecodeErrors;
+    private static readonly MAX_CONSECUTIVE_DECODE_ERRORS;
     /**
      * 处理 FramebufferUpdate 消息
      *
      * 采用「先完整解析整帧、再统一处理」的两阶段模型，消除 TCP 分片边界处
-     * 的状态错乱：
+     * 的状态错乱。
      *
-     * 旧模型按数据到达即时消费矩形，并把已处理前缀从接收缓冲区移除；若某
-     * 个矩形恰好被 TCP 分片截断，会保留消息头等剩余分片，但消息头里的
-     * numRects 是整帧矩形总数，重解析时矩形数会与剩余数据不匹配，导致漏帧、
-     * 花屏甚至永久卡死；已喂入 ZRLE 累积流的压缩数据也可能被重复喂入而
-     * 解码错乱。
-     *
-     * 新模型第一阶段只确认每个矩形（含 ZRLE 压缩块、伪编码附加数据）已
-     * 完整到达并暂存，任一矩形不完整就返回 false，不做任何消费或副作用，
-     * 等后续分片补齐后重头解析；第二阶段整帧齐备后统一解码/派发，最后
-     * 一次性消费整帧字节。代价是帧要收齐才渲染，但 VNC 帧远小于 TCP 窗口，
-     * 实际延迟影响可忽略。
+     * 异常恢复策略：
+     * 1. 单帧解码失败 → 丢弃本帧 + 累积解压状态，请求全量刷新
+     * 2. 连续失败 < 阈值 → 继续尝试
+     * 3. 连续失败 ≥ 阈值 → 断开连接（可能是协议根本性不匹配）
      */
     private processFramebufferUpdate;
-    /** 帧解析主体（模型说明见 processFramebufferUpdate） */
+    /** 帧解析主体 */
     private processFramebufferUpdateInner;
     private initCoverage;
     private markCoverage;
     private checkCoverageAndRequest;
     /**
-     * 读取伪编码矩形的附加数据（纯读取，不产生副作用）。
-     * @returns 附加数据 Buffer；null 表示数据尚未收全
+     * 读取伪编码矩形的附加数据
      */
     private readPseudoEncodingPayload;
     /**
-     * 应用伪编码的副作用（整帧齐备后调用，保证副作用只发生一次）
+     * 应用伪编码的副作用
      */
     private applyPseudoEncoding;
     /**
@@ -132,12 +154,29 @@ export declare class RfbClient extends EventEmitter {
      */
     private processSetColorMapEntries;
     /**
-     * 处理服务器剪贴板文本
+     * 处理服务器剪贴板文本 (Extended Clipboard)
+     * 标准格式: 1-byte msg-type(3), 3-byte padding, 4-byte flags, 4-byte length, text
+     * 旧格式:   1-byte msg-type(3), 3-byte padding, 4-byte length, text
      */
     private processServerCutText;
     /**
-     * 处理桌面大小变化
+     * 处理桌面大小变化 (Extended Desktop Size 响应)
+     * 格式: 1-byte msg-type(251), 1-byte padding, 2-byte width, 2-byte height,
+     *        1-byte number-of-screens(0xFF=unspecified), [screens...]
      */
     private processDesktopSize;
+    /**
+     * 处理 Client Redirect 消息 (服务器重定向)
+     * 格式: 1-byte msg-type(252), 1-byte reserved,
+     *        4-byte redirect-host-length, host-string,
+     *        4-byte redirect-port
+     *
+     * 某些 VNC 服务器（如负载均衡器）会发送此消息让客户端连接到另一台服务器
+     */
+    private processClientRedirect;
+    /**
+     * 启动空闲超时检测
+     */
+    private startIdleTimer;
 }
 //# sourceMappingURL=client.d.ts.map

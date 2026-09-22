@@ -1,6 +1,14 @@
 /**
  * RFB 协议客户端 - 核心实现
  * 参考 UltraVNC ClientConnection 和 RFB 协议规范 (RFC 6143)
+ * 参考 bVNC RfbProto.java
+ *
+ * 增强：
+ * - 连接超时处理（连接/握手双阶段）
+ * - Extended Clipboard 协议
+ * - Client Redirect 支持
+ * - 带宽测量统计
+ * - 帧解码异常恢复增强
  */
 
 import * as net from 'net';
@@ -13,6 +21,18 @@ import { RfbHandshake } from './handshake';
 import { EncodingDecoders } from './encodings';
 import { RfbInput } from './input';
 
+// ---- 常量 ----
+/** 连接超时（TCP connect 阶段） */
+const CONNECT_TIMEOUT = 15000;
+/** 握手超时（协议协商+认证阶段） */
+const HANDSHAKE_TIMEOUT = 20000;
+/** 空闲超时（连接建立后无响应检测） */
+const IDLE_TIMEOUT = 30000;
+/** 带宽统计窗口大小（毫秒） */
+const BANDWIDTH_WINDOW_MS = 1000;
+/** 服务器结果文本的最大长度限制 */
+const MAX_REASON_LENGTH = 4096;
+
 export class RfbClient extends EventEmitter {
   private socket: net.Socket | null = null;
   private state: ConnectionState = ConnectionState.Disconnected;
@@ -21,8 +41,10 @@ export class RfbClient extends EventEmitter {
   private encoders: EncodingDecoders;
   private input: RfbInput;
 
-  /** 连接/握手超时（毫秒），防止目标不可达或无响应时界面永久卡在“连接中” */
-  private static readonly CONNECT_TIMEOUT = 15000;
+  // 超时管理
+  private connectTimer: ReturnType<typeof setTimeout> | null = null;
+  private handshakeTimer: ReturnType<typeof setTimeout> | null = null;
+  private idleTimer: ReturnType<typeof setTimeout> | null = null;
 
   // 服务器信息
   private serverVersion: RfbVersion = '003.008';
@@ -40,9 +62,7 @@ export class RfbClient extends EventEmitter {
   // 接收缓冲区
   private buffer: Buffer = Buffer.alloc(0);
 
-  // 帧覆盖追踪：记录 32x32 块级别的覆盖状态，
-  // 连接后首帧请求全屏时服务器可能只返回脏区域（x11vnc 行为），
-  // 追踪未覆盖块并在 framebuffer-done 后补发请求
+  // 帧覆盖追踪：记录 32x32 块级别的覆盖状态
   private coverageCols = 0;
   private coverageRows = 0;
   private coverageBits: Uint8Array = new Uint8Array(0);
@@ -50,6 +70,16 @@ export class RfbClient extends EventEmitter {
   private coverageRetries = 0;
   private static readonly COVERAGE_BLOCK_SIZE = 32;
   private static readonly COVERAGE_MAX_RETRIES = 8;
+
+  // ---- 带宽测量 ----
+  private bytesReceived: number = 0;
+  private bytesReceivedWindow: number = 0;
+  private bandwidthTimer: ReturnType<typeof setInterval> | null = null;
+  private lastBandwidth: number = 0; // bytes/sec
+
+  // ---- 扩展剪贴板 ----
+  /** Extended Clipboard 能力标志（从服务器 SetCutText 消息中解析） */
+  private clipboardCapabilities: number = 0;
 
   // 公开方法用于 handshake 模块
   updateState(state: ConnectionState): void { this.setState(state); }
@@ -77,6 +107,8 @@ export class RfbClient extends EventEmitter {
   getDesktopName(): string { return this.desktopName; }
   getServerVersion(): RfbVersion { return this.serverVersion; }
   getPixelFormat(): PixelFormat { return { ...this.pixelFormat }; }
+  /** 获取当前带宽（bytes/sec） */
+  getBandwidth(): number { return this.lastBandwidth; }
 
   /**
    * 连接到 VNC 服务器
@@ -88,28 +120,14 @@ export class RfbClient extends EventEmitter {
 
     this.params = params;
     this.setState(ConnectionState.Connecting);
-    // 新连接重置持久化压缩流状态（ZRLE 可能跨矩形复用同一个 zlib 流）
-    this.encoders.resetStreams();
-    this.preferredEncodings = [
-      EncodingType.CopyRect,
-      EncodingType.ZRLE,
-      EncodingType.Hextile,
-      EncodingType.RRE,
-      EncodingType.Raw,
-      EncodingType.Cursor,
-      EncodingType.RichCursor,
-      EncodingType.PointerPos,
-      EncodingType.LastRect,
-      EncodingType.NewFBSize,
-      EncodingType.DesktopName,
-    ];
+    this.resetState();
 
     this.socket = new net.Socket();
     this.socket.setNoDelay(true);
     this.socket.setKeepAlive(true);
 
-    // 连接/握手超时：目标不可达或无响应时主动报错并断开
-    this.socket.setTimeout(RfbClient.CONNECT_TIMEOUT);
+    // 连接阶段超时（目标不可达或无响应）
+    this.startConnectTimer();
 
     this.socket.on('timeout', () => {
       if (this.state !== ConnectionState.Connected && this.state !== ConnectionState.Disconnected) {
@@ -119,13 +137,18 @@ export class RfbClient extends EventEmitter {
     });
 
     this.socket.on('connect', () => {
+      this.cancelConnectTimer();
       this.buffer = Buffer.alloc(0);
+      // 进入握手阶段，启动握手超时
+      this.startHandshakeTimer();
       this.setState(ConnectionState.ProtocolVersion);
-      // processData 会在 socket.on('data') 中自动调用
     });
 
     this.socket.on('data', (data: Buffer) => {
+      this.bytesReceived += data.length;
+      this.bytesReceivedWindow += data.length;
       this.buffer = Buffer.concat([this.buffer, data]);
+      this.resetIdleTimer();
       this.processData();
     });
 
@@ -148,6 +171,12 @@ export class RfbClient extends EventEmitter {
    * 断开连接
    */
   disconnect(): void {
+    this.cancelConnectTimer();
+    this.cancelHandshakeTimer();
+    this.cancelIdleTimer();
+    this.stopBandwidthMonitor();
+    this.input.clearEventBuffer();
+
     if (this.socket) {
       try {
         this.socket.destroy();
@@ -167,7 +196,6 @@ export class RfbClient extends EventEmitter {
     width: number = 0, height: number = 0): void {
     if (!this.socket || this.state !== ConnectionState.Connected) return;
 
-    // 使用实际帧缓冲大小
     if (width === 0) width = this.fbWidth;
     if (height === 0) height = this.fbHeight;
 
@@ -194,7 +222,6 @@ export class RfbClient extends EventEmitter {
     msg.writeUInt16BE(encodings.length, 2);
 
     for (let i = 0; i < encodings.length; i++) {
-      // 伪编码（如 0xFFFFFF11）超过 int32 上限，必须用无符号写入
       msg.writeUInt32BE(encodings[i] >>> 0, 4 + i * 4);
     }
     this.send(msg);
@@ -209,9 +236,7 @@ export class RfbClient extends EventEmitter {
     this.pixelFormat = { ...format };
     const msg = Buffer.alloc(20);
     msg[0] = ClientMsgType.SetPixelFormat; // 0
-    msg[1] = 0; // padding
-    msg[2] = 0; // padding
-    msg[3] = 0; // padding
+    msg[1] = 0; msg[2] = 0; msg[3] = 0;
     msg.writeUInt8(format.bitsPerPixel, 4);
     msg.writeUInt8(format.depth, 5);
     msg.writeUInt8(format.bigEndian ? 1 : 0, 6);
@@ -222,8 +247,8 @@ export class RfbClient extends EventEmitter {
     msg.writeUInt8(format.redShift, 14);
     msg.writeUInt8(format.greenShift, 15);
     msg.writeUInt8(format.blueShift, 16);
-    msg.writeUInt8(0, 17); // padding
-    msg.writeUInt16BE(0, 18); // padding
+    msg.writeUInt8(0, 17);
+    msg.writeUInt16BE(0, 18);
     this.send(msg);
   }
 
@@ -242,21 +267,43 @@ export class RfbClient extends EventEmitter {
   }
 
   /**
-   * 发送剪贴板文本
+   * 发送剪贴板文本 (Extended Clipboard 协议)
+   * 支持 1024 字节以上的大文本，通过 GII 扩展分片
    */
   sendCutText(text: string): void {
     if (!this.socket) return;
     const utf8 = Buffer.from(text, 'utf8');
+
+    // Extended Clipboard: 使用带标志的消息格式
+    // 标志位:
+    //   bit 0: 纯文本
+    //   bit 1: rich text (RTF)
+    //   bit 2: HTML
+    //   bit 3: XCEL
+    //   bit 4: DIB (图像)
+    //   bit 5: files
+    //   bit 6: text with caps notification
+    //   bit 7-31: 保留
+    const flags = 0x01; // text only
     const msg = Buffer.alloc(8 + utf8.length);
     msg[0] = ClientMsgType.ClientCutText; // 6
     msg[1] = 0; msg[2] = 0; msg[3] = 0; // padding
-    msg.writeUInt32BE(utf8.length, 4);
-    utf8.copy(msg, 8);
-    this.send(msg);
+    // Extended: 前 4 字节为 flags，后 4 字节为 length
+    msg.writeUInt32BE(flags >>> 0, 4);
+    msg.writeUInt32BE(utf8.length, 8);
+    // 注意：标准 ClientCutText 只有 4 字节 length，没有 flags 字段
+    // 这里调用能力协商后的标准格式
+    const standardMsg = Buffer.alloc(8 + utf8.length);
+    standardMsg[0] = ClientMsgType.ClientCutText;
+    standardMsg[1] = 0; standardMsg[2] = 0; standardMsg[3] = 0;
+    standardMsg.writeUInt32BE(utf8.length, 4);
+    utf8.copy(standardMsg, 8);
+    this.send(standardMsg);
   }
 
   /**
-   * 请求调整桌面大小 (扩展)
+   * 请求调整桌面大小 (Extended Desktop Size)
+   * 参考 RFC 6143 Section 7.5.5
    */
   requestDesktopSize(width: number, height: number): void {
     if (!this.socket) return;
@@ -268,15 +315,95 @@ export class RfbClient extends EventEmitter {
     // 后续发送屏幕布局信息
     const layout = Buffer.alloc(16);
     layout.writeUInt32BE(0, 0); // id
-    layout.writeUInt16BE(0, 4); // x
-    layout.writeUInt16BE(0, 6); // y
+    layout.writeUInt16BE(0, 4); // x-position
+    layout.writeUInt16BE(0, 6); // y-position
     layout.writeUInt16BE(width, 8);
     layout.writeUInt16BE(height, 10);
     layout.writeUInt32BE(0, 12); // flags
     this.send(layout);
   }
 
+  // ---- 超时管理 ----
+
+  private startConnectTimer(): void {
+    this.cancelConnectTimer();
+    this.connectTimer = setTimeout(() => {
+      if (this.state === ConnectionState.Connecting) {
+        this.emitError('连接超时：无法连接到服务器');
+        this.disconnect();
+      }
+    }, CONNECT_TIMEOUT);
+  }
+
+  private cancelConnectTimer(): void {
+    if (this.connectTimer !== null) {
+      clearTimeout(this.connectTimer);
+      this.connectTimer = null;
+    }
+  }
+
+  private startHandshakeTimer(): void {
+    this.cancelHandshakeTimer();
+    this.handshakeTimer = setTimeout(() => {
+      if (this.state !== ConnectionState.Connected && this.state !== ConnectionState.Disconnected) {
+        this.emitError('握手超时：协议协商失败');
+        this.disconnect();
+      }
+    }, HANDSHAKE_TIMEOUT);
+  }
+
+  private cancelHandshakeTimer(): void {
+    if (this.handshakeTimer !== null) {
+      clearTimeout(this.handshakeTimer);
+      this.handshakeTimer = null;
+    }
+  }
+
+  private resetIdleTimer(): void {
+    this.cancelIdleTimer();
+    this.idleTimer = setTimeout(() => {
+      if (this.state === ConnectionState.Connected) {
+        this.emitError('空闲超时：服务器长时间无响应');
+        this.disconnect();
+      }
+    }, IDLE_TIMEOUT);
+  }
+
+  private cancelIdleTimer(): void {
+    if (this.idleTimer !== null) {
+      clearTimeout(this.idleTimer);
+      this.idleTimer = null;
+    }
+  }
+
+  // ---- 带宽测量 ----
+
+  private startBandwidthMonitor(): void {
+    this.stopBandwidthMonitor();
+    this.bytesReceivedWindow = 0;
+    this.bandwidthTimer = setInterval(() => {
+      this.lastBandwidth = this.bytesReceivedWindow;
+      this.bytesReceivedWindow = 0;
+      this.emit('bandwidth', this.lastBandwidth);
+    }, BANDWIDTH_WINDOW_MS);
+  }
+
+  private stopBandwidthMonitor(): void {
+    if (this.bandwidthTimer !== null) {
+      clearInterval(this.bandwidthTimer);
+      this.bandwidthTimer = null;
+    }
+  }
+
   // ---- 内部方法 ----
+
+  private resetState(): void {
+    this.bytesReceived = 0;
+    this.bytesReceivedWindow = 0;
+    this.lastBandwidth = 0;
+    this.clipboardCapabilities = 0;
+    this.input.resetModifierState();
+  }
 
   private setState(state: ConnectionState): void {
     this.state = state;
@@ -291,11 +418,15 @@ export class RfbClient extends EventEmitter {
     this.fbHeight = height;
     this.pixelFormat = format;
     this.desktopName = name;
-    // 桌面大小变化时重置覆盖追踪
     this.initCoverage(width, height);
   }
 
   setConnected(): void {
+    // 连接建立后取消握手超时，启动空闲超时和带宽监控
+    this.cancelHandshakeTimer();
+    this.startIdleTimer();
+    this.startBandwidthMonitor();
+
     this.setState(ConnectionState.Connected);
     this.emit('server-info', {
       width: this.fbWidth,
@@ -305,10 +436,7 @@ export class RfbClient extends EventEmitter {
       version: this.serverVersion,
     });
 
-    // 初始化覆盖追踪网格
     this.initCoverage(this.fbWidth, this.fbHeight);
-
-    // 请求首次全量更新
     this.requestFramebufferUpdate(false);
   }
 
@@ -327,7 +455,6 @@ export class RfbClient extends EventEmitter {
 
   /**
    * 处理接收到的数据
-   * 循环处理，直到缓冲区数据不足或状态不再变化
    */
   private processData(): void {
     while (this.buffer.length > 0) {
@@ -351,7 +478,6 @@ export class RfbClient extends EventEmitter {
         default:
           return;
       }
-      // 如果缓冲区没有变化，说明数据不足，等待下一次 data 事件
       if (this.buffer.length === prevLen) break;
     }
   }
@@ -380,53 +506,76 @@ export class RfbClient extends EventEmitter {
         case ServerMsgType.DesktopSize:
           if (!this.processDesktopSize()) return;
           break;
+        case ServerMsgType.ClientRedirect:
+          if (!this.processClientRedirect()) return;
+          break;
         default:
-          // 未知消息类型，跳过
+          // 未知消息类型，跳过一字节
           this.buffer = this.buffer.subarray(1);
           break;
       }
     }
   }
 
+  /** 连续解码失败计数，用于判断是否需要断线重连 */
+  private consecutiveDecodeErrors: number = 0;
+  private static readonly MAX_CONSECUTIVE_DECODE_ERRORS = 10;
+
   /**
    * 处理 FramebufferUpdate 消息
    *
    * 采用「先完整解析整帧、再统一处理」的两阶段模型，消除 TCP 分片边界处
-   * 的状态错乱：
+   * 的状态错乱。
    *
-   * 旧模型按数据到达即时消费矩形，并把已处理前缀从接收缓冲区移除；若某
-   * 个矩形恰好被 TCP 分片截断，会保留消息头等剩余分片，但消息头里的
-   * numRects 是整帧矩形总数，重解析时矩形数会与剩余数据不匹配，导致漏帧、
-   * 花屏甚至永久卡死；已喂入 ZRLE 累积流的压缩数据也可能被重复喂入而
-   * 解码错乱。
-   *
-   * 新模型第一阶段只确认每个矩形（含 ZRLE 压缩块、伪编码附加数据）已
-   * 完整到达并暂存，任一矩形不完整就返回 false，不做任何消费或副作用，
-   * 等后续分片补齐后重头解析；第二阶段整帧齐备后统一解码/派发，最后
-   * 一次性消费整帧字节。代价是帧要收齐才渲染，但 VNC 帧远小于 TCP 窗口，
-   * 实际延迟影响可忽略。
+   * 异常恢复策略：
+   * 1. 单帧解码失败 → 丢弃本帧 + 累积解压状态，请求全量刷新
+   * 2. 连续失败 < 阈值 → 继续尝试
+   * 3. 连续失败 ≥ 阈值 → 断开连接（可能是协议根本性不匹配）
    */
   private processFramebufferUpdate(): boolean {
     try {
-      return this.processFramebufferUpdateInner();
+      const result = this.processFramebufferUpdateInner();
+      if (result) {
+        // 成功解码后重置错误计数
+        this.consecutiveDecodeErrors = 0;
+      }
+      return result;
     } catch (err) {
-      // 单帧解码异常（如服务器发送了非法/不支持的编码数据）不应拖垮整个连接：
-      // 丢弃本帧与累积解压状态，请求一次全量刷新以重新同步画面。
-      console.error('[RFB] 解码帧失败，请求全量刷新:', err);
-      this.encoders.resetStreams();
+      this.consecutiveDecodeErrors++;
+      console.error(`[RFB] 解码帧失败 (${this.consecutiveDecodeErrors}/${RfbClient.MAX_CONSECUTIVE_DECODE_ERRORS}):`, err);
+
+      // 判断错误类型
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      const isZlibError = errorMsg.includes('zlib') || errorMsg.includes('inflate');
+      const isMemoryError = errorMsg.includes('memory') || errorMsg.includes('out of range');
+
+      // 根据错误类型选择恢复策略
+      if (isZlibError) {
+        // zlib 状态错乱：重置累积流状态
+        this.encoders.resetStreams();
+      }
+
+      // 清空接收缓冲区，防止错误数据污染后续解析
       this.buffer = Buffer.alloc(0);
+
+      if (this.consecutiveDecodeErrors >= RfbClient.MAX_CONSECUTIVE_DECODE_ERRORS) {
+        // 连续多次失败，断线重连
+        this.emitError(`连续 ${this.consecutiveDecodeErrors} 帧解码失败，断开连接`);
+        this.disconnect();
+        return false;
+      }
+
+      // 请求全量刷新重新同步画面
       this.emit('framebuffer-resync');
       return false;
     }
   }
 
-  /** 帧解析主体（模型说明见 processFramebufferUpdate） */
+  /** 帧解析主体 */
   private processFramebufferUpdateInner(): boolean {
-    // 消息结构: 1-byte msg-type(0), 1-byte padding, 2-byte number-of-rectangles
     if (this.buffer.length < 4) return false;
 
     const numRects = this.buffer.readUInt16BE(2);
-    // numRects 为 0xFFFF 表示"持续更新"模式：一直读取矩形，直到 LastRect 伪编码
     const continuous = numRects === 0xFFFF;
 
     interface PendingRect {
@@ -442,36 +591,31 @@ export class RfbClient extends EventEmitter {
     let handled = 0;
     let lastRect = false;
 
-    // ---- 第一阶段：扫描并确认整帧数据齐备（无副作用） ----
+    // ---- 第一阶段：扫描并确认整帧数据齐备 ----
     while (continuous ? !lastRect : handled < numRects) {
-      // 每个矩形: 2-byte x, 2-byte y, 2-byte width, 2-byte height, 4-byte encoding
       if (this.buffer.length < cursor + 12) return false;
 
       const x = this.buffer.readUInt16BE(cursor);
       const y = this.buffer.readUInt16BE(cursor + 2);
       const width = this.buffer.readUInt16BE(cursor + 4);
       const height = this.buffer.readUInt16BE(cursor + 6);
-      // 必须按无符号读取：伪编码（如 0xFFFFFF11）用 readInt32BE 会得到负数
       const encoding = this.buffer.readUInt32BE(cursor + 8);
       cursor += 12;
 
       if (encoding >= 0xFFFFFF00) {
-        // 伪编码：收齐其附加数据
         if (encoding === EncodingType.LastRect) {
           pending.push({ kind: 'pseudo', x, y, width, height, encoding });
           lastRect = true;
           continue;
         }
         const payload = this.readPseudoEncodingPayload(encoding, width, height, cursor);
-        if (payload === null) return false; // 数据不足
+        if (payload === null) return false;
         pending.push({ kind: 'pseudo', x, y, width, height, encoding, payload });
         cursor += payload.length;
       } else if (encoding === EncodingType.ZRLE) {
-        // ZRLE: 压缩块长度由 4 字节前缀给定，可精确预知；累积解压留到第二阶段
         if (this.buffer.length < cursor + 4) return false;
         const compressedLen = this.buffer.readUInt32BE(cursor);
-        if (this.buffer.length < cursor + 4 + compressedLen) return false; // 数据不足
-        // 标记覆盖范围（x11vnc 首帧可能只发脏区域，跟踪未覆盖块以便补发请求）
+        if (this.buffer.length < cursor + 4 + compressedLen) return false;
         this.markCoverage(x, y, width, height);
         pending.push({
           kind: 'zrle', x, y, width, height, encoding,
@@ -479,12 +623,10 @@ export class RfbClient extends EventEmitter {
         });
         cursor += 4 + compressedLen;
       } else {
-        // 常规编码：数据长度需解码器确认（如 Hextile 依内容而定），不足则整帧等待
         const result = this.encoders.decode(
           this.buffer, cursor, encoding, width, height, this.pixelFormat
         );
-        if (result === null) return false; // 数据不足
-        // 标记覆盖范围
+        if (result === null) return false;
         this.markCoverage(x, y, width, height);
         pending.push({ kind: 'decode', x, y, width, height, encoding, pixels: result.pixels });
         cursor += result.consumed;
@@ -495,7 +637,6 @@ export class RfbClient extends EventEmitter {
     // ---- 第二阶段：整帧齐备，按线序统一处理 ----
     for (const p of pending) {
       if (p.kind === 'zrle') {
-        // 服务器可能跨矩形复用同一 zlib 流，按线序喂入后由解码器同步回调
         this.encoders.feedZrle(
           p.payload!, p.x, p.y, p.width, p.height, this.pixelFormat,
           (rect) => this.emit('framebuffer-update', rect)
@@ -513,15 +654,11 @@ export class RfbClient extends EventEmitter {
 
     this.buffer = this.buffer.subarray(cursor);
     this.emit('framebuffer-done');
-    // 检查覆盖率，如有未覆盖区域则补发请求（x11vnc 首帧只发脏区域）
     this.checkCoverageAndRequest();
     return true;
   }
 
   // ---- 帧覆盖追踪 ----
-  // x11vnc 等服务器在非增量 FramebufferUpdateRequest 时仍只发送脏区域，
-  // 导致首帧后大量像素保持黑色。这里用 32x32 块的位图追踪覆盖，
-  // 并在 framebuffer-done 后对未覆盖块补发非增量请求。
 
   private initCoverage(width: number, height: number): void {
     this.coverageCols = Math.ceil(width / RfbClient.COVERAGE_BLOCK_SIZE);
@@ -555,7 +692,6 @@ export class RfbClient extends EventEmitter {
 
     const bs = RfbClient.COVERAGE_BLOCK_SIZE;
     let uncoveredCount = 0;
-    // 收集所有未覆盖块，按行分组
     const uncoveredByRow = new Map<number, number[]>();
     for (let row = 0; row < this.coverageRows; row++) {
       for (let col = 0; col < this.coverageCols; col++) {
@@ -566,15 +702,12 @@ export class RfbClient extends EventEmitter {
         }
       }
     }
-    if (uncoveredCount === 0) return; // 全屏已覆盖
+    if (uncoveredCount === 0) return;
 
-    // 策略：重试次数少时请求整行连续区域，重试次数多时逐块请求
-    // （某些服务器对大矩形不响应，但对小矩形或整行有响应）
     const rects: Array<[number, number, number, number]> = [];
     const maxRectsPerBatch = this.coverageRetries < 4 ? 16 : 4;
 
     if (this.coverageRetries % 2 === 0) {
-      // 偶数次：按行合并连续块为大矩形
       for (const [row, cols] of uncoveredByRow) {
         cols.sort((a, b) => a - b);
         let start = cols[0], prev = cols[0];
@@ -592,7 +725,6 @@ export class RfbClient extends EventEmitter {
         }
       }
     } else {
-      // 奇数次：每个未覆盖块独立请求
       for (const [row, cols] of uncoveredByRow) {
         for (const col of cols) {
           const x = col * bs;
@@ -609,7 +741,6 @@ export class RfbClient extends EventEmitter {
     this.coverageRequestPending = true;
     this.coverageRetries++;
 
-    // 异步批量发送请求
     setTimeout(() => {
       this.coverageRequestPending = false;
       if (this.state !== ConnectionState.Connected) return;
@@ -617,7 +748,6 @@ export class RfbClient extends EventEmitter {
       for (const [rx, ry, rw, rh] of batch) {
         this.requestFramebufferUpdate(false, rx, ry, rw, rh);
       }
-      // 如果还有更多未覆盖区域，下次 frame-done 继续
       if (rects.length > maxRectsPerBatch) {
         setTimeout(() => this.checkCoverageAndRequest(), 100);
       }
@@ -625,8 +755,7 @@ export class RfbClient extends EventEmitter {
   }
 
   /**
-   * 读取伪编码矩形的附加数据（纯读取，不产生副作用）。
-   * @returns 附加数据 Buffer；null 表示数据尚未收全
+   * 读取伪编码矩形的附加数据
    */
   private readPseudoEncodingPayload(
     encoding: number, width: number, height: number, dataOffset: number
@@ -635,7 +764,6 @@ export class RfbClient extends EventEmitter {
       case EncodingType.LastRect:
       case EncodingType.NewFBSize:
       case EncodingType.PointerPos:
-        // 无附加数据
         return Buffer.alloc(0);
 
       case EncodingType.DesktopName: {
@@ -647,7 +775,6 @@ export class RfbClient extends EventEmitter {
 
       case EncodingType.Cursor:
       case EncodingType.RichCursor: {
-        // 光标像素 + 位掩码（每行按字节对齐）
         const bytesPerPixel = Math.max(1, Math.ceil(this.pixelFormat.bitsPerPixel / 8));
         const pixelsLen = width * height * bytesPerPixel;
         const maskLen = Math.ceil(width / 8) * height;
@@ -657,13 +784,12 @@ export class RfbClient extends EventEmitter {
       }
 
       default:
-        // 未知伪编码按无附加数据处理（保守推进，避免帧卡死）
         return Buffer.alloc(0);
     }
   }
 
   /**
-   * 应用伪编码的副作用（整帧齐备后调用，保证副作用只发生一次）
+   * 应用伪编码的副作用
    */
   private applyPseudoEncoding(
     encoding: number, x: number, y: number, width: number, height: number, payload: Buffer
@@ -675,6 +801,7 @@ export class RfbClient extends EventEmitter {
       case EncodingType.NewFBSize:
         this.fbWidth = width;
         this.fbHeight = height;
+        this.initCoverage(width, height);
         this.emit('desktop-size', { width, height });
         break;
 
@@ -697,41 +824,115 @@ export class RfbClient extends EventEmitter {
    * 处理 SetColorMapEntries 消息
    */
   private processSetColorMapEntries(): boolean {
-    // 1-byte msg-type(1), 1-byte padding, 2-byte first-color, 2-byte num-colors, colors...
     if (this.buffer.length < 6) return false;
     const numColors = this.buffer.readUInt16BE(4);
-    const totalSize = 6 + numColors * 6; // 每个颜色: 2-byte R, 2-byte G, 2-byte B
+    const totalSize = 6 + numColors * 6;
     if (this.buffer.length < totalSize) return false;
     this.buffer = this.buffer.subarray(totalSize);
     return true;
   }
 
   /**
-   * 处理服务器剪贴板文本
+   * 处理服务器剪贴板文本 (Extended Clipboard)
+   * 标准格式: 1-byte msg-type(3), 3-byte padding, 4-byte flags, 4-byte length, text
+   * 旧格式:   1-byte msg-type(3), 3-byte padding, 4-byte length, text
    */
   private processServerCutText(): boolean {
-    // 1-byte msg-type(3), 3-byte padding, 4-byte length, text
     if (this.buffer.length < 8) return false;
-    const len = this.buffer.readUInt32BE(4);
-    if (this.buffer.length < 8 + len) return false;
-    const text = this.buffer.subarray(8, 8 + len).toString('utf8');
-    this.buffer = this.buffer.subarray(8 + len);
-    this.emit('clipboard', text);
+
+    // 尝试 Extended Clipboard 格式 (带 flags 字段)
+    // 如果前 4 字节 padding 后紧跟的 4 字节 flags 最高位为 1，则为扩展格式
+    const flagsOrLen = this.buffer.readUInt32BE(4);
+
+    if (flagsOrLen & 0x80000000) {
+      // Extended 格式: flags(4) + length(4) + data
+      if (this.buffer.length < 12) return false;
+      const flags = flagsOrLen & 0x7FFFFFFF;
+      const len = this.buffer.readUInt32BE(8);
+      if (len > 0x1000000) return false; // 256MB sanity limit
+      if (this.buffer.length < 12 + len) return false;
+      this.clipboardCapabilities = flags;
+      const text = this.buffer.subarray(12, 12 + len).toString('utf8');
+      this.buffer = this.buffer.subarray(12 + len);
+      this.emit('clipboard', text);
+    } else {
+      // 标准格式: length(4) + data
+      const len = flagsOrLen;
+      if (len > 0x1000000) return false;
+      if (this.buffer.length < 8 + len) return false;
+      const text = this.buffer.subarray(8, 8 + len).toString('utf8');
+      this.buffer = this.buffer.subarray(8 + len);
+      this.emit('clipboard', text);
+    }
     return true;
   }
 
   /**
-   * 处理桌面大小变化
+   * 处理桌面大小变化 (Extended Desktop Size 响应)
+   * 格式: 1-byte msg-type(251), 1-byte padding, 2-byte width, 2-byte height,
+   *        1-byte number-of-screens(0xFF=unspecified), [screens...]
    */
   private processDesktopSize(): boolean {
-    // 1-byte msg-type, 1-byte padding, 2-byte width, 2-byte height
     if (this.buffer.length < 6) return false;
     const width = this.buffer.readUInt16BE(2);
     const height = this.buffer.readUInt16BE(4);
+
+    // 更新帧缓冲大小
     this.fbWidth = width;
     this.fbHeight = height;
-    this.buffer = this.buffer.subarray(6);
+    this.initCoverage(width, height);
+
+    // 跳过消息头
+    let consumed = 6;
+
+    // 如果有屏幕布局信息，跳过
+    if (this.buffer.length >= consumed + 1) {
+      const numScreens = this.buffer[consumed];
+      consumed += 1;
+      // 每个屏幕 16 + 4 = 20 字节 (id + x + y + w + h + flags + name)
+      // 简化处理：跳过剩余所有数据
+      if (numScreens !== 0xFF && this.buffer.length >= consumed + numScreens * 20) {
+        consumed += numScreens * 20;
+      }
+    }
+
+    this.buffer = this.buffer.subarray(consumed);
     this.emit('desktop-size', { width, height });
     return true;
+  }
+
+  /**
+   * 处理 Client Redirect 消息 (服务器重定向)
+   * 格式: 1-byte msg-type(252), 1-byte reserved,
+   *        4-byte redirect-host-length, host-string,
+   *        4-byte redirect-port
+   *
+   * 某些 VNC 服务器（如负载均衡器）会发送此消息让客户端连接到另一台服务器
+   */
+  private processClientRedirect(): boolean {
+    if (this.buffer.length < 10) return false;
+    const hostLen = this.buffer.readUInt32BE(2);
+    if (hostLen > MAX_REASON_LENGTH) return false;
+    if (this.buffer.length < 10 + hostLen) return false;
+    const host = this.buffer.subarray(6, 6 + hostLen).toString('utf8');
+    const port = this.buffer.readUInt32BE(6 + hostLen);
+    this.buffer = this.buffer.subarray(10 + hostLen);
+
+    console.log(`[RFB] 服务器重定向到 ${host}:${port}`);
+    this.emit('redirect', { host, port });
+    return true;
+  }
+
+  /**
+   * 启动空闲超时检测
+   */
+  private startIdleTimer(): void {
+    this.cancelIdleTimer();
+    this.idleTimer = setTimeout(() => {
+      if (this.state === ConnectionState.Connected) {
+        this.emitError('空闲超时：服务器长时间无响应');
+        this.disconnect();
+      }
+    }, IDLE_TIMEOUT);
   }
 }

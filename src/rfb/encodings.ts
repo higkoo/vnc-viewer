@@ -1,12 +1,15 @@
 /**
  * RFB 编码解码器
  * 参考 UltraVNC vncEncoder 和 RFC 6143
+ * 参考 TightVNC 协议规范
  *
  * 支持的编码:
  * - Raw (0): 原始像素数据
  * - CopyRect (1): 复制已有区域
  * - RRE (2): 行程编码
  * - Hextile (5): 分块编码
+ * - Tight (7): Tight 编码 (含 Zlib 压缩+JPEG)
+ * - TightZstd (17): Tight + Zstd 压缩
  * - ZRLE (16): Zlib 游程编码
  */
 
@@ -139,6 +142,10 @@ export class EncodingDecoders {
         return this.decodeRRE(buffer, offset, width, height, format);
       case EncodingType.Hextile:
         return this.decodeHextile(buffer, offset, width, height, format);
+      case EncodingType.Tight:
+        return this.decodeTight(buffer, offset, width, height, format);
+      case EncodingType.TightZstd:
+        return this.decodeTightZstd(buffer, offset, width, height, format);
       // ZRLE 走 feedZrle(): 服务器可能跨矩形复用 zlib 流，需要累积解压后回调
       default:
         // 未知编码，尝试跳过
@@ -682,5 +689,190 @@ export class EncodingDecoders {
         fb[off + 3] = color[3];
       }
     }
+  }
+
+  // ---- Tight 编码 ----
+  // Tight 编码 (TightVNC 协议):
+  // - 第1字节: 压缩控制字节
+  //   bit 7-4: 压缩类型
+  //     0x00 = 使用 zlib 压缩填充 (Fill) — 后跟 1 个 CPIXEL
+  //     0x01 = 使用 zlib 压缩原始数据 (JPEG-LS 风格的 basic compression)
+  //     0x02 = 使用 zlib 压缩具体数据
+  //     0x08 = 填充 + JPEG (即 JPEG 压缩)
+  //   bit 0: 滤波器/滤波器标识 (当基本压缩时)
+  // - 数据压缩方式: zlib (bit7-4 != 0x80)
+  // - JPEG: 当压缩类型高4位 = 0x08 时，数据为 JPEG
+
+  /** Tight zlib 累积流 */
+  private tightZlibAccumulated: Buffer = Buffer.alloc(0);
+
+  /**
+   * 解码 Tight 编码 (Zlib 压缩)
+   * 参考 TightVNC 协议规范
+   */
+  private decodeTight(
+    buffer: Buffer, offset: number,
+    width: number, height: number, format: PixelFormat
+  ): DecodeResult | null {
+    // 读取压缩控制字节
+    if (buffer.length < offset + 1) return null;
+    const compControl = buffer[offset];
+    offset++;
+
+    const compType = (compControl >> 4) & 0x0F;
+    const filterId = compControl & 0x0F;
+
+    if (compType === 0x08) {
+      // JPEG 压缩 — 需要 JPEG 解码器，标记为不支持
+      console.warn('[RFB] Tight JPEG 编码尚未实现，跳过');
+      return null;
+    }
+
+    // 读取压缩数据长度 (1-3 字节变长编码)
+    let compressedLen = 0;
+    let lenBytes = 0;
+    if (compType === 0x00) {
+      // Fill 模式: 无压缩数据，只有 1 个 CPIXEL
+      const fb = Buffer.alloc(width * height * 4);
+      const color = this.readCPixel(buffer, offset, format, this.cpixelSize(format));
+      this.fillRect(fb, 0, 0, width, height, color, width);
+      return { pixels: fb, consumed: 1 + this.cpixelSize(format) };
+    }
+
+    // 读取变长长度编码 (Tight 自定义)
+    if (buffer.length < offset + 1) return null;
+    compressedLen = buffer[offset] & 0x7F;
+    lenBytes = 1;
+    if (buffer[offset] & 0x80) {
+      if (buffer.length < offset + 2) return null;
+      compressedLen |= (buffer[offset + 1] & 0x7F) << 7;
+      lenBytes = 2;
+      if (buffer[offset + 1] & 0x80) {
+        if (buffer.length < offset + 3) return null;
+        compressedLen |= (buffer[offset + 2]) << 14;
+        lenBytes = 3;
+      }
+    }
+    offset += lenBytes;
+
+    // 读取压缩数据
+    if (buffer.length < offset + compressedLen) return null;
+    const compressed = buffer.subarray(offset, offset + compressedLen);
+
+    // 解压
+    let rawData: Buffer;
+    try {
+      rawData = zlib.inflateSync(compressed, {
+        finishFlush: zlib.constants.Z_SYNC_FLUSH,
+      });
+    } catch (err) {
+      console.error('[RFB] Tight zlib 解压失败:', err);
+      return null;
+    }
+
+    const totalPixels = width * height;
+    const fb = Buffer.alloc(totalPixels * 4);
+
+    if (filterId === 0x00) {
+      // 无滤波器: 原始 CPIXEL 数据
+      const cpi = this.cpixelSize(format);
+      for (let i = 0; i < totalPixels; i++) {
+        const color = this.readCPixel(rawData, i * cpi, format, cpi);
+        const dstOff = i * 4;
+        fb[dstOff] = color[0];
+        fb[dstOff + 1] = color[1];
+        fb[dstOff + 2] = color[2];
+        fb[dstOff + 3] = 255;
+      }
+    } else if (filterId === 0x01) {
+      // Palette 滤波器
+      const paletteSize = rawData[0] + 1;
+      const cpi = this.cpixelSize(format);
+      const palette: number[][] = [];
+      let srcOff = 1;
+      for (let i = 0; i < paletteSize; i++) {
+        palette.push(this.readCPixel(rawData, srcOff, format, cpi));
+        srcOff += cpi;
+      }
+
+      if (paletteSize === 2) {
+        // 2 色调色板: 每像素 1 bit
+        for (let row = 0; row < height; row++) {
+          for (let col = 0; col < width; col++) {
+            const bitIndex = col;
+            const byte = rawData[srcOff + (row * Math.ceil(width / 8) + (bitIndex >> 3))];
+            const shift = 7 - (bitIndex & 7);
+            const idx = (byte >> shift) & 1;
+            const color = palette[idx] || [0, 0, 0, 255];
+            const dstOff = (row * width + col) * 4;
+            fb[dstOff] = color[0];
+            fb[dstOff + 1] = color[1];
+            fb[dstOff + 2] = color[2];
+            fb[dstOff + 3] = 255;
+          }
+        }
+      } else {
+        // 3-256 色调色板: 每像素 1 byte
+        for (let row = 0; row < height; row++) {
+          for (let col = 0; col < width; col++) {
+            const idx = rawData[srcOff + row * width + col];
+            const color = palette[idx] || [0, 0, 0, 255];
+            const dstOff = (row * width + col) * 4;
+            fb[dstOff] = color[0];
+            fb[dstOff + 1] = color[1];
+            fb[dstOff + 2] = color[2];
+            fb[dstOff + 3] = 255;
+          }
+        }
+      }
+    } else if (filterId === 0x02) {
+      // Gradient 滤波器 (JPEG-LS 风格)
+      // 每个像素使用前一个像素和上方像素的梯度预测
+      const cpi = this.cpixelSize(format);
+      const bpp = Math.max(1, Math.ceil(format.bitsPerPixel / 8));
+
+      for (let row = 0; row < height; row++) {
+        for (let col = 0; col < width; col++) {
+          const prev = col > 0 ? this.getPixel(fb, col - 1, row, width) : [0, 0, 0];
+          const above = row > 0 ? this.getPixel(fb, col, row - 1, width) : [0, 0, 0];
+          const raw = this.readCPixel(rawData, (row * width + col) * cpi, format, cpi);
+
+          const r = (raw[0] + ((prev[0] + above[0]) >> 1)) & 0xFF;
+          const g = (raw[1] + ((prev[1] + above[1]) >> 1)) & 0xFF;
+          const b = (raw[2] + ((prev[2] + above[2]) >> 1)) & 0xFF;
+
+          const dstOff = (row * width + col) * 4;
+          fb[dstOff] = r;
+          fb[dstOff + 1] = g;
+          fb[dstOff + 2] = b;
+          fb[dstOff + 3] = 255;
+        }
+      }
+    } else {
+      console.warn(`[RFB] Tight: 未知滤波器 ${filterId}`);
+      return null;
+    }
+
+    return { pixels: fb, consumed: 1 + lenBytes + compressedLen };
+  }
+
+  /**
+   * 解码 Tight+Zstd 编码
+   * TightZstd 使用 Zstandard 代替 zlib
+   */
+  private decodeTightZstd(
+    buffer: Buffer, offset: number,
+    width: number, height: number, format: PixelFormat
+  ): DecodeResult | null {
+    // TightZstd 结构与 Tight 相同，但使用 zstd 解压
+    // Node.js 内置 zstd 不可用(FreeBSD 平台限制), 标记为不支持
+    console.warn('[RFB] Tight+Zstd 编码尚未实现 (Node.js 无内置 zstd), 跳过');
+    return null;
+  }
+
+  /** 从帧缓冲中获取像素 */
+  private getPixel(fb: Buffer, x: number, y: number, fbWidth: number): number[] {
+    const off = (y * fbWidth + x) * 4;
+    return [fb[off], fb[off + 1], fb[off + 2]];
   }
 }

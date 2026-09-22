@@ -1,12 +1,15 @@
 /**
  * RFB 编码解码器
  * 参考 UltraVNC vncEncoder 和 RFC 6143
+ * 参考 TightVNC 协议规范
  *
  * 支持的编码:
  * - Raw (0): 原始像素数据
  * - CopyRect (1): 复制已有区域
  * - RRE (2): 行程编码
  * - Hextile (5): 分块编码
+ * - Tight (7): Tight 编码 (含 Zlib 压缩+JPEG)
+ * - TightZstd (17): Tight + Zstd 压缩
  * - ZRLE (16): Zlib 游程编码
  */
 import { PixelFormat, FramebufferRect } from './types';
@@ -140,6 +143,20 @@ export declare class EncodingDecoders {
      * 填充矩形区域
      */
     private fillRect;
+    /** Tight zlib 累积流 */
+    private tightZlibAccumulated;
+    /**
+     * 解码 Tight 编码 (Zlib 压缩)
+     * 参考 TightVNC 协议规范
+     */
+    private decodeTight;
+    /**
+     * 解码 Tight+Zstd 编码
+     * TightZstd 使用 Zstandard 代替 zlib
+     */
+    private decodeTightZstd;
+    /** 从帧缓冲中获取像素 */
+    private getPixel;
 }
 export {};
 //# sourceMappingURL=encodings.d.ts.map

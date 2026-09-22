@@ -23,6 +23,7 @@ export enum SecurityType {
   MD5 = 21,
   ColinDeanXVP = 22,
   MSLogon = 129,
+  Plain = 256,      // VeNCrypt Plain 子类型 (UltraVNC 扩展)
 }
 
 // ---- 编码类型 ----
@@ -39,6 +40,14 @@ export enum EncodingType {
   NewFBSize = 0xFFFFFF21,    // 伪编码: 新帧缓冲大小
   DesktopName = 0xFFFFFF22,  // 伪编码: 桌面名称
   UltraVNC_Ext = 0xFFFFFFF8, // UltraVNC 扩展
+  // Tight 编码
+  Tight = 7,
+  TightZstd = 17, // Tight + Zstd 压缩
+  // Extended Clipboard 伪编码
+  ExtClipboard_Caps = 0xFFFFFEC0,
+  ExtClipboard_Request = 0xFFFFFEC1,
+  ExtClipboard_Peek = 0xFFFFFEC2,
+  ExtClipboard_Notify = 0xFFFFFEC3,
 }
 
 // ---- 消息类型 (客户端→服务器) ----
@@ -61,6 +70,7 @@ export enum ServerMsgType {
   ServerCutText = 3,
   FileTransfer = 7,         // UltraVNC 扩展
   DesktopSize = 251,        // 扩展
+  ClientRedirect = 252,     // 扩展: 服务器重定向
 }
 
 // ---- 像素格式 ----
@@ -133,6 +143,10 @@ export const IPC_CHANNELS = {
   SET_ENCODINGS: 'rfb:set-encodings',
   SET_PIXEL_FORMAT: 'rfb:set-pixel-format',
   SET_DESKTOP_SIZE: 'rfb:request-desktop-size',
+  // 带宽统计
+  BANDWIDTH: 'rfb:bandwidth',
+  // 服务器重定向
+  REDIRECT: 'rfb:redirect',
   // 应用日志
   APP_LOG: 'app:log',
   LOG_GET: 'app:log:get',
