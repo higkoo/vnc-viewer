@@ -92,7 +92,6 @@ declare let fbHeight: number;
 declare let fbCanvas: ImageData | null;
 declare let bgFillTimer: ReturnType<typeof setTimeout> | null;
 declare let lastFrameTime: number;
-declare let bgFillDone: boolean;
 declare let mouseButtonMask: number;
 declare let lastMouseX: number;
 declare let lastMouseY: number;
@@ -129,8 +128,11 @@ declare function renderRect(rect: {
 }): void;
 /**
  * 背景填充：x11vnc 等服务器不发送静态背景区域，导致帧缓冲中保留黑色(0,0,0)。
- * 检测纯黑像素，用上下左右最近的非黑像素颜色填充。
- * 这是一个简单的一遍扫描修复，适用于纯色或渐变背景。
+ *
+ * 三段式策略：
+ * 1. 纯色推断：从边缘采样推断背景主色调，直接填充所有黑块（适合纯色桌面）
+ * 2. 扫描线扩散：32 轮四方向扫描，用最近非黑像素填充（适合渐变/纹理背景）
+ * 3. 孤立点修复：对仍未修复的黑点做螺旋采样，取 4-16px 范围内最近非黑像素
  */
 declare function fillBackground(): void;
 declare function handleMouseDown(e: MouseEvent): void;

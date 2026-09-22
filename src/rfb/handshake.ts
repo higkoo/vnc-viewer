@@ -167,6 +167,7 @@ export class RfbHandshake {
 
   /**
    * 阶段 3: 认证
+   * 支持: None, VncAuth, MSLogon, Plain (VeNCrypt 子类型)
    */
   private handleAuthentication(type: SecurityType): void {
     switch (type) {
@@ -179,13 +180,13 @@ export class RfbHandshake {
         console.log('[RFB] VNC 认证 - 等待挑战码');
         this.authChallengeSent = false;
         this.client.updateState(ConnectionState.Authentication);
-        // processAuthentication 会在数据到达时由 processData 调用
-        // 它会先读 16 字节挑战码，再读 4 字节安全结果
         break;
       case SecurityType.MSLogon:
-        console.log('[RFB] MS-Logon 认证简化处理');
-        this.client.updateState(ConnectionState.ClientInit);
-        this.sendClientInit();
+      case SecurityType.Plain:
+        // MSLogon 和 Plain 都使用用户名+密码明文认证
+        console.log(`[RFB] ${SecurityType[type]} 认证`);
+        this.authChallengeSent = false;
+        this.client.updateState(ConnectionState.Authentication);
         break;
       default:
         this.client.emitError(`不支持的安全类型: ${SecurityType[type]}`);
@@ -208,13 +209,43 @@ export class RfbHandshake {
   }
 
   /**
-   * 处理认证阶段数据，分两步：
+   * 处理认证阶段数据
+   * 根据当前选择的安全类型分派到对应处理器
+   */
+  processAuthentication(): void {
+    const selectedType = this.getCurrentSecurityType();
+    if (selectedType === SecurityType.MSLogon || selectedType === SecurityType.Plain) {
+      this.processPlainAuth();
+    } else {
+      this.processVncAuth();
+    }
+  }
+
+  /** 获取当前选择的安全类型 */
+  private getCurrentSecurityType(): SecurityType {
+    // 从 securityTypes 中选出的第一个即是已选类型
+    const priority = [
+      SecurityType.None,
+      SecurityType.VncAuth,
+      SecurityType.MSLogon,
+      SecurityType.Plain,
+      SecurityType.Tight,
+    ];
+    for (const pref of priority) {
+      if (this.securityTypes.includes(pref)) {
+        return pref;
+      }
+    }
+    return this.securityTypes[0] || SecurityType.Invalid;
+  }
+
+  /**
+   * VNC Auth (DES 挑战-响应) — 分两步：
    * 1. 读 16 字节挑战码 → 发送加密响应
    * 2. 读 4 字节安全结果 → 成功则进入 ClientInit
    */
-  processAuthentication(): void {
+  private processVncAuth(): void {
     if (!this.authChallengeSent) {
-      // 第一步：读 16 字节挑战码
       const challenge = this.client.readBuffer(16);
       if (!challenge) return;
 
@@ -224,26 +255,69 @@ export class RfbHandshake {
         return;
       }
 
-      // 准备密码: 截断或填充到8字节
       const keyBuf = Buffer.alloc(8, 0);
       const pwd = Buffer.from(password, 'utf8');
       pwd.copy(keyBuf, 0, 0, Math.min(pwd.length, 8));
 
-      // 翻转密码字节的位 (UltraVNC 兼容)
       for (let i = 0; i < 8; i++) {
         keyBuf[i] = this.reverseBits(keyBuf[i]);
       }
 
-      // DES ECB 加密（纯 JS 实现，避免 OpenSSL 3 禁用 DES）
       const encrypted = desEcbEncrypt(keyBuf, challenge);
-
       this.client.send(encrypted);
       this.authChallengeSent = true;
       console.log('[RFB] 已发送加密挑战码，等待安全结果');
       return;
     }
 
-    // 第二步：读 4 字节安全结果
+    this.readAuthResult('VNC 认证失败');
+  }
+
+  /**
+   * Plain / MSLogon 明文认证
+   * UltraVNC MS-Logon 格式:
+   *   1. 服务器发送 16-byte 域字符串（通常为空）
+   *   2. 客户端发送 username:length + username + password:length + password
+   *   3. 服务器发送 4-byte 结果
+   *
+   * 标准 Plain 格式 (x11vnc):
+   *   1. 服务器发送 4-byte username-len + username + 4-byte password-len + password 长度
+   *   2. 客户端回复相同格式
+   *   3. 服务器发送 4-byte 结果
+   */
+  private processPlainAuth(): void {
+    if (!this.authChallengeSent) {
+      // 读取服务器挑战（MS-Logon: 16 字节域; Plain: 4+len+4+len）
+      // 为了兼容性，先试探性读取
+      const challenge = this.client.readBuffer(16);
+      if (!challenge) return;
+
+      const params = this.client.getParams();
+      const username = (params as any).username || '';
+      const password = params.password || '';
+
+      // 构建响应: [1-byte username-len][username][1-byte password-len][password]
+      const userBuf = Buffer.from(username, 'utf8');
+      const passBuf = Buffer.from(password, 'utf8');
+      const response = Buffer.alloc(1 + userBuf.length + 1 + passBuf.length);
+      response[0] = Math.min(userBuf.length, 255);
+      userBuf.copy(response, 1, 0, Math.min(userBuf.length, 255));
+      response[1 + Math.min(userBuf.length, 255)] = Math.min(passBuf.length, 255);
+      passBuf.copy(response, 2 + Math.min(userBuf.length, 255), 0, Math.min(passBuf.length, 255));
+
+      this.client.send(response);
+      this.authChallengeSent = true;
+      console.log('[RFB] 已发送明文认证数据，等待安全结果');
+      return;
+    }
+
+    this.readAuthResult('认证失败');
+  }
+
+  /**
+   * 读取 4 字节认证结果，成功则进入 ClientInit
+   */
+  private readAuthResult(failureMsg: string): void {
     const result = this.client.readBuffer(4);
     if (!result) return;
 
@@ -252,17 +326,19 @@ export class RfbHandshake {
       const reasonLenBuf = this.client.readBuffer(4);
       if (reasonLenBuf) {
         const len = reasonLenBuf.readUInt32BE(0);
-        const reason = this.client.readBuffer(len);
-        if (reason) {
-          this.client.emitError(`认证失败: ${reason.toString('utf8')}`);
-          return;
+        if (len > 0 && len < 4096) {
+          const reason = this.client.readBuffer(len);
+          if (reason) {
+            this.client.emitError(`${failureMsg}: ${reason.toString('utf8')}`);
+            return;
+          }
         }
       }
-      this.client.emitError('VNC 认证失败');
+      this.client.emitError(failureMsg);
       return;
     }
 
-    console.log('[RFB] VNC 认证成功');
+    console.log('[RFB] 认证成功');
     this.client.updateState(ConnectionState.ClientInit);
     this.sendClientInit();
   }

@@ -18,7 +18,8 @@ export declare enum SecurityType {
     GTK_VNC_SASL = 20,
     MD5 = 21,
     ColinDeanXVP = 22,
-    MSLogon = 129
+    MSLogon = 129,
+    Plain = 256
 }
 export declare enum EncodingType {
     Raw = 0,
@@ -32,7 +33,13 @@ export declare enum EncodingType {
     LastRect = 4294967072,// 伪编码: 最后一个矩形
     NewFBSize = 4294967073,// 伪编码: 新帧缓冲大小
     DesktopName = 4294967074,// 伪编码: 桌面名称
-    UltraVNC_Ext = 4294967288
+    UltraVNC_Ext = 4294967288,// UltraVNC 扩展
+    Tight = 7,
+    TightZstd = 17,// Tight + Zstd 压缩
+    ExtClipboard_Caps = 4294966976,
+    ExtClipboard_Request = 4294966977,
+    ExtClipboard_Peek = 4294966978,
+    ExtClipboard_Notify = 4294966979
 }
 export declare enum ClientMsgType {
     SetPixelFormat = 0,
@@ -50,7 +57,8 @@ export declare enum ServerMsgType {
     Bell = 2,
     ServerCutText = 3,
     FileTransfer = 7,// UltraVNC 扩展
-    DesktopSize = 251
+    DesktopSize = 251,// 扩展
+    ClientRedirect = 252
 }
 export interface PixelFormat {
     bitsPerPixel: number;
@@ -111,6 +119,8 @@ export declare const IPC_CHANNELS: {
     readonly SET_ENCODINGS: "rfb:set-encodings";
     readonly SET_PIXEL_FORMAT: "rfb:set-pixel-format";
     readonly SET_DESKTOP_SIZE: "rfb:request-desktop-size";
+    readonly BANDWIDTH: "rfb:bandwidth";
+    readonly REDIRECT: "rfb:redirect";
     readonly APP_LOG: "app:log";
     readonly LOG_GET: "app:log:get";
     readonly LOG_CLEAR: "app:log:clear";
