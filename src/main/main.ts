@@ -22,7 +22,14 @@ let lastUpdateRequestAt: number = 0;
 let pendingFrameRects: FramebufferRect[] = [];
 
 // ---- 配置管理 ----
-const CONFIG_PATH = path.join(app.getPath('userData'), 'config.json');
+// 注意：app.getPath 必须在 app.ready 之后调用，不能作为顶层 const 求值
+let _configPath: string | null = null;
+function getConfigPath(): string {
+  if (!_configPath) {
+    _configPath = path.join(app.getPath('userData'), 'config.json');
+  }
+  return _configPath;
+}
 
 interface AppConfig {
   mobilePort: number;
@@ -30,8 +37,9 @@ interface AppConfig {
 
 function loadConfig(): AppConfig {
   try {
-    if (fs.existsSync(CONFIG_PATH)) {
-      const data = fs.readFileSync(CONFIG_PATH, 'utf8');
+    const configPath = getConfigPath();
+    if (fs.existsSync(configPath)) {
+      const data = fs.readFileSync(configPath, 'utf8');
       return JSON.parse(data);
     }
   } catch (e) {
@@ -42,9 +50,10 @@ function loadConfig(): AppConfig {
 
 function saveConfig(config: AppConfig): void {
   try {
-    const dir = path.dirname(CONFIG_PATH);
+    const configPath = getConfigPath();
+    const dir = path.dirname(configPath);
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), 'utf8');
+    fs.writeFileSync(configPath, JSON.stringify(config, null, 2), 'utf8');
   } catch (e) {
     error(`保存配置文件失败: ${e}`);
   }

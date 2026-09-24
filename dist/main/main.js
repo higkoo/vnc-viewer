@@ -52,11 +52,19 @@ let lastUpdateRequestAt = 0;
 // 当前帧已解码但尚未发送到渲染进程的矩形（整帧收齐后批量发送，减少 IPC 次数）
 let pendingFrameRects = [];
 // ---- 配置管理 ----
-const CONFIG_PATH = path.join(electron_1.app.getPath('userData'), 'config.json');
+// 注意：app.getPath 必须在 app.ready 之后调用，不能作为顶层 const 求值
+let _configPath = null;
+function getConfigPath() {
+    if (!_configPath) {
+        _configPath = path.join(electron_1.app.getPath('userData'), 'config.json');
+    }
+    return _configPath;
+}
 function loadConfig() {
     try {
-        if (fs.existsSync(CONFIG_PATH)) {
-            const data = fs.readFileSync(CONFIG_PATH, 'utf8');
+        const configPath = getConfigPath();
+        if (fs.existsSync(configPath)) {
+            const data = fs.readFileSync(configPath, 'utf8');
             return JSON.parse(data);
         }
     }
@@ -67,10 +75,11 @@ function loadConfig() {
 }
 function saveConfig(config) {
     try {
-        const dir = path.dirname(CONFIG_PATH);
+        const configPath = getConfigPath();
+        const dir = path.dirname(configPath);
         if (!fs.existsSync(dir))
             fs.mkdirSync(dir, { recursive: true });
-        fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), 'utf8');
+        fs.writeFileSync(configPath, JSON.stringify(config, null, 2), 'utf8');
     }
     catch (e) {
         (0, logger_1.error)(`保存配置文件失败: ${e}`);
