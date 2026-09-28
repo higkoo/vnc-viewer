@@ -103,8 +103,7 @@ let fbWidth = 0;
 let fbHeight = 0;
 let fbCanvas: ImageData | null = null;
 
-// 背景填充计时器（x11vnc 等服务器不发送静态背景时，用邻近像素填充黑色区域）
-let bgFillTimer: ReturnType<typeof setTimeout> | null = null;
+// 背景填充：已禁用以保留真实黑色像素（VNC 服务器应在首帧发送完整画面）
 let lastFrameTime = 0;
 
 // 鼠标状态
@@ -213,18 +212,26 @@ function setupIPCListeners(): void {
       renderRect(rect);
     }
     lastFrameTime = Date.now();
-    // 重置背景填充计时器：如果 800ms 无新帧，触发背景填充
-    if (bgFillTimer) clearTimeout(bgFillTimer);
-    if (isConnected && fbCanvas) {
-      bgFillTimer = setTimeout(() => {
-        fillBackground();
-      }, 800);
-    }
+    // 背景填充已禁用：x11vnc 等服务器首帧即发完整画面，bf 时机不对会覆盖真实黑色像素
   });
 
   vncApi.onConnectionState((state: number) => {
     currentState = state;
     updateStatusBar(state);
+    // 连接意外断开时自动重置 UI 状态
+    if (state === ConnectionState.Disconnected && isConnected) {
+      console.log('[INPUT-DIAG] 连接已断开，重置 UI 状态，停止发送输入事件');
+      isConnected = false;
+      fbCanvas = null;
+      toolbarEl.classList.add('hidden');
+      statusBar.classList.add('hidden');
+      emptyState.classList.remove('hidden');
+      if (!isFullscreen) {
+        dialog.classList.remove('hidden');
+      }
+      connectBtn.disabled = false;
+      connectBtn.textContent = '连接';
+    }
   });
 
   vncApi.onServerInfo((info) => {
@@ -474,8 +481,16 @@ function setupCanvasResize(): void {
 }
 
 // ---- 渲染 ----
+let totalRectsRendered = 0;
 function renderRect(rect: { x: number; y: number; width: number; height: number; data: number[] | Buffer; encoding: number }): void {
-  if (!fbCanvas) return;
+  if (!fbCanvas) {
+    console.error('[RENDER] fbCanvas 为 null，跳过渲染');
+    return;
+  }
+  totalRectsRendered++;
+  if (totalRectsRendered <= 5 || totalRectsRendered % 50 === 0) {
+    console.log(`[RENDER] rect #${totalRectsRendered}: (${rect.x},${rect.y},${rect.width}x${rect.height}) enc=${rect.encoding} dataType=${rect.data?.constructor?.name} dataLen=${rect.data?.length}`);
+  }
 
   const ctx = canvas.getContext('2d')!;
 
@@ -500,9 +515,17 @@ function renderRect(rect: { x: number; y: number; width: number; height: number;
     return;
   }
 
-  const data = Array.isArray(rect.data)
-    ? new Uint8ClampedArray(rect.data)
-    : new Uint8ClampedArray(rect.data.buffer, rect.data.byteOffset, rect.data.byteLength);
+  // 统一转为 Uint8Array（兼容 Buffer、Uint8Array、number[] 等 IPC 传输后的格式）
+  let data: Uint8Array;
+  if (Array.isArray(rect.data)) {
+    data = new Uint8Array(rect.data as number[]);
+  } else if (rect.data instanceof Uint8Array) {
+    data = rect.data;
+  } else {
+    // Buffer 或其他 ArrayBufferView
+    const d = rect.data as any;
+    data = new Uint8Array(d.buffer, d.byteOffset || 0, d.byteLength);
+  }
 
   // 裁剪到帧缓冲范围，防止越界
   const x = Math.max(0, rect.x);
@@ -513,13 +536,12 @@ function renderRect(rect: { x: number; y: number; width: number; height: number;
   const skipX = x - rect.x;
   const skipY = y - rect.y;
 
-  // 用 32 位视图按行整块拷贝（解码器已保证 alpha=255），比逐像素循环快一个数量级
-  const src32 = new Uint32Array(data.buffer, data.byteOffset, data.byteLength >> 2);
-  const dst32 = new Uint32Array(fbCanvas.data.buffer);
+  // 按行逐字节拷贝（避免 Uint32Array 视图在跨平台时的字节序隐患）
+  const dst = fbCanvas.data;
   for (let row = 0; row < h; row++) {
-    const srcStart = (skipY + row) * rect.width + skipX;
-    const dstStart = (y + row) * fbWidth + x;
-    dst32.set(src32.subarray(srcStart, srcStart + w), dstStart);
+    const srcStart = ((skipY + row) * rect.width + skipX) * 4;
+    const dstStart = ((y + row) * fbWidth + x) * 4;
+    dst.set(data.subarray(srcStart, srcStart + w * 4), dstStart);
   }
 
   // 只渲染更新区域
@@ -527,14 +549,17 @@ function renderRect(rect: { x: number; y: number; width: number; height: number;
 }
 
 /**
- * 背景填充：x11vnc 等服务器不发送静态背景区域，导致帧缓冲中保留黑色(0,0,0)。
+ * 【已禁用】背景填充：会覆盖画面中合法的黑色像素导致黑屏。
  *
- * 三段式策略：
+ * 背景填充逻辑的三段式策略：
  * 1. 纯色推断：从边缘采样推断背景主色调，直接填充所有黑块（适合纯色桌面）
  * 2. 扫描线扩散：32 轮四方向扫描，用最近非黑像素填充（适合渐变/纹理背景）
  * 3. 孤立点修复：对仍未修复的黑点做螺旋采样，取 4-16px 范围内最近非黑像素
+ *
+ * 禁用原因：VNC 服务器应在首帧发送完整画面，bf 时机不对会覆盖真实黑色像素。
+ * 若确有服务器不发背景的问题，应在协议层通过 coverage 追踪补发请求处理。
  */
-function fillBackground(): void {
+function _fillBackgroundDisabled(): void {
   if (!fbCanvas) return;
 
   const data = fbCanvas.data;
@@ -702,6 +727,7 @@ function fillBackground(): void {
 }
 
 // ---- 鼠标事件 ----
+let inputEventCount = 0;
 function handleMouseDown(e: MouseEvent): void {
   if (!isConnected) return;
   canvas.focus();
@@ -714,6 +740,10 @@ function handleMouseDown(e: MouseEvent): void {
 
   mouseButtonMask |= mask;
   const pos = getCanvasPosition(e);
+  inputEventCount++;
+  if (inputEventCount <= 10 || inputEventCount % 20 === 0) {
+    console.log(`[INPUT-DIAG] mousedown btn=${btn} mask=${mouseButtonMask} pos=(${pos.x},${pos.y})`);
+  }
   vncApi.pointerEvent(mouseButtonMask, pos.x, pos.y);
 }
 
@@ -804,14 +834,33 @@ function handleMouseWheel(e: WheelEvent): void {
   }
 }
 
+let coordDiagCounter = 0;
 function getCanvasPosition(e: MouseEvent): { x: number; y: number } {
   const rect = canvas.getBoundingClientRect();
+  
+  // 安全检查：如果 canvas 还没正确渲染（rect 为 0）或 fbWidth 未初始化，
+  // 则返回 (0, 0) 避免发送无效坐标给 VNC 服务器
+  if (!rect.width || !rect.height || !canvas.width || !canvas.height) {
+    console.warn(`[COORD-DIAG] 无法计算坐标: rect=(${rect.left},${rect.top},${rect.width}x${rect.height}) canvas=${canvas.width}x${canvas.height}`);
+    return { x: 0, y: 0 };
+  }
+  
   const scaleX = canvas.width / rect.width;
   const scaleY = canvas.height / rect.height;
-  return {
-    x: Math.round((e.clientX - rect.left) * scaleX),
-    y: Math.round((e.clientY - rect.top) * scaleY),
+  const rawX = (e.clientX - rect.left) * scaleX;
+  const rawY = (e.clientY - rect.top) * scaleY;
+  
+  // 坐标钳制到 VNC 桌面范围内，防止越界
+  const result = {
+    x: Math.max(0, Math.min(fbWidth - 1, Math.round(rawX))),
+    y: Math.max(0, Math.min(fbHeight - 1, Math.round(rawY))),
   };
+  
+  coordDiagCounter++;
+  if (coordDiagCounter <= 5 || coordDiagCounter % 50 === 0) {
+    console.log(`[COORD-DIAG] client=(${e.clientX},${e.clientY}) rect=(${rect.left.toFixed(1)},${rect.top.toFixed(1)},${rect.width.toFixed(1)}x${rect.height.toFixed(1)}) scale=(${scaleX.toFixed(4)},${scaleY.toFixed(4)}) fb=${fbWidth}x${fbHeight} => pos=(${result.x},${result.y}) raw=(${rawX.toFixed(1)},${rawY.toFixed(1)})`);
+  }
+  return result;
 }
 
 // ---- 键盘事件 ----
@@ -825,15 +874,27 @@ function isTypingTarget(target: EventTarget | null): boolean {
 }
 
 function handleKeyDown(e: KeyboardEvent): void {
-  if (!isConnected || isTypingTarget(e.target)) return;
+  if (!isConnected) return;
+  // 焦点在输入控件/按钮上时按键归控件所有，不应转发给远程
+  if (isTypingTarget(e.target)) return;
+
+  // 快捷键：Cmd(Mac) 或 Ctrl(其他) 组合键触发本地操作
+  const mod = e.metaKey || e.ctrlKey;
+  if (mod) {
+    if (e.key === 'n' || e.key === 'N') { showConnectionDialog(); e.preventDefault(); return; }
+    if (e.key === 'd' || e.key === 'D') { handleDisconnect(); e.preventDefault(); return; }
+    if (e.key === '0') { setZoomMode('fit'); e.preventDefault(); return; }
+    if (e.key === '1') { setZoomMode('100'); e.preventDefault(); return; }
+    // Ctrl+L 日志面板由 Electron 菜单处理，不拦截
+  }
+
+  // 已连接且焦点不在输入框时，确保 canvas 有焦点以便接收后续事件
+  canvas.focus();
   e.preventDefault();
-
-  // 特殊键组合
-  if (e.ctrlKey && e.key === 'n') { showConnectionDialog(); return; }
-  if (e.ctrlKey && e.key === 'd') { handleDisconnect(); return; }
-  if (e.ctrlKey && e.key === '0') { setZoomMode('fit'); return; }
-  if (e.ctrlKey && e.key === '1') { setZoomMode('100'); return; }
-
+  inputEventCount++;
+  if (inputEventCount <= 10 || inputEventCount % 20 === 0) {
+    console.log(`[INPUT-DIAG] keydown keyCode=${e.keyCode} key=${e.key}`);
+  }
   vncApi.keyEvent(e.keyCode, true);
 }
 
@@ -841,6 +902,13 @@ function handleKeyUp(e: KeyboardEvent): void {
   if (!isConnected || isTypingTarget(e.target)) return;
   e.preventDefault();
   vncApi.keyEvent(e.keyCode, false);
+}
+
+// 点击工具栏按钮后自动把焦点还给 canvas，避免按键"丢失"
+function ensureCanvasFocus(): void {
+  if (isConnected && document.activeElement !== canvas) {
+    canvas.focus();
+  }
 }
 
 function sendCtrlAltDel(): void {

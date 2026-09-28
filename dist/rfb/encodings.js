@@ -49,6 +49,7 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.EncodingDecoders = void 0;
 const zlib = __importStar(require("zlib"));
+const jpeg = __importStar(require("jpeg-js"));
 const types_1 = require("./types");
 class EncodingDecoders {
     constructor() {
@@ -663,9 +664,52 @@ class EncodingDecoders {
         const compType = (compControl >> 4) & 0x0F;
         const filterId = compControl & 0x0F;
         if (compType === 0x08) {
-            // JPEG 压缩 — 需要 JPEG 解码器，标记为不支持
-            console.warn('[RFB] Tight JPEG 编码尚未实现，跳过');
-            return null;
+            // JPEG 压缩 — 使用 jpeg-js 解码
+            // 读取 JPEG 数据长度 (1-3 字节变长编码)
+            let jpegLen = 0;
+            let lenBytes = 0;
+            if (buffer.length < offset + 1)
+                return null;
+            jpegLen = buffer[offset] & 0x7F;
+            lenBytes = 1;
+            if (buffer[offset] & 0x80) {
+                if (buffer.length < offset + 2)
+                    return null;
+                jpegLen |= (buffer[offset + 1] & 0x7F) << 7;
+                lenBytes = 2;
+                if (buffer[offset + 1] & 0x80) {
+                    if (buffer.length < offset + 3)
+                        return null;
+                    jpegLen |= (buffer[offset + 2]) << 14;
+                    lenBytes = 3;
+                }
+            }
+            offset += lenBytes;
+            if (buffer.length < offset + jpegLen)
+                return null;
+            const jpegData = buffer.subarray(offset, offset + jpegLen);
+            try {
+                // jpeg-js 解码返回 RGBA 格式 (BGRA 强制选项)
+                const decoded = jpeg.decode(jpegData, {
+                    useTArray: true,
+                    formatAsRGBA: true,
+                });
+                const fb = Buffer.alloc(width * height * 4);
+                // jpeg-js 输出为 RGBA，VNC 使用 BGRA — 需要交换 R/B
+                for (let i = 0; i < width * height; i++) {
+                    const src = i * 4;
+                    const dst = i * 4;
+                    fb[dst] = decoded.data[src + 2]; // B (from R)
+                    fb[dst + 1] = decoded.data[src + 1]; // G
+                    fb[dst + 2] = decoded.data[src]; // R (from B)
+                    fb[dst + 3] = 255; // A
+                }
+                return { pixels: fb, consumed: 1 + lenBytes + jpegLen };
+            }
+            catch (err) {
+                console.error('[RFB] Tight JPEG 解码失败:', err);
+                return null;
+            }
         }
         // 读取压缩数据长度 (1-3 字节变长编码)
         let compressedLen = 0;

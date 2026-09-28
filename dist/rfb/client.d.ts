@@ -23,6 +23,8 @@ export declare class RfbClient extends EventEmitter {
     private connectTimer;
     private handshakeTimer;
     private idleTimer;
+    private pollTimer;
+    private static readonly POLL_INTERVAL_MS;
     private serverVersion;
     private fbWidth;
     private fbHeight;
@@ -40,6 +42,7 @@ export declare class RfbClient extends EventEmitter {
     private static readonly COVERAGE_MAX_RETRIES;
     private bytesReceived;
     private bytesReceivedWindow;
+    private lastDataAt;
     private bandwidthTimer;
     private lastBandwidth;
     /** Extended Clipboard 能力标志（从服务器 SetCutText 消息中解析） */
@@ -105,6 +108,8 @@ export declare class RfbClient extends EventEmitter {
     private cancelIdleTimer;
     private startBandwidthMonitor;
     private stopBandwidthMonitor;
+    private startPollTimer;
+    private stopPollTimer;
     private resetState;
     private setState;
     getSocket(): net.Socket | null;
@@ -175,7 +180,7 @@ export declare class RfbClient extends EventEmitter {
      */
     private processClientRedirect;
     /**
-     * 启动空闲超时检测
+     * 启动空闲超时检测（复用 resetIdleTimer 的预警机制）
      */
     private startIdleTimer;
 }

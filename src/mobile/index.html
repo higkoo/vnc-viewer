@@ -167,6 +167,15 @@ body {
   image-rendering: pixelated;
   -ms-interpolation-mode: nearest-neighbor;
 }
+.cursor-layer {
+  position: absolute;
+  pointer-events: none;
+  z-index: 50;
+  image-rendering: pixelated;
+  -ms-interpolation-mode: nearest-neighbor;
+  transform-origin: top left;
+}
+.cursor-layer.hidden { display: none; }
 
 /* 缩放指示器 */
 #zoom-indicator {
@@ -337,6 +346,7 @@ body {
 <!-- 画布 -->
 <div id="canvas-wrapper">
   <canvas id="vnc-canvas"></canvas>
+  <canvas id="cursor-canvas" class="cursor-layer hidden"></canvas>
 </div>
 
 <!-- 缩放指示 -->
@@ -840,6 +850,212 @@ class Encodings {
       console.error('ZRLE decode error:', e);
     }
   }
+
+  // ---- Tight 编码解码 (TightVNC 协议) ----
+  // 返回 { consumed: number, async: Promise|null }
+  // JPEG 压缩需要异步解码（浏览器 Image 对象），非 JPEG 同步完成
+  static decodeTight(data, x, y, w, h, fb, fbWidth) {
+    let pos = 0;
+    if (data.length < 1) return null;
+
+    // 压缩控制字节: 高4位=压缩类型, 低4位=滤波器ID
+    const compControl = data[pos++];
+    const compType = (compControl >> 4) & 0x0F;
+    const filterId = compControl & 0x0F;
+
+    // 压缩类型 0x08 = JPEG
+    if (compType === 0x08) {
+      const readResult = TightReadVarLen(data, pos);
+      if (!readResult) return null;
+      pos = readResult.newPos;
+      const jpegLen = readResult.value;
+      if (data.length < pos + jpegLen) return null;
+      const jpegData = data.subarray(pos, pos + jpegLen);
+      const consumed = pos + jpegLen;
+      // 返回异步 Promise - 浏览器原生 JPEG 解码
+      const asyncPromise = TightDecodeJPEG(jpegData, x, y, w, h, fb, fbWidth);
+      return { consumed, async: asyncPromise };
+    }
+
+    // 压缩类型 0x00 = Fill (单个 CPIXEL)
+    if (compType === 0x00) {
+      if (data.length < pos + 3) return null;
+      const b = data[pos++];
+      const g = data[pos++];
+      const r = data[pos++];
+      for (let row = 0; row < h; row++) {
+        const dst = ((y + row) * fbWidth + x) * 4;
+        for (let col = 0; col < w; col++) {
+          const off = dst + col * 4;
+          fb[off] = b;
+          fb[off + 1] = g;
+          fb[off + 2] = r;
+          fb[off + 3] = 255;
+        }
+      }
+      return { consumed: pos, async: null };
+    }
+
+    // 压缩类型 0x01 = Basic (zlib + 可选滤波器)
+    const readResult = TightReadVarLen(data, pos);
+    if (!readResult) return null;
+    pos = readResult.newPos;
+    const compressedLen = readResult.value;
+    if (data.length < pos + compressedLen) return null;
+
+    let rawData;
+    try {
+      rawData = pako.inflate(data.subarray(pos, pos + compressedLen));
+    } catch (e) {
+      console.error('Tight zlib inflate error:', e);
+      return null;
+    }
+
+    const totalPixels = w * h;
+    if (filterId === 0x00) {
+      // Copy / 无滤波器 - 直接 RGB 像素
+      let srcPos = 0;
+      for (let i = 0; i < totalPixels; i++) {
+        const dst = ((y + Math.floor(i / w)) * fbWidth + (x + (i % w))) * 4;
+        fb[dst] = rawData[srcPos++];
+        fb[dst + 1] = rawData[srcPos++];
+        fb[dst + 2] = rawData[srcPos++];
+        fb[dst + 3] = 255;
+      }
+    } else if (filterId === 0x01) {
+      // Palette 滤波器
+      const paletteSize = rawData[0] + 1;
+      const palette = [];
+      let srcPos = 1;
+      for (let i = 0; i < paletteSize; i++) {
+        palette.push({ b: rawData[srcPos++], g: rawData[srcPos++], r: rawData[srcPos++] });
+      }
+      if (paletteSize === 2) {
+        // 每像素 1 bit
+        for (let row = 0; row < h; row++) {
+          for (let col = 0; col < w; col++) {
+            const bitIdx = col;
+            const byte = rawData[srcPos + Math.floor(row * Math.ceil(w / 8) + (bitIdx >> 3))];
+            const shift = 7 - (bitIdx & 7);
+            const idx = (byte >> shift) & 1;
+            const c = palette[idx];
+            const dst = ((y + row) * fbWidth + (x + col)) * 4;
+            fb[dst] = c.b;
+            fb[dst + 1] = c.g;
+            fb[dst + 2] = c.r;
+            fb[dst + 3] = 255;
+          }
+        }
+      } else {
+        // 3-256 色调色板: 每像素 1 byte
+        for (let row = 0; row < h; row++) {
+          for (let col = 0; col < w; col++) {
+            const idx = rawData[srcPos + row * w + col];
+            const c = palette[idx] || { b: 0, g: 0, r: 0 };
+            const dst = ((y + row) * fbWidth + (x + col)) * 4;
+            fb[dst] = c.b;
+            fb[dst + 1] = c.g;
+            fb[dst + 2] = c.r;
+            fb[dst + 3] = 255;
+          }
+        }
+      }
+    } else if (filterId === 0x02) {
+      // Gradient 滤波器 (JPEG-LS 风格)
+      for (let row = 0; row < h; row++) {
+        for (let col = 0; col < w; col++) {
+          const rawOff = (row * w + col) * 3;
+          const r = rawData[rawOff];
+          const g = rawData[rawOff + 1];
+          const b = rawData[rawOff + 2];
+
+          let pr = 0, pg = 0, pb = 0;
+          if (col > 0) {
+            const off = ((y + row) * fbWidth + (x + col - 1)) * 4;
+            pr = fb[off]; pg = fb[off + 1]; pb = fb[off + 2];
+          }
+          let ar = 0, ag = 0, ab = 0;
+          if (row > 0) {
+            const off = ((y + row - 1) * fbWidth + (x + col)) * 4;
+            ar = fb[off]; ag = fb[off + 1]; ab = fb[off + 2];
+          }
+
+          const dr = (r + ((pr + ar) >> 1)) & 0xFF;
+          const dg = (g + ((pg + ag) >> 1)) & 0xFF;
+          const db = (b + ((pb + ab) >> 1)) & 0xFF;
+
+          const dst = ((y + row) * fbWidth + (x + col)) * 4;
+          fb[dst] = db;
+          fb[dst + 1] = dg;
+          fb[dst + 2] = dr;
+          fb[dst + 3] = 255;
+        }
+      }
+    } else {
+      console.warn('Tight: 未知滤波器', filterId);
+      return null;
+    }
+
+    return { consumed: pos + compressedLen, async: null };
+  }
+}
+
+// Tight 变长整数读取 (1-3 字节)
+function TightReadVarLen(data, startPos) {
+  let pos = startPos;
+  if (data.length < pos + 1) return null;
+  let value = data[pos] & 0x7F;
+  let bytesRead = 1;
+  if (data[pos] & 0x80) {
+    if (data.length < pos + 2) return null;
+    value |= (data[pos + 1] & 0x7F) << 7;
+    bytesRead = 2;
+    if (data[pos + 1] & 0x80) {
+      if (data.length < pos + 3) return null;
+      value |= data[pos + 2] << 14;
+      bytesRead = 3;
+    }
+  }
+  return { value, newPos: pos + bytesRead };
+}
+
+// 浏览器原生 JPEG 解码（通过 Image + OffscreenCanvas）
+// 返回 Promise，解码完成后将像素写入帧缓冲
+function TightDecodeJPEG(jpegData, x, y, w, h, fb, fbWidth) {
+  return new Promise((resolve) => {
+    const blob = new Blob([jpegData], { type: 'image/jpeg' });
+    const url = URL.createObjectURL(blob);
+    const img = new Image();
+    img.onload = () => {
+      // 使用离屏 canvas 解码 JPEG 像素
+      const canvas = document.createElement('canvas');
+      canvas.width = w;
+      canvas.height = h;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(img, 0, 0, w, h);
+      const imageData = ctx.getImageData(0, 0, w, h);
+      const pixels = imageData.data;
+      // 写入帧缓冲（RGBA -> BGRA 本地布局）
+      for (let row = 0; row < h; row++) {
+        for (let col = 0; col < w; col++) {
+          const srcOff = (row * w + col) * 4;
+          const dstOff = ((y + row) * fbWidth + (x + col)) * 4;
+          fb[dstOff] = pixels[srcOff + 2];     // B
+          fb[dstOff + 1] = pixels[srcOff + 1]; // G
+          fb[dstOff + 2] = pixels[srcOff];     // R
+          fb[dstOff + 3] = 255;
+        }
+      }
+      URL.revokeObjectURL(url);
+      resolve();
+    };
+    img.onerror = () => {
+      console.warn('Tight JPEG 解码失败');
+      URL.revokeObjectURL(url);
+      resolve();
+    };
+    img.src = url;
+  });
 }
 
 // ====== 移动端 RFB 客户端 ======
@@ -1094,6 +1310,7 @@ class MobileRfbClient {
   _setEncodings() {
     const encodings = [
       -16,  // ZRLE
+      7,    // Tight (含 JPEG - 高压缩比优先)
       -255, // DesktopSize
       -223, // DesktopName
       -24,  // LastRect
@@ -1142,7 +1359,7 @@ class MobileRfbClient {
     return false;
   }
 
-  _processData() {
+  async _processData() {
     while (this.buffer.length > 0) {
       // 先处理挂起的握手/数据读取，握手完成前也能消费数据
       if (this._pendingExpect) {
@@ -1164,8 +1381,10 @@ class MobileRfbClient {
       if (this.buffer.length < 4) break;
       const msgType = this.buffer[0];
       if (msgType === 0) {
-        // FramebufferUpdate
-        this._processFramebufferUpdate();
+        // FramebufferUpdate (async)
+        await this._processFramebufferUpdate();
+        // _processFramebufferUpdate 已经通过 setTimeout 调度后续处理
+        return;
       } else {
         // 未知消息类型，忽略
         this._consume(1);
@@ -1173,12 +1392,14 @@ class MobileRfbClient {
     }
   }
 
-  _processFramebufferUpdate() {
+  // async-aware 帧处理：收集所有矩形，等待异步的 Tight JPEG 完成，再统一发出 frame update
+  async _processFramebufferUpdate() {
     if (this.buffer.length < 4) return;
     const padding = this.buffer[1];
     const numRects = (this.buffer[2] << 8) | this.buffer[3];
     let pos = 4;
     let rectsProcessed = 0;
+    const asyncOps = [];
 
     const tryProcess = () => {
       while (rectsProcessed < numRects) {
@@ -1192,14 +1413,14 @@ class MobileRfbClient {
 
         pos += 12;
 
-        if (enc === -24) {
+        if (enc === 0xFFFFFF20) {
           // LastRect
           rectsProcessed++;
           continue;
         }
 
-        if (enc === -255) {
-          // DesktopSize
+        if (enc === 0xFFFFFF21) {
+          // DesktopSize (NewFBSize)
           this.fbWidth = rw;
           this.fbHeight = rh;
           this.framebuffer = new Uint8Array(this.fbWidth * this.fbHeight * 4);
@@ -1208,7 +1429,7 @@ class MobileRfbClient {
           continue;
         }
 
-        if (enc === -223) {
+        if (enc === 0xFFFFFF22) {
           // DesktopName
           if (this.buffer.length < pos + 4) return false;
           const nameLen = (this.buffer[pos] << 24) | (this.buffer[pos + 1] << 16) | (this.buffer[pos + 2] << 8) | this.buffer[pos + 3];
@@ -1221,33 +1442,61 @@ class MobileRfbClient {
           continue;
         }
 
+        if (enc === 0xFFFFFF10) {
+          // Cursor (含 AND/XOR mask)
+          const pixelsLen = rw * rh * 4;
+          const maskLen = Math.ceil(rw / 8) * rh;
+          const cursorLen = pixelsLen + maskLen;
+          if (this.buffer.length < pos + cursorLen) return false;
+          // x, y 是热点位置 (hotspot)
+          const pixelData = this.buffer.slice(pos, pos + pixelsLen);
+          const maskData = this.buffer.slice(pos + pixelsLen, pos + pixelsLen + maskLen);
+          if (typeof decodeRemoteCursor === 'function') {
+            decodeRemoteCursor(rx, ry, rw, rh, pixelData, maskData);
+          }
+          pos += cursorLen;
+          rectsProcessed++;
+          continue;
+        }
+
+        if (enc === 0xFFFFFF11) {
+          // RichCursor (含 alpha 通道)
+          const pixelsLen = rw * rh * 4;
+          const maskLen = Math.ceil(rw / 8) * rh;
+          const cursorLen = pixelsLen + maskLen;
+          if (this.buffer.length < pos + cursorLen) return false;
+          const pixelData = this.buffer.slice(pos, pos + pixelsLen);
+          const maskData = null; // RichCursor 自带 alpha，不需要额外 mask
+          if (typeof decodeRemoteCursor === 'function') {
+            decodeRemoteCursor(rx, ry, rw, rh, pixelData, maskData);
+          }
+          pos += cursorLen;
+          rectsProcessed++;
+          continue;
+        }
+
         if (enc === 0) {
           // Raw
           const bytesNeeded = rw * rh * 4;
           if (this.buffer.length < pos + bytesNeeded) return false;
           Encodings.decodeRaw(this.buffer.slice(pos, pos + bytesNeeded), rx, ry, rw, rh, this.framebuffer, this.fbWidth);
           pos += bytesNeeded;
-        } else if (enc === -1) {
+        } else if (enc === -1 || enc === 0xFFFFFFFF) {
           // CopyRect
           if (this.buffer.length < pos + 4) return false;
-          Encodings.decodeCopyRect(this.buffer.slice(pos, pos + 4), rx, ry, this.framebuffer, this.fbWidth, this.fbHeight);
+          // 使用正确的参数: rect 的宽高 rw, rh 而不是坐标差
+          Encodings.decodeCopyRect(this.buffer.slice(pos, pos + 4), rx, ry, rw, rh, this.framebuffer, this.fbWidth);
           pos += 4;
-        } else if (enc === -2) {
+        } else if (enc === -2 || enc === 0xFFFFFFFE) {
           // RRE
           if (this.buffer.length < pos + 4) return false;
           const numSub = (this.buffer[pos] << 24) | (this.buffer[pos + 1] << 16) | (this.buffer[pos + 2] << 8) | this.buffer[pos + 3];
-          const rreBytes = 4 + 4 + numSub * (4 + 4);
+          const rreBytes = 4 + 3 + numSub * (3 + 4);
           if (this.buffer.length < pos + rreBytes) return false;
           Encodings.decodeRRE(this.buffer.slice(pos, pos + rreBytes), rx, ry, rw, rh, this.framebuffer, this.fbWidth);
           pos += rreBytes;
-        } else if (enc === -5) {
+        } else if (enc === -5 || enc === 0xFFFFFFFB) {
           // Hextile
-          // 最大需要 16*16*4 + header 每块
-          const maxTiles = Math.ceil(rw / 16) * Math.ceil(rh / 16);
-          const maxHextile = maxTiles * (16 * 16 * 4 + 1);
-          if (this.buffer.length < pos + 1) return false;
-          // 尝试解码，如果不够则返回
-          const savedPos = pos;
           try {
             const decoded = this._decodeHextilePartial(this.buffer, pos, rx, ry, rw, rh);
             if (decoded === null) return false;
@@ -1255,7 +1504,7 @@ class MobileRfbClient {
           } catch (e) {
             return false;
           }
-        } else if (enc === -16) {
+        } else if (enc === -16 || enc === 0xFFFFFFEF) {
           // ZRLE
           if (this.buffer.length < pos + 4) return false;
           const zrleLen = (this.buffer[pos] << 24) | (this.buffer[pos + 1] << 16) | (this.buffer[pos + 2] << 8) | this.buffer[pos + 3];
@@ -1263,16 +1512,19 @@ class MobileRfbClient {
           if (this.buffer.length < pos + zrleLen) return false;
           Encodings.decodeZRLE(this.buffer.slice(pos, pos + zrleLen), rx, ry, rw, rh, this.framebuffer, this.fbWidth);
           pos += zrleLen;
-        } else if (enc === -239) {
-          // Cursor - skip
-          if (this.buffer.length < pos + 4) return false;
-          const cursorLen = rw * rh * 4 + Math.ceil(rw / 8) * rh;
-          if (this.buffer.length < pos + cursorLen) return false;
-          pos += cursorLen;
+        } else if (enc === 7) {
+          // Tight (含 JPEG / zlib / fill)
+          const dataSlice = this.buffer.slice(pos);
+          const result = Encodings.decodeTight(dataSlice, rx, ry, rw, rh, this.framebuffer, this.fbWidth);
+          if (result === null) return false;
+          pos += result.consumed;
+          if (result.async) {
+            asyncOps.push(result.async);
+          }
         } else {
-          // Unknown encoding - skip
-          rectsProcessed++;
-          continue;
+          // Unknown encoding - cannot safely skip (unknown size)
+          console.warn('未知编码:', enc, '(0x' + (enc >>> 0).toString(16) + ')');
+          return false;
         }
 
         rectsProcessed++;
@@ -1281,12 +1533,17 @@ class MobileRfbClient {
     };
 
     if (tryProcess()) {
+      // 等待所有异步操作（Tight JPEG 解码）完成
+      if (asyncOps.length > 0) {
+        await Promise.all(asyncOps);
+      }
       this._consume(pos);
       if (this.onUpdate) this.onUpdate(this.framebuffer, this.fbWidth, this.fbHeight);
       this._pendingExpect = null;
       // 请求增量更新
       this._requestUpdate(true);
-      this._processData();
+      // 使用 setTimeout 让出事件循环，避免堆栈过深
+      setTimeout(() => this._processData(), 0);
     }
   }
 
@@ -1415,6 +1672,8 @@ class MobileRfbClient {
 // ====== UI 控制器 ======
 const canvas = document.getElementById('vnc-canvas');
 const ctx = canvas.getContext('2d');
+cursorCanvas = document.getElementById('cursor-canvas');
+cursorCtx = cursorCanvas ? cursorCanvas.getContext('2d') : null;
 const connectPanel = document.getElementById('connect-panel');
 const toolbar = document.getElementById('toolbar');
 const keyboardPanel = document.getElementById('keyboard-panel');
@@ -1432,6 +1691,12 @@ let lastTouchX = 0, lastTouchY = 0;
 let activeModifiers = {};
 let keyboardVisible = false;
 let zoomMode = 'fit'; // 'fit' or 'actual'
+
+// 远程光标状态
+let cursorCanvas, cursorCtx;
+let remoteCursor = null; // { x, y, hotX, hotY, w, h, pixels, visible }
+let lastCursorX = 0, lastCursorY = 0;
+let cursorVisible = false;
 
 // 获取连接参数
 function getConnectionParams() {
@@ -1656,12 +1921,80 @@ function toggleZoom() {
 
 // 更新缩放指示器
 function updateZoomIndicator() {
-  zoomIndicator.textContent = zoomMode === 'fit' ? '缩放适应' : '100%';
+  zoomIndicator.textContent = zoomMode === 'fit' ? '缩放适应' : Math.round(scale * 100) + '%';
   zoomIndicator.classList.add('show');
   clearTimeout(zoomIndicator._hideTimer);
   zoomIndicator._hideTimer = setTimeout(() => {
     zoomIndicator.classList.remove('show');
   }, 1500);
+}
+
+// ===== 远程光标支持 =====
+// 解码 / 更新远程光标（Cursor 或 RichCursor 伪编码）
+// rx, ry 是热点位置（hotspot）
+function decodeRemoteCursor(rx, ry, rw, rh, pixelData, maskData) {
+  if (!cursorCtx || rw <= 0 || rh <= 0 || rw > 128 || rh > 128) return;
+  const totalPx = rw * rh;
+  const pixels = new Uint8ClampedArray(totalPx * 4);
+  for (let i = 0; i < totalPx; i++) {
+    // pixelData 格式: BGRA (与 VNC 像素格式匹配)
+    const src = i * 4;
+    pixels[i * 4] = pixelData[src + 2];     // R
+    pixels[i * 4 + 1] = pixelData[src + 1]; // G
+    pixels[i * 4 + 2] = pixelData[src];     // B
+    pixels[i * 4 + 3] = 255;               // A
+  }
+  remoteCursor = {
+    x: rx, y: ry, hotX: rx, hotY: ry,
+    w: rw, h: rh, pixels, mask: maskData, visible: true
+  };
+  drawRemoteCursor();
+}
+
+// 绘制远程光标到独立 canvas
+function drawRemoteCursor() {
+  if (!remoteCursor || !remoteCursor.visible || !cursorCtx) return;
+  const cw = remoteCursor.w, ch = remoteCursor.h;
+  cursorCanvas.width = cw;
+  cursorCanvas.height = ch;
+  const imgData = cursorCtx.createImageData(cw, ch);
+  const pixels = remoteCursor.pixels;
+  const mask = remoteCursor.mask;
+  for (let i = 0; i < cw * ch; i++) {
+    // mask: 1=可见, 0=透明 (Cursor 使用 AND mask; RichCursor 自带 alpha)
+    let alpha = 255;
+    if (mask && mask.length > 0) {
+      const byteIdx = Math.floor(i / 8);
+      const bitIdx = 7 - (i % 8);
+      if (byteIdx < mask.length) {
+        alpha = (mask[byteIdx] >> bitIdx) & 1 ? 255 : 0;
+      }
+    }
+    imgData.data[i * 4] = pixels[i * 4];
+    imgData.data[i * 4 + 1] = pixels[i * 4 + 1];
+    imgData.data[i * 4 + 2] = pixels[i * 4 + 2];
+    imgData.data[i * 4 + 3] = alpha;
+  }
+  cursorCtx.putImageData(imgData, 0, 0);
+  cursorCanvas.classList.remove('hidden');
+  // 定位光标（以热点为中心）
+  positionRemoteCursor();
+}
+
+function positionRemoteCursor() {
+  if (!remoteCursor) return;
+  const fx = (remoteCursor.x - remoteCursor.hotX) * scale + offsetX;
+  const fy = (remoteCursor.y - remoteCursor.hotY) * scale + offsetY;
+  cursorCanvas.style.left = fx + 'px';
+  cursorCanvas.style.top = fy + 'px';
+  cursorCanvas.style.width = (remoteCursor.w * scale) + 'px';
+  cursorCanvas.style.height = (remoteCursor.h * scale) + 'px';
+}
+
+// 隐藏远程光标
+function hideRemoteCursor() {
+  if (cursorCanvas) cursorCanvas.classList.add('hidden');
+  if (remoteCursor) remoteCursor.visible = false;
 }
 
 // 切换键盘
@@ -1670,7 +2003,38 @@ function toggleKeyboard() {
   keyboardPanel.classList.toggle('hidden', !keyboardVisible);
 }
 
-// ====== 触摸事件处理 ======
+// ====== 触摸事件处理 (增强: 平滑缩放 / 中心点锚定 / 平移跟随) ======
+let lastPinchCenterX = 0, lastPinchCenterY = 0;
+let lastPanX = 0, lastPanY = 0;
+
+function applyCanvasTransform() {
+  canvas.style.width = (fbW * scale) + 'px';
+  canvas.style.height = (fbH * scale) + 'px';
+  canvas.style.marginLeft = offsetX + 'px';
+  canvas.style.marginTop = offsetY + 'px';
+  // 同步更新远程光标位置
+  if (remoteCursor && remoteCursor.visible) positionRemoteCursor();
+}
+
+function clampOffset() {
+  const wrapper = document.getElementById('canvas-wrapper');
+  const displayW = fbW * scale;
+  const displayH = fbH * scale;
+  const wW = wrapper.clientWidth;
+  const wH = wrapper.clientHeight;
+  // 如果画面比屏幕小，居中；否则限制不超出边界
+  if (displayW <= wW) {
+    offsetX = (wW - displayW) / 2;
+  } else {
+    offsetX = Math.min(0, Math.max(wW - displayW, offsetX));
+  }
+  if (displayH <= wH) {
+    offsetY = (wH - displayH) / 2;
+  } else {
+    offsetY = Math.min(0, Math.max(wH - displayH, offsetY));
+  }
+}
+
 canvas.addEventListener('touchstart', (e) => {
   e.preventDefault();
   if (e.touches.length === 1) {
@@ -1678,20 +2042,24 @@ canvas.addEventListener('touchstart', (e) => {
     isPanning = false;
     lastTouchX = e.touches[0].clientX;
     lastTouchY = e.touches[0].clientY;
+    lastPanX = e.touches[0].clientX;
+    lastPanY = e.touches[0].clientY;
     // 鼠标按下
     const rect = canvas.getBoundingClientRect();
     const x = Math.floor((e.touches[0].clientX - rect.left) / scale);
     const y = Math.floor((e.touches[0].clientY - rect.top) / scale);
     if (client && client.connected) {
-      client.sendPointerEvent(x, y, 1); // 左键按下
+      client.sendPointerEvent(x, y, 1);
     }
   } else if (e.touches.length === 2) {
-    // 双指缩放
+    // 双指缩放开始
     isDragging = false;
     isPanning = true;
     const dx = e.touches[0].clientX - e.touches[1].clientX;
     const dy = e.touches[0].clientY - e.touches[1].clientY;
     lastTouchDist = Math.sqrt(dx * dx + dy * dy);
+    lastPinchCenterX = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+    lastPinchCenterY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
   }
 });
 
@@ -1701,25 +2069,57 @@ canvas.addEventListener('touchmove', (e) => {
     const rect = canvas.getBoundingClientRect();
     const x = Math.floor((e.touches[0].clientX - rect.left) / scale);
     const y = Math.floor((e.touches[0].clientY - rect.top) / scale);
-    if (client && client.connected) {
-      client.sendPointerEvent(x, y, 1);
+    // 如果缩放 > 1.05，单指拖动 = 平移画布；否则 = 鼠标事件
+    if (scale > 1.05) {
+      const deltaX = e.touches[0].clientX - lastPanX;
+      const deltaY = e.touches[0].clientY - lastPanY;
+      offsetX += deltaX;
+      offsetY += deltaY;
+      clampOffset();
+      applyCanvasTransform();
+      lastPanX = e.touches[0].clientX;
+      lastPanY = e.touches[0].clientY;
+    } else {
+      if (client && client.connected) {
+        client.sendPointerEvent(x, y, 1);
+      }
     }
   } else if (e.touches.length === 2 && isPanning) {
     const dx = e.touches[0].clientX - e.touches[1].clientX;
     const dy = e.touches[0].clientY - e.touches[1].clientY;
     const dist = Math.sqrt(dx * dx + dy * dy);
+    const cx = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+    const cy = (e.touches[0].clientY + e.touches[1].clientY) / 2;
     if (lastTouchDist > 0) {
       const delta = dist / lastTouchDist;
-      if (delta > 1.05 || delta < 0.95) {
-        scale = Math.max(0.2, Math.min(4, scale * delta));
-        canvas.style.width = (fbW * scale) + 'px';
-        canvas.style.height = (fbH * scale) + 'px';
+      // 平滑缩放 (灵敏度 0.02-1.0 无阈值限制)
+      const newScale = Math.max(0.15, Math.min(5, scale * delta));
+      if (newScale !== scale) {
+        // 以缩放中心点为锚点：保持锚点在屏幕上的位置不变
         const wrapper = document.getElementById('canvas-wrapper');
-        offsetX = (wrapper.clientWidth - fbW * scale) / 2;
-        offsetY = (wrapper.clientHeight - fbH * scale) / 2;
-        canvas.style.marginLeft = offsetX + 'px';
-        canvas.style.marginTop = offsetY + 'px';
+        const anchorScreenX = cx - wrapper.getBoundingClientRect().left;
+        const anchorScreenY = cy - wrapper.getBoundingClientRect().top;
+        const anchorFbX = (anchorScreenX - offsetX) / scale;
+        const anchorFbY = (anchorScreenY - offsetY) / scale;
+        scale = newScale;
+        offsetX = anchorScreenX - anchorFbX * scale;
+        offsetY = anchorScreenY - anchorFbY * scale;
+        clampOffset();
+        applyCanvasTransform();
+        lastPinchCenterX = cx;
+        lastPinchCenterY = cy;
         updateZoomIndicator();
+      }
+      // 双指同时平移
+      const panDeltaX = cx - lastPinchCenterX;
+      const panDeltaY = cy - lastPinchCenterY;
+      if (Math.abs(panDeltaX) > 1 || Math.abs(panDeltaY) > 1) {
+        offsetX += panDeltaX;
+        offsetY += panDeltaY;
+        clampOffset();
+        applyCanvasTransform();
+        lastPinchCenterX = cx;
+        lastPinchCenterY = cy;
       }
     }
     lastTouchDist = dist;
@@ -1730,11 +2130,10 @@ canvas.addEventListener('touchend', (e) => {
   e.preventDefault();
   if (isDragging) {
     const rect = canvas.getBoundingClientRect();
-    // 使用最后已知位置
     const x = Math.floor((lastTouchX - rect.left) / scale);
     const y = Math.floor((lastTouchY - rect.top) / scale);
-    if (client && client.connected) {
-      client.sendPointerEvent(x, y, 0); // 释放
+    if (client && client.connected && scale <= 1.05) {
+      client.sendPointerEvent(x, y, 0);
     }
   }
   isDragging = false;

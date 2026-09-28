@@ -392,17 +392,35 @@ export class RfbHandshake {
     console.log(`[RFB] 服务器初始化完成:`);
     console.log(`  - 桌面: ${name}`);
     console.log(`  - 尺寸: ${fbWidth} x ${fbHeight}`);
-    console.log(`  - 像素格式: ${pixelFormat.bitsPerPixel}bpp, depth=${pixelFormat.depth}`);
+    console.log(`  - 原始像素格式: ${pixelFormat.bitsPerPixel}bpp, depth=${pixelFormat.depth}, bigEndian=${pixelFormat.bigEndian}, trueColor=${pixelFormat.trueColor}`);
+    console.log(`    R: max=${pixelFormat.redMax} shift=${pixelFormat.redShift}`);
+    console.log(`    G: max=${pixelFormat.greenMax} shift=${pixelFormat.greenShift}`);
+    console.log(`    B: max=${pixelFormat.blueMax} shift=${pixelFormat.blueShift}`);
 
-    this.client.setFramebufferInfo(fbWidth, fbHeight, pixelFormat, name);
+    // 强制使用标准 32bpp true-color 像素格式（BGR 字节序）。
+    // 几乎所有 VNC 服务器都支持此格式，避免服务器发送非标准格式导致画面残缺。
+    const standardFormat = {
+      bitsPerPixel: 32,
+      depth: 24,
+      bigEndian: false,
+      trueColor: true,
+      redMax: 255,
+      greenMax: 255,
+      blueMax: 255,
+      redShift: 16,
+      greenShift: 8,
+      blueShift: 0,
+    };
+    this.client.setPixelFormat(standardFormat);
+    console.log(`[RFB] 已强制设置标准像素格式: 32bpp/true-color/BGR`);
 
-    // 发送首选编码
+    this.client.setFramebufferInfo(fbWidth, fbHeight, standardFormat, name);
+
+    // 诊断模式：仅请求 Raw 编码，排除压缩编码解码器导致的解析失败
+    // 如果 Raw 能正常显示，说明问题在 ZRLE/Tight 解码器
     this.client.setEncodings([
-      1,    // CopyRect
-      16,   // ZRLE
-      5,    // Hextile
-      2,    // RRE
       0,    // Raw
+      1,    // CopyRect
       0xFFFFFF11, // RichCursor
       0xFFFFFF10, // Cursor
       0xFFFFFF18, // PointerPos

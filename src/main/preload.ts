@@ -6,6 +6,7 @@
  * 渲染进程将拿不到 vncApi。因此这里内联 IPC 通道常量（与 src/rfb/types.ts 保持一致）。
  */
 
+// Electron 32.x：preload 脚本中 require('electron') 正常导出 API 命名空间
 import { contextBridge, ipcRenderer } from 'electron';
 
 // 与 src/rfb/types.ts 的 IPC_CHANNELS 保持一致
@@ -35,8 +36,9 @@ const IPC = {
 const api = {
   connect: (params: any) => ipcRenderer.invoke(IPC.CONNECT, params),
   disconnect: () => ipcRenderer.invoke(IPC.DISCONNECT),
-  keyEvent: (keyCode: number, down: boolean) => ipcRenderer.invoke(IPC.KEY_EVENT, keyCode, down),
-  pointerEvent: (buttonMask: number, x: number, y: number) => ipcRenderer.invoke(IPC.POINTER_EVENT, buttonMask, x, y),
+  // 输入事件使用 send（单向、不等待响应），避免被帧数据 IPC 排队阻塞
+  keyEvent: (keyCode: number, down: boolean) => ipcRenderer.send(IPC.KEY_EVENT, keyCode, down),
+  pointerEvent: (buttonMask: number, x: number, y: number) => ipcRenderer.send(IPC.POINTER_EVENT, buttonMask, x, y),
   sendCutText: (text: string) => ipcRenderer.invoke(IPC.CUT_TEXT, text),
   setEncodings: (encodings: number[]) => ipcRenderer.invoke(IPC.SET_ENCODINGS, encodings),
   setPixelFormat: (format: any) => ipcRenderer.invoke(IPC.SET_PIXEL_FORMAT, format),

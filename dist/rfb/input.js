@@ -66,8 +66,11 @@ class RfbInput {
      */
     sendKeyEvent(keyCode, down) {
         const keysym = this.mapKeyCode(keyCode);
-        if (keysym === 0)
+        if (keysym === 0) {
+            console.warn(`[RFB] [INPUT-DIAG] keyEvent 被忽略：keyCode=${keyCode} 映射到 keysym=0`);
             return;
+        }
+        console.log(`[RFB] [INPUT-DIAG] sendKeyEvent: keyCode=${keyCode} keysym=0x${keysym.toString(16)} down=${down}`);
         const isModifier = RfbInput.MODIFIER_KEYSYMS.has(keysym);
         if (down) {
             // 按下事件：先更新修饰键，再发送按键
@@ -206,6 +209,7 @@ class RfbInput {
         msg[1] = fullMask & 0xFF;
         msg.writeUInt16BE(Math.max(0, x), 2);
         msg.writeUInt16BE(Math.max(0, y), 4);
+        console.log(`[RFB] [INPUT-DIAG] sendPointerEvent: mask=${fullMask} x=${Math.max(0, x)} y=${Math.max(0, y)}`);
         this.client.send(msg);
     }
     /**

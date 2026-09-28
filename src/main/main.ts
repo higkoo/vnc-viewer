@@ -3,6 +3,7 @@
  * 管理窗口、IPC 通信、RFB 协议连接
  */
 
+// Electron 32.x：require('electron') 正常导出 API 命名空间
 import { app, BrowserWindow, ipcMain, Menu, dialog, MenuItemConstructorOptions } from 'electron';
 import * as path from 'path';
 import * as fs from 'fs';
@@ -17,7 +18,6 @@ let mainWindow: BrowserWindow | null = null;
 let rfbClient: RfbClient | null = null;
 let currentConnectionParams: ConnectionParams | null = null;
 let mobileServer: MobileServer | null = null;
-let lastUpdateRequestAt: number = 0;
 // 当前帧已解码但尚未发送到渲染进程的矩形（整帧收齐后批量发送，减少 IPC 次数）
 let pendingFrameRects: FramebufferRect[] = [];
 
@@ -271,7 +271,6 @@ function setupIPC(): void {
 
     currentConnectionParams = params;
     rfbClient = new RfbClient();
-    lastUpdateRequestAt = 0;
     pendingFrameRects = [];
 
     info(`正在连接 ${params.host}:${params.port} ${params.shared ? '(共享模式)' : ''}`);
@@ -280,40 +279,78 @@ function setupIPC(): void {
     rfbClient.on('state', (state: ConnectionState) => {
       mainWindow?.webContents.send(IPC_CHANNELS.CONNECTION_STATE, state);
       info(`连接状态: ${connectionStateLabel(state)}`);
+      // 断开后清空引用，让输入 handler 能准确诊断"连接已断开"
+      if (state === ConnectionState.Disconnected) {
+        rfbClient = null;
+      }
     });
 
     // 帧缓冲更新：先累积到本帧，避免每个矩形都走一次 IPC
     rfbClient.on('framebuffer-update', (rect: FramebufferRect) => {
+      // 诊断：每帧首矩形打印像素采样
+      if (pendingFrameRects.length === 0 && rect.data.length >= 16) {
+        const d = rect.data;
+        info(`[DIAG] 帧首矩形 rect=(${rect.x},${rect.y},${rect.width}x${rect.height}) enc=${rect.encoding} dataLen=${rect.data.length}`);
+        info(`[DIAG] 前16像素RGBA: ${
+          Array.from({length: 4}, (_, i) => `(${d[i*4]},${d[i*4+1]},${d[i*4+2]},${d[i*4+3]})`).join(' ')
+        }`);
+      }
       pendingFrameRects.push(rect);
     });
 
     // 帧缓冲完成：整帧收齐后批量发给渲染进程，再请求下一帧增量更新
+    // 同时在此处做诊断统计（帧率、更新请求频率），每秒输出一次汇总
+    let frameCount = 0;
+    let updateRequestCount = 0;
+    let lastDiagAt = Date.now();
     rfbClient.on('framebuffer-done', () => {
+      // --- 诊断统计 ---
+      frameCount++;
+      const now = Date.now();
+      if (now - lastDiagAt >= 1000) {
+        info(`[DIAG] 帧率: ${frameCount}帧/秒, 更新请求: ${updateRequestCount}次/秒, pendingRects=${pendingFrameRects.length}`);
+        frameCount = 0;
+        updateRequestCount = 0;
+        lastDiagAt = now;
+      }
+      // --- 帧数据转发给渲染进程 ---
+      // 注意：不在此处请求下一帧增量更新。
+      // 帧请求由 RfbClient 内部的 pollTimer 统一调度，避免多路请求导致频率失控。
       if (rfbClient && rfbClient.getState() === ConnectionState.Connected) {
         if (pendingFrameRects.length > 0) {
           const rects = pendingFrameRects;
           pendingFrameRects = [];
-          mainWindow?.webContents.send(IPC_CHANNELS.FRAMEBUFFER_UPDATE, rects);
+          // IPC 传输前把每个矩形的 Buffer data 拷贝为新的 Uint8Array，
+          // 使用 Uint8Array.from 做拷贝以避免共享 ArrayBuffer 导致的偏移问题
+          mainWindow?.webContents.send(IPC_CHANNELS.FRAMEBUFFER_UPDATE, rects.map((r) => ({
+            x: r.x, y: r.y, width: r.width, height: r.height,
+            encoding: r.encoding,
+            data: Uint8Array.from(r.data),
+          })));
         }
-        // 持续更新模式下该事件会频繁触发，做节流避免请求风暴
-        const now = Date.now();
-        if (now - lastUpdateRequestAt < 50) return;
-        lastUpdateRequestAt = now;
-        rfbClient.requestFramebufferUpdate(true);
       }
     });
 
     // 服务器信息
     rfbClient.on('server-info', (info_: any) => {
+      const pf = info_.pixelFormat;
       mainWindow?.webContents.send(IPC_CHANNELS.SERVER_INFO, info_);
-      info(`收到服务器信息: ${info_.name} ${info_.width}x${info_.height}`);
+      info(`[SERVER-INFO] ${info_.name} ${info_.width}x${info_.height}`);
+      if (pf) {
+        info(`[SERVER-INFO] 像素格式: ${pf.bitsPerPixel}bpp depth=${pf.depth} ${pf.trueColor ? 'true-color' : 'indexed'} ${pf.bigEndian ? 'BE' : 'LE'}`);
+        info(`[SERVER-INFO] R: max=${pf.redMax} shift=${pf.redShift}  G: max=${pf.greenMax} shift=${pf.greenShift}  B: max=${pf.blueMax} shift=${pf.blueShift}`);
+      }
+    });
+
+    // 诊断：帧请求发送计数
+    rfbClient.on('update-request', () => {
+      updateRequestCount++;
     });
 
     // 解码异常后的画面重新同步：请求一次全量更新
     rfbClient.on('framebuffer-resync', () => {
       if (rfbClient && rfbClient.getState() === ConnectionState.Connected) {
         pendingFrameRects = [];
-        lastUpdateRequestAt = 0;
         rfbClient.requestFramebufferUpdate(false);
       }
     });
@@ -356,14 +393,31 @@ function setupIPC(): void {
     return { success: true };
   });
 
-  ipcMain.handle(IPC_CHANNELS.KEY_EVENT, async (_event, keyCode: number, down: boolean) => {
-    rfbClient?.keyEvent(keyCode, down);
-    return { success: true };
+  // 输入事件用 ipcMain.on（非阻塞），避免被帧数据 IPC 排队阻塞
+  ipcMain.on(IPC_CHANNELS.KEY_EVENT, (_event, keyCode: number, down: boolean) => {
+    if (!rfbClient) {
+      warn(`[INPUT-DIAG] keyEvent(${keyCode}, ${down}) 被忽略：rfbClient 为 null（连接可能已断开）`);
+      return;
+    }
+    const sock = rfbClient.getSocket();
+    if (!sock || sock.destroyed) {
+      warn(`[INPUT-DIAG] keyEvent(${keyCode}, ${down}) 被忽略：socket 已断开`);
+      return;
+    }
+    rfbClient.keyEvent(keyCode, down);
   });
 
-  ipcMain.handle(IPC_CHANNELS.POINTER_EVENT, async (_event, buttonMask: number, x: number, y: number) => {
-    rfbClient?.pointerEvent(buttonMask, x, y);
-    return { success: true };
+  ipcMain.on(IPC_CHANNELS.POINTER_EVENT, (_event, buttonMask: number, x: number, y: number) => {
+    if (!rfbClient) {
+      warn(`[INPUT-DIAG] pointerEvent(mask=${buttonMask}, ${x},${y}) 被忽略：rfbClient 为 null（连接可能已断开）`);
+      return;
+    }
+    const sock = rfbClient.getSocket();
+    if (!sock || sock.destroyed) {
+      warn(`[INPUT-DIAG] pointerEvent(mask=${buttonMask}, ${x},${y}) 被忽略：socket 已断开`);
+      return;
+    }
+    rfbClient.pointerEvent(buttonMask, x, y);
   });
 
   ipcMain.handle(IPC_CHANNELS.CUT_TEXT, async (_event, text: string) => {

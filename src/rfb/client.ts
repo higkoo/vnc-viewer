@@ -46,6 +46,11 @@ export class RfbClient extends EventEmitter {
   private handshakeTimer: ReturnType<typeof setTimeout> | null = null;
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
 
+  // 持续帧请求轮询：即使服务器不主动推送，也会定期请求增量更新，
+  // 防止画面"卡死"（某些 VNC 服务器在无画面变化时停止推送 FramebufferUpdate）
+  private pollTimer: ReturnType<typeof setInterval> | null = null;
+  private static readonly POLL_INTERVAL_MS = 100; // 10fps 轮询
+
   // 服务器信息
   private serverVersion: RfbVersion = '003.008';
   private fbWidth: number = 0;
@@ -71,11 +76,12 @@ export class RfbClient extends EventEmitter {
   private static readonly COVERAGE_BLOCK_SIZE = 32;
   private static readonly COVERAGE_MAX_RETRIES = 8;
 
-  // ---- 带宽测量 ----
-  private bytesReceived: number = 0;
-  private bytesReceivedWindow: number = 0;
-  private bandwidthTimer: ReturnType<typeof setInterval> | null = null;
-  private lastBandwidth: number = 0; // bytes/sec
+// ---- 带宽测量 ----
+private bytesReceived: number = 0;
+private bytesReceivedWindow: number = 0;
+private lastDataAt: number = 0; // 上次收到服务端数据的时间戳
+private bandwidthTimer: ReturnType<typeof setInterval> | null = null;
+private lastBandwidth: number = 0; // bytes/sec
 
   // ---- 扩展剪贴板 ----
   /** Extended Clipboard 能力标志（从服务器 SetCutText 消息中解析） */
@@ -147,6 +153,7 @@ export class RfbClient extends EventEmitter {
     this.socket.on('data', (data: Buffer) => {
       this.bytesReceived += data.length;
       this.bytesReceivedWindow += data.length;
+      this.lastDataAt = Date.now();
       this.buffer = Buffer.concat([this.buffer, data]);
       this.resetIdleTimer();
       this.processData();
@@ -174,6 +181,7 @@ export class RfbClient extends EventEmitter {
     this.cancelConnectTimer();
     this.cancelHandshakeTimer();
     this.cancelIdleTimer();
+    this.stopPollTimer();
     this.stopBandwidthMonitor();
     this.input.clearEventBuffer();
 
@@ -207,6 +215,7 @@ export class RfbClient extends EventEmitter {
     msg.writeUInt16BE(width, 6);
     msg.writeUInt16BE(height, 8);
     this.send(msg);
+    this.emit('update-request');
   }
 
   /**
@@ -361,12 +370,23 @@ export class RfbClient extends EventEmitter {
 
   private resetIdleTimer(): void {
     this.cancelIdleTimer();
+    // 预警定时器：超时前 10 秒打日志，方便诊断是定时器未重置还是服务端真无响应
+    // 注意：不能使用嵌套 setTimeout — 内层 setTimeout 返回的新 id 赋值给 this.idleTimer 后，
+    // 下次调用 resetIdleTimer 时 cancelIdleTimer 只能清除最新的 timer，导致旧的预警 timer 泄露。
+    // 解决方案：预警逻辑通过单次定时器 + 时间差判断实现。
     this.idleTimer = setTimeout(() => {
-      if (this.state === ConnectionState.Connected) {
+      if (this.state !== ConnectionState.Connected) return;
+      const idleMs = Date.now() - this.lastDataAt;
+      if (idleMs >= IDLE_TIMEOUT) {
+        // 真正超时
         this.emitError('空闲超时：服务器长时间无响应');
         this.disconnect();
+      } else {
+        // 预警阶段：还未到完整超时，重新设定精确剩余时间
+        console.warn(`[RFB] [IDLE-WARN] 即将空闲超时，距超时还有 ${((IDLE_TIMEOUT - idleMs) / 1000).toFixed(1)}s`);
+        this.resetIdleTimer();
       }
-    }, IDLE_TIMEOUT);
+    }, IDLE_TIMEOUT - 10000);
   }
 
   private cancelIdleTimer(): void {
@@ -392,6 +412,29 @@ export class RfbClient extends EventEmitter {
     if (this.bandwidthTimer !== null) {
       clearInterval(this.bandwidthTimer);
       this.bandwidthTimer = null;
+    }
+  }
+
+  // ---- 持续帧轮询 ----
+
+  private startPollTimer(): void {
+    this.stopPollTimer();
+    // 立即发一次增量请求，确保连接后有画面
+    this.requestFramebufferUpdate(true);
+    this.pollTimer = setInterval(() => {
+      if (this.state === ConnectionState.Connected) {
+        // 距上次收到数据超过 1 秒才主动请求（避免与服务器的主动推送冲突）
+        if (Date.now() - this.lastDataAt > 1000) {
+          this.requestFramebufferUpdate(true);
+        }
+      }
+    }, RfbClient.POLL_INTERVAL_MS);
+  }
+
+  private stopPollTimer(): void {
+    if (this.pollTimer !== null) {
+      clearInterval(this.pollTimer);
+      this.pollTimer = null;
     }
   }
 
@@ -427,6 +470,8 @@ export class RfbClient extends EventEmitter {
     this.startIdleTimer();
     this.startBandwidthMonitor();
 
+    // 重要：必须先将 state 设为 Connected，再调用 requestFramebufferUpdate，
+    // 否则 requestFramebufferUpdate 中的状态检查会拒绝发送。
     this.setState(ConnectionState.Connected);
     this.emit('server-info', {
       width: this.fbWidth,
@@ -437,7 +482,10 @@ export class RfbClient extends EventEmitter {
     });
 
     this.initCoverage(this.fbWidth, this.fbHeight);
+    // 请求全量帧（非增量），获取完整画面
     this.requestFramebufferUpdate(false);
+    // 启动持续轮询，即使服务器不主动推送也会定期请求增量更新
+    this.startPollTimer();
   }
 
   emitError(msg: string): void {
@@ -450,6 +498,8 @@ export class RfbClient extends EventEmitter {
   send(data: Buffer): void {
     if (this.socket && this.socket.writable) {
       this.socket.write(data);
+    } else {
+      console.warn(`[RFB] [INPUT-DIAG] send 被丢弃！socket=${this.socket ? '存在' : 'null'} writable=${this.socket?.writable} state=${this.state} dataLen=${data.length} msgType=${data[0]}`);
     }
   }
 
@@ -457,7 +507,12 @@ export class RfbClient extends EventEmitter {
    * 处理接收到的数据
    */
   private processData(): void {
+    let iterations = 0;
     while (this.buffer.length > 0) {
+      if (++iterations > 100) {
+        console.warn('[RFB] processData 超过 100 次迭代，强制退出。state=', this.state, 'bufferLen=', this.buffer.length);
+        break;
+      }
       const prevLen = this.buffer.length;
       switch (this.state) {
         case ConnectionState.ProtocolVersion:
@@ -478,7 +533,9 @@ export class RfbClient extends EventEmitter {
         default:
           return;
       }
-      if (this.buffer.length === prevLen) break;
+      if (this.buffer.length === prevLen) {
+        break;
+      }
     }
   }
 
@@ -924,15 +981,9 @@ export class RfbClient extends EventEmitter {
   }
 
   /**
-   * 启动空闲超时检测
+   * 启动空闲超时检测（复用 resetIdleTimer 的预警机制）
    */
   private startIdleTimer(): void {
-    this.cancelIdleTimer();
-    this.idleTimer = setTimeout(() => {
-      if (this.state === ConnectionState.Connected) {
-        this.emitError('空闲超时：服务器长时间无响应');
-        this.disconnect();
-      }
-    }, IDLE_TIMEOUT);
+    this.resetIdleTimer();
   }
 }

@@ -90,7 +90,6 @@ declare let zoomMode: 'fit' | '100';
 declare let fbWidth: number;
 declare let fbHeight: number;
 declare let fbCanvas: ImageData | null;
-declare let bgFillTimer: ReturnType<typeof setTimeout> | null;
 declare let lastFrameTime: number;
 declare let mouseButtonMask: number;
 declare let lastMouseX: number;
@@ -118,6 +117,7 @@ declare function setupCanvas(): void;
 declare function applyZoomFit(): void;
 declare function setZoomMode(mode: 'fit' | '100'): void;
 declare function setupCanvasResize(): void;
+declare let totalRectsRendered: number;
 declare function renderRect(rect: {
     x: number;
     y: number;
@@ -127,14 +127,18 @@ declare function renderRect(rect: {
     encoding: number;
 }): void;
 /**
- * 背景填充：x11vnc 等服务器不发送静态背景区域，导致帧缓冲中保留黑色(0,0,0)。
+ * 【已禁用】背景填充：会覆盖画面中合法的黑色像素导致黑屏。
  *
- * 三段式策略：
+ * 背景填充逻辑的三段式策略：
  * 1. 纯色推断：从边缘采样推断背景主色调，直接填充所有黑块（适合纯色桌面）
  * 2. 扫描线扩散：32 轮四方向扫描，用最近非黑像素填充（适合渐变/纹理背景）
  * 3. 孤立点修复：对仍未修复的黑点做螺旋采样，取 4-16px 范围内最近非黑像素
+ *
+ * 禁用原因：VNC 服务器应在首帧发送完整画面，bf 时机不对会覆盖真实黑色像素。
+ * 若确有服务器不发背景的问题，应在协议层通过 coverage 追踪补发请求处理。
  */
-declare function fillBackground(): void;
+declare function _fillBackgroundDisabled(): void;
+declare let inputEventCount: number;
 declare function handleMouseDown(e: MouseEvent): void;
 declare function handleMouseUp(e: MouseEvent): void;
 declare function handleWindowMouseUp(e: MouseEvent): void;
@@ -150,6 +154,7 @@ declare let pendingMove: {
 declare function handleMouseMove(e: MouseEvent): void;
 declare function scheduleMouseMove(): void;
 declare function handleMouseWheel(e: WheelEvent): void;
+declare let coordDiagCounter: number;
 declare function getCanvasPosition(e: MouseEvent): {
     x: number;
     y: number;
@@ -157,6 +162,7 @@ declare function getCanvasPosition(e: MouseEvent): {
 declare function isTypingTarget(target: EventTarget | null): boolean;
 declare function handleKeyDown(e: KeyboardEvent): void;
 declare function handleKeyUp(e: KeyboardEvent): void;
+declare function ensureCanvasFocus(): void;
 declare function sendCtrlAltDel(): void;
 declare function toggleFullscreen(): void;
 declare function exitFullscreen(): void;
