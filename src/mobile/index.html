@@ -359,6 +359,7 @@ body {
     <button class="kb-key modifier" data-key="Alt" data-mod="alt">Alt</button>
     <button class="kb-key modifier" data-key="Meta" data-mod="meta">Cmd</button>
     <button class="kb-key modifier" data-key="Shift" data-mod="shift">Shift</button>
+    <button class="kb-key modifier" data-key="CapsLock" data-mod="capslock">Caps</button>
   </div>
   <div class="kb-row">
     <button class="kb-key special" data-key="Escape">Esc</button>
@@ -387,14 +388,45 @@ body {
 
 <script>
 // ====== RFB Keysym 映射 (X11) ======
+// 注：X11 字母 keysym 使用小写 (0x61='a')，大写由 Shift 修饰键组合产生
 const KEYSYM = {
   'Backspace': 0xff08, 'Tab': 0xff09, 'Enter': 0xff0d, 'Escape': 0xff1b,
   'F1': 0xffbe, 'F2': 0xffbf, 'F3': 0xffc0, 'F4': 0xffc1,
   'F5': 0xffc2, 'F6': 0xffc3, 'F7': 0xffc4, 'F8': 0xffc5,
   'F9': 0xffc6, 'F10': 0xffc7, 'F11': 0xffc8, 'F12': 0xffc9,
   'Shift': 0xffe1, 'Ctrl': 0xffe3, 'Alt': 0xffe9, 'Meta': 0xffeb,
+  'Shift_L': 0xffe1, 'Shift_R': 0xffe2,
+  'Control_L': 0xffe3, 'Control_R': 0xffe4,
+  'Alt_L': 0xffe9, 'Alt_R': 0xffea,
+  'Super_L': 0xffeb, 'Super_R': 0xffec,
+  'Caps_Lock': 0xffe5,
   'CtrlAltDel': 0xffff,
+  ' ': 0x20, 'Space': 0x20,
 };
+
+// 从字符解析 X11 keysym，正确处理字母大小写
+// 返回 { keysym, needShift } — needShift 表示是否需要额外发送 Shift
+function keysymFromChar(key) {
+  // 查表
+  if (KEYSYM[key] !== undefined) return { keysym: KEYSYM[key], needShift: false };
+  if (key.length !== 1) return { keysym: 0, needShift: false };
+
+  const code = key.charCodeAt(0);
+  // 字母键：始终返回小写 keysym + 根据大小写决定是否需要 shift
+  if (code >= 65 && code <= 90) {
+    // A-Z (大写)
+    return { keysym: 0x61 + (code - 65), needShift: true };
+  }
+  if (code >= 97 && code <= 122) {
+    // a-z (小写)
+    return { keysym: code, needShift: false };
+  }
+  // 其他字符 (数字/符号)：直接用 ASCII 作为 keysym
+  return { keysym: code, needShift: false };
+}
+
+// 修饰键集合（用于判断是否为修饰键）
+const MODIFIER_KEYS = new Set(['Shift', 'Control', 'Alt', 'Meta', 'Shift_L', 'Shift_R', 'Control_L', 'Control_R', 'Alt_L', 'Alt_R', 'Super_L', 'Super_R', 'Caps_Lock']);
 
 // ====== DES 实现 (VNC 认证) ======
 class DES {
@@ -1688,7 +1720,7 @@ let fbW = 0, fbH = 0;
 let isDragging = false, isPanning = false;
 let lastTouchDist = 0;
 let lastTouchX = 0, lastTouchY = 0;
-let activeModifiers = {};
+let activeModifiers = { shift: false, ctrl: false, alt: false, meta: false, capslock: false };
 let keyboardVisible = false;
 let zoomMode = 'fit'; // 'fit' or 'actual'
 
@@ -2189,52 +2221,86 @@ canvas.addEventListener('wheel', (e) => {
   }
 });
 
-// ====== 键盘事件 ======
+// ====== 键盘事件（正确处理大小写 + Caps Lock） ======
 document.addEventListener('keydown', (e) => {
   if (!client || !client.connected) return;
   e.preventDefault();
-  if (e.key === 'Shift') activeModifiers.shift = true;
-  if (e.key === 'Control') activeModifiers.ctrl = true;
-  if (e.key === 'Alt') activeModifiers.alt = true;
-  if (e.key === 'Meta') activeModifiers.meta = true;
 
-  const keysym = KEYSYM[e.key];
-  if (keysym) {
-    client.sendKeyEvent(keysym, true);
-  } else if (e.key.length === 1) {
-    const code = e.key.charCodeAt(0);
-    client.sendKeyEvent(code, true);
+  // 更新修饰键状态
+  if (e.key === 'Shift') { activeModifiers.shift = true; client.sendKeyEvent(0xffe1, true); return; }
+  if (e.key === 'Control') { activeModifiers.ctrl = true; client.sendKeyEvent(0xffe3, true); return; }
+  if (e.key === 'Alt') { activeModifiers.alt = true; client.sendKeyEvent(0xffe9, true); return; }
+  if (e.key === 'Meta') { activeModifiers.meta = true; client.sendKeyEvent(0xffeb, true); return; }
+  if (e.key === 'CapsLock') {
+    activeModifiers.capslock = !activeModifiers.capslock;
+    updateCapsLockVisual();
+    return;
+  }
+
+  // 解析 keysym 和 shift 需求
+  const { keysym, needShift } = keysymFromChar(e.key);
+  if (keysym === 0) return;
+
+  // Caps Lock 状态翻转 shift 需求
+  const effectiveShift = needShift !== (activeModifiers.capslock || false);
+
+  // 如果需要 shift 但当前未按下，先发送 shift down
+  if (effectiveShift && !activeModifiers.shift) {
+    client.sendKeyEvent(0xffe1, true); // Shift_L down
+  }
+
+  client.sendKeyEvent(keysym, true);
+
+  // 如果是临时注入的 shift，立即释放
+  if (effectiveShift && !activeModifiers.shift) {
+    client.sendKeyEvent(0xffe1, false); // Shift_L up
   }
 });
 
 document.addEventListener('keyup', (e) => {
   if (!client || !client.connected) return;
   e.preventDefault();
-  if (e.key === 'Shift') activeModifiers.shift = false;
-  if (e.key === 'Control') activeModifiers.ctrl = false;
-  if (e.key === 'Alt') activeModifiers.alt = false;
-  if (e.key === 'Meta') activeModifiers.meta = false;
 
-  const keysym = KEYSYM[e.key];
-  if (keysym) {
-    client.sendKeyEvent(keysym, false);
-  } else if (e.key.length === 1) {
-    const code = e.key.charCodeAt(0);
-    client.sendKeyEvent(code, false);
-  }
+  if (e.key === 'Shift') { activeModifiers.shift = false; client.sendKeyEvent(0xffe1, false); return; }
+  if (e.key === 'Control') { activeModifiers.ctrl = false; client.sendKeyEvent(0xffe3, false); return; }
+  if (e.key === 'Alt') { activeModifiers.alt = false; client.sendKeyEvent(0xffe9, false); return; }
+  if (e.key === 'Meta') { activeModifiers.meta = false; client.sendKeyEvent(0xffeb, false); return; }
+  if (e.key === 'CapsLock') return;
+
+  const { keysym } = keysymFromChar(e.key);
+  if (keysym === 0) return;
+
+  client.sendKeyEvent(keysym, false);
 });
 
 // ====== 虚拟键盘 ======
+// Caps Lock 状态指示样式
+function updateCapsLockVisual() {
+  document.querySelectorAll('.kb-key[data-mod="capslock"]').forEach(btn => {
+    btn.classList.toggle('active', !!activeModifiers.capslock);
+  });
+}
 document.querySelectorAll('.kb-key').forEach(btn => {
+  // 虚拟键盘修饰键的统一 keysym 映射
+  const MOD_KEYSYM = {
+    'shift': 0xffe1,   // Shift_L
+    'ctrl': 0xffe3,    // Control_L
+    'alt': 0xffe9,     // Alt_L
+    'meta': 0xffeb,    // Super_L
+  };
   btn.addEventListener('touchstart', (e) => {
     e.preventDefault();
     const key = btn.dataset.key;
     const mod = btn.dataset.mod;
-    if (mod) {
+    if (mod === 'capslock') {
+      // Caps Lock：仅在本地追踪大小写切换（不发给服务端，避免双重切换导致远端 capslock 状态不匹配）
+      activeModifiers.capslock = !activeModifiers.capslock;
+      btn.classList.toggle('active', activeModifiers.capslock);
+    } else if (mod) {
       activeModifiers[mod] = !activeModifiers[mod];
       btn.classList.toggle('active');
-      if (client && client.connected) {
-        client.sendKeyEvent(KEYSYM[key], activeModifiers[mod]);
+      if (client && client.connected && MOD_KEYSYM[mod]) {
+        client.sendKeyEvent(MOD_KEYSYM[mod], activeModifiers[mod]);
       }
     } else if (key === 'CtrlAltDel') {
       if (client && client.connected) {
