@@ -951,10 +951,10 @@ function handleKeyDown(e: KeyboardEvent): void {
   }
 
   // 修饰键按下
-  if (e.key === 'Shift') { modShiftDown = true; vncApi.keyEvent(0xffe1, true); return; }
-  if (e.key === 'Control') { vncApi.keyEvent(0xffe3, true); return; }
-  if (e.key === 'Alt') { vncApi.keyEvent(0xffe9, true); return; }
-  if (e.key === 'Meta') { vncApi.keyEvent(0xffeb, true); return; }
+  if (e.key === 'Shift') { modShiftDown = true; vncApi.keyEvent(0x1000000 | 0xffe1, true); return; }
+  if (e.key === 'Control') { vncApi.keyEvent(0x1000000 | 0xffe3, true); return; }
+  if (e.key === 'Alt') { vncApi.keyEvent(0x1000000 | 0xffe9, true); return; }
+  if (e.key === 'Meta') { vncApi.keyEvent(0x1000000 | 0xffeb, true); return; }
 
   // 解析字符 keysym
   const { keysym, needShift } = keysymFromKey(e.key);
@@ -965,14 +965,14 @@ function handleKeyDown(e: KeyboardEvent): void {
 
   // 需要 shift 但当前未按下，先发送 shift down
   if (effectiveShift && !modShiftDown) {
-    vncApi.keyEvent(0xffe1, true);
+    vncApi.keyEvent(0x1000000 | 0xffe1, true);
   }
 
-  vncApi.keyEvent(keysym, true);
+  vncApi.keyEvent(0x1000000 | keysym, true);
 
   // 如果是临时注入的 shift，立即释放
   if (effectiveShift && !modShiftDown) {
-    vncApi.keyEvent(0xffe1, false);
+    vncApi.keyEvent(0x1000000 | 0xffe1, false);
   }
 
   inputEventCount++;
@@ -986,16 +986,16 @@ function handleKeyUp(e: KeyboardEvent): void {
   e.preventDefault();
 
   // 修饰键释放
-  if (e.key === 'Shift') { modShiftDown = false; vncApi.keyEvent(0xffe1, false); return; }
-  if (e.key === 'Control') { vncApi.keyEvent(0xffe3, false); return; }
-  if (e.key === 'Alt') { vncApi.keyEvent(0xffe9, false); return; }
-  if (e.key === 'Meta') { vncApi.keyEvent(0xffeb, false); return; }
+  if (e.key === 'Shift') { modShiftDown = false; vncApi.keyEvent(0x1000000 | 0xffe1, false); return; }
+  if (e.key === 'Control') { vncApi.keyEvent(0x1000000 | 0xffe3, false); return; }
+  if (e.key === 'Alt') { vncApi.keyEvent(0x1000000 | 0xffe9, false); return; }
+  if (e.key === 'Meta') { vncApi.keyEvent(0x1000000 | 0xffeb, false); return; }
   if (e.key === 'CapsLock') return;
 
   const { keysym } = keysymFromKey(e.key);
   if (keysym === 0) return;
 
-  vncApi.keyEvent(keysym, false);
+  vncApi.keyEvent(0x1000000 | keysym, false);
 }
 
 // 点击工具栏按钮后自动把焦点还给 canvas，避免按键"丢失"
@@ -1007,8 +1007,10 @@ function ensureCanvasFocus(): void {
 
 function sendCtrlAltDel(): void {
   if (!isConnected) return;
-  // 发送 Ctrl+Alt+Del
-  const ctrl = 17, alt = 18, del = 46;
+  // 发送 Ctrl+Alt+Del（使用 X11 keysym + 标记位）
+  const ctrl = 0x1000000 | 0xffe3;  // Control_L
+  const alt = 0x1000000 | 0xffe9;   // Alt_L
+  const del = 0x1000000 | 0xffff;    // Delete
   vncApi.keyEvent(ctrl, true);
   vncApi.keyEvent(alt, true);
   vncApi.keyEvent(del, true);
