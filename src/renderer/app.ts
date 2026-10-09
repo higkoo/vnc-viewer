@@ -873,9 +873,63 @@ function isTypingTarget(target: EventTarget | null): boolean {
     || tag === 'BUTTON' || el.isContentEditable;
 }
 
+// X11 keysym 映射表
+const KEYSYM: Record<string, number> = {
+  'Backspace': 0xff08, 'Tab': 0xff09, 'Enter': 0xff0d, 'Escape': 0xff1b,
+  'F1': 0xffbe, 'F2': 0xffbf, 'F3': 0xffc0, 'F4': 0xffc1,
+  'F5': 0xffc2, 'F6': 0xffc3, 'F7': 0xffc4, 'F8': 0xffc5,
+  'F9': 0xffc6, 'F10': 0xffc7, 'F11': 0xffc8, 'F12': 0xffc9,
+  'Shift': 0xffe1, 'Shift_L': 0xffe1, 'Shift_R': 0xffe2,
+  'Control': 0xffe3, 'Ctrl': 0xffe3, 'Control_L': 0xffe3, 'Control_R': 0xffe4,
+  'Alt': 0xffe9, 'Alt_L': 0xffe9, 'Alt_R': 0xffea,
+  'Meta': 0xffeb, 'Super_L': 0xffeb, 'Super_R': 0xffec,
+  'CapsLock': 0xffe5, 'Caps_Lock': 0xffe5,
+  'Delete': 0xffff, 'Insert': 0xff63, 'Home': 0xff50, 'End': 0xff57,
+  'PageUp': 0xff55, 'PageDown': 0xff56,
+  'ArrowUp': 0xff52, 'ArrowDown': 0xff54, 'ArrowLeft': 0xff51, 'ArrowRight': 0xff53,
+  ' ': 0x20,
+  // 数字键
+  '`': 0x60, '-': 0x2d, '=': 0x3d,
+  '[': 0x5b, ']': 0x5d, '\\': 0x5c,
+  ';': 0x3b, "'": 0x27, ',': 0x2c, '.': 0x2e, '/': 0x2f,
+};
+
+// 需要 Shift 才能输入的符号映射
+const SHIFT_SYMBOLS: Record<string, number> = {
+  '~': 0x60, '!': 0x21, '@': 0x40, '#': 0x23, '$': 0x24, '%': 0x25,
+  '^': 0x5e, '&': 0x26, '*': 0x2a, '(': 0x28, ')': 0x29,
+  '_': 0x5f, '+': 0x3b, '{': 0x7b, '}': 0x7d, '|': 0x7c,
+  ':': 0x3a, '"': 0x22, '<': 0x3c, '>': 0x3e, '?': 0x3f,
+};
+
+// Caps Lock 状态
+let capsLockOn = false;
+
+// 从按键解析 X11 keysym，正确处理字母大小写
+function keysymFromKey(key: string): { keysym: number; needShift: boolean } {
+  // 查表（功能键、符号等）
+  if (KEYSYM[key] !== undefined) return { keysym: KEYSYM[key], needShift: false };
+  if (key.length !== 1) return { keysym: 0, needShift: false };
+
+  const code = key.charCodeAt(0);
+  // 字母键：始终返回小写 keysym + 根据大小写决定是否需要 shift
+  if (code >= 65 && code <= 90) {
+    return { keysym: 0x61 + (code - 65), needShift: true };
+  }
+  if (code >= 97 && code <= 122) {
+    return { keysym: code, needShift: false };
+  }
+  // Shift 符号
+  if (SHIFT_SYMBOLS[key] !== undefined) return { keysym: SHIFT_SYMBOLS[key], needShift: true };
+  // 其他字符 (数字)
+  return { keysym: code, needShift: false };
+}
+
+// 当前跟踪的修饰键状态
+let modShiftDown = false;
+
 function handleKeyDown(e: KeyboardEvent): void {
   if (!isConnected) return;
-  // 焦点在输入控件/按钮上时按键归控件所有，不应转发给远程
   if (isTypingTarget(e.target)) return;
 
   // 快捷键：Cmd(Mac) 或 Ctrl(其他) 组合键触发本地操作
@@ -885,23 +939,63 @@ function handleKeyDown(e: KeyboardEvent): void {
     if (e.key === 'd' || e.key === 'D') { handleDisconnect(); e.preventDefault(); return; }
     if (e.key === '0') { setZoomMode('fit'); e.preventDefault(); return; }
     if (e.key === '1') { setZoomMode('100'); e.preventDefault(); return; }
-    // Ctrl+L 日志面板由 Electron 菜单处理，不拦截
   }
 
-  // 已连接且焦点不在输入框时，确保 canvas 有焦点以便接收后续事件
   canvas.focus();
   e.preventDefault();
+
+  // Caps Lock 切换
+  if (e.key === 'CapsLock') {
+    capsLockOn = !capsLockOn;
+    return;
+  }
+
+  // 修饰键按下
+  if (e.key === 'Shift') { modShiftDown = true; vncApi.keyEvent(0xffe1, true); return; }
+  if (e.key === 'Control') { vncApi.keyEvent(0xffe3, true); return; }
+  if (e.key === 'Alt') { vncApi.keyEvent(0xffe9, true); return; }
+  if (e.key === 'Meta') { vncApi.keyEvent(0xffeb, true); return; }
+
+  // 解析字符 keysym
+  const { keysym, needShift } = keysymFromKey(e.key);
+  if (keysym === 0) return;
+
+  // Caps Lock 对字母有效：翻转 shift 需求
+  const effectiveShift = needShift !== capsLockOn;
+
+  // 需要 shift 但当前未按下，先发送 shift down
+  if (effectiveShift && !modShiftDown) {
+    vncApi.keyEvent(0xffe1, true);
+  }
+
+  vncApi.keyEvent(keysym, true);
+
+  // 如果是临时注入的 shift，立即释放
+  if (effectiveShift && !modShiftDown) {
+    vncApi.keyEvent(0xffe1, false);
+  }
+
   inputEventCount++;
   if (inputEventCount <= 10 || inputEventCount % 20 === 0) {
-    console.log(`[INPUT-DIAG] keydown keyCode=${e.keyCode} key=${e.key}`);
+    console.log(`[INPUT-DIAG] keydown key=${e.key} keysym=0x${keysym.toString(16)} needShift=${needShift} capsLock=${capsLockOn} effectiveShift=${effectiveShift}`);
   }
-  vncApi.keyEvent(e.keyCode, true);
 }
 
 function handleKeyUp(e: KeyboardEvent): void {
   if (!isConnected || isTypingTarget(e.target)) return;
   e.preventDefault();
-  vncApi.keyEvent(e.keyCode, false);
+
+  // 修饰键释放
+  if (e.key === 'Shift') { modShiftDown = false; vncApi.keyEvent(0xffe1, false); return; }
+  if (e.key === 'Control') { vncApi.keyEvent(0xffe3, false); return; }
+  if (e.key === 'Alt') { vncApi.keyEvent(0xffe9, false); return; }
+  if (e.key === 'Meta') { vncApi.keyEvent(0xffeb, false); return; }
+  if (e.key === 'CapsLock') return;
+
+  const { keysym } = keysymFromKey(e.key);
+  if (keysym === 0) return;
+
+  vncApi.keyEvent(keysym, false);
 }
 
 // 点击工具栏按钮后自动把焦点还给 canvas，避免按键"丢失"
