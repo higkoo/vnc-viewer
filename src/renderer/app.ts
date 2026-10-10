@@ -98,6 +98,13 @@ let isFullscreen = false;
 let zoomLevel = 1;
 let zoomMode: 'fit' | '100' = 'fit';
 
+// ---- 本地修饰键状态跟踪 ----
+// 作为 e.shiftKey 的后备数据源，某些平台/Electron 版本中 e.shiftKey 可能存在延迟
+let localShiftDown = false;
+let localCtrlDown = false;
+let localAltDown = false;
+let localMetaDown = false;
+
 // 帧缓冲数据
 let fbWidth = 0;
 let fbHeight = 0;
@@ -777,11 +784,18 @@ function handleWindowMouseUp(e: MouseEvent): void {
   vncApi.pointerEvent(mouseButtonMask, lastMouseX, lastMouseY);
 }
 
-// 窗口失焦（如切换应用/Alt-Tab）时释放全部鼠标键
+// 窗口失焦（如切换应用/Alt-Tab）时释放全部鼠标键和修饰键
 function handleWindowBlur(): void {
-  if (!isConnected || mouseButtonMask === 0) return;
-  mouseButtonMask = 0;
-  vncApi.pointerEvent(0, lastMouseX, lastMouseY);
+  // 释放可能残留的本地修饰键
+  if (localShiftDown) { localShiftDown = false; vncApi.keyEvent(0x1000000 | 0xffe1, false); }
+  if (localCtrlDown) { localCtrlDown = false; vncApi.keyEvent(0x1000000 | 0xffe3, false); }
+  if (localAltDown) { localAltDown = false; vncApi.keyEvent(0x1000000 | 0xffe9, false); }
+  if (localMetaDown) { localMetaDown = false; vncApi.keyEvent(0x1000000 | 0xffeb, false); }
+  // 释放鼠标键
+  if (mouseButtonMask !== 0) {
+    mouseButtonMask = 0;
+    vncApi.pointerEvent(0, lastMouseX, lastMouseY);
+  }
 }
 
 // 鼠标移动节流：mousemove 触发频率远高于屏幕刷新率，逐条走 IPC 会拖垮渲染与主进程
@@ -896,10 +910,12 @@ const KEYSYM: Record<string, number> = {
 };
 
 // 需要 Shift 才能输入的符号映射
+// 注意：标准 ASCII 字符的 keysym 等于其 ASCII 码，大部分不需要此表。
+// 仅列出需要特殊处理的符号映射（大部分是冗余的 ASCII 映射，保留是为了兼容性）
 const SHIFT_SYMBOLS: Record<string, number> = {
-  '~': 0x60, '!': 0x21, '@': 0x40, '#': 0x23, '$': 0x24, '%': 0x25,
+  '~': 0x7e, '!': 0x21, '@': 0x40, '#': 0x23, '$': 0x24, '%': 0x25,
   '^': 0x5e, '&': 0x26, '*': 0x2a, '(': 0x28, ')': 0x29,
-  '_': 0x5f, '+': 0x3b, '{': 0x7b, '}': 0x7d, '|': 0x7c,
+  '_': 0x5f, '+': 0x2b, '{': 0x7b, '}': 0x7d, '|': 0x7c,
   ':': 0x3a, '"': 0x22, '<': 0x3c, '>': 0x3e, '?': 0x3f,
 };
 
@@ -924,6 +940,15 @@ function handleKeyDown(e: KeyboardEvent): void {
   if (!isConnected) return;
   if (isTypingTarget(e.target)) return;
 
+  // 跳过修饰键的自动重复事件（OS 按住不放时生成的重复 keydown）
+  // 使用本地状态判断：如果本地已记录该修饰键为按下，跳过重复事件
+  if (e.repeat) {
+    if (e.key === 'Shift' && localShiftDown) return;
+    if (e.key === 'Control' && localCtrlDown) return;
+    if (e.key === 'Alt' && localAltDown) return;
+    if (e.key === 'Meta' && localMetaDown) return;
+  }
+
   // 快捷键：Cmd(Mac) 或 Ctrl(其他) 组合键触发本地操作
   const mod = e.metaKey || e.ctrlKey;
   if (mod) {
@@ -937,14 +962,14 @@ function handleKeyDown(e: KeyboardEvent): void {
   canvas.focus();
   e.preventDefault();
 
-  // 修饰键按下 — 发送对应的 X11 keysym
-  if (e.key === 'Shift') { vncApi.keyEvent(0x1000000 | 0xffe1, true); return; }
-  if (e.key === 'Control') { vncApi.keyEvent(0x1000000 | 0xffe3, true); return; }
-  if (e.key === 'Alt') { vncApi.keyEvent(0x1000000 | 0xffe9, true); return; }
-  if (e.key === 'Meta') { vncApi.keyEvent(0x1000000 | 0xffeb, true); return; }
+  // 修饰键按下 — 发送对应的 X11 keysym + 更新本地状态
+  if (e.key === 'Shift') { localShiftDown = true; vncApi.keyEvent(0x1000000 | 0xffe1, true); return; }
+  if (e.key === 'Control') { localCtrlDown = true; vncApi.keyEvent(0x1000000 | 0xffe3, true); return; }
+  if (e.key === 'Alt') { localAltDown = true; vncApi.keyEvent(0x1000000 | 0xffe9, true); return; }
+  if (e.key === 'Meta') { localMetaDown = true; vncApi.keyEvent(0x1000000 | 0xffeb, true); return; }
   if (e.key === 'CapsLock') {
-    // Caps Lock 按下本身不需要发送 keyEvent（服务器通过 Shift 状态推断大小写）
-    // 但不妨碍按键本身的处理
+    // Caps Lock 按下本身不需要发送 keyEvent
+    // 但本地 Caps Lock 跟踪在 getModifierState 中已处理
     return;
   }
 
@@ -952,16 +977,27 @@ function handleKeyDown(e: KeyboardEvent): void {
   const keysym = keysymFromKey(e.key);
   if (keysym === 0) return;
 
-  // 判断是否需要临时注入 Shift:
-  // 浏览器通过 e.shiftKey 已经告诉我们 Shift 修饰键的状态。
-  // 对于字母键，浏览器已经把 Caps Lock + Shift 的优先级算好了:
-  //   - Shift+a → e.key="A", e.shiftKey=true → 需要 shift → 但 Shift 修饰键已经按下（浏览器发了 shift keydown）
-  //   - CapsLock+a → e.key="A", e.shiftKey=false (或 true 取决于平台) → 需要 shift 但远程没 shift
-  // 所以我们只需要: 最终结果是"大写" 但 远程还没 shift 时注入临时 shift
-  // "最终结果是大写" 等价于: keysym 是字母(0x61-0x7a) 且 key 是大写
+  // 判断该字符是否需要 Shift 修饰:
+  // 通过 e.getModifierState() 获取修饰键物理状态，比 e.shiftKey 更可靠
+  // (e.shiftKey 是"计算后"的状态，可能在某些平台上与 CapsLock 交互不一致)
+  const capsLockOn = !!(e.getModifierState && e.getModifierState('CapsLock'));
   const isLetter = keysym >= 0x61 && keysym <= 0x7a;
+
+  // 对于字母: 有效的大小写 = shift XOR capsLock（标准键盘行为）
+  // 大写字符需要 Shift 修饰
   const keyIsUppercase = (e.key.length === 1 && e.key >= 'A' && e.key <= 'Z');
-  const needTempShift = isLetter && keyIsUppercase && !e.shiftKey;
+  // 用 XOR 综合判断: 最终是否需要大写输出
+  // 如果 e.key 反映了 Caps Lock(e.key 为大写) → keyIsUppercase=true
+  // 如果 e.key 未反映 Caps Lock(Mac 上 e.key 为小写) → 用 capsLockOn 补充
+  const effectiveUppercase = keyIsUppercase !== capsLockOn;
+
+  // 字母且需要大写: 检查服务器端是否已有 Shift
+  // 服务器端 Shift 状态 = 物理 Shift 键是否按下(因为我们会发送 shift keydown/keyup)
+  // 如果 e.shiftKey=true → 服务器已有 shift → 不需要注入
+  // 如果 e.shiftKey=false → 服务器没有 shift → 需要注入临时 shift
+  // 例外: Shift+CapsLock+字母 → 有效结果为小写，但服务器有 shift
+  //   这种情况无法完美修复（需要事件重序），但极少使用
+  const needTempShift = isLetter && effectiveUppercase && !e.shiftKey;
 
   if (needTempShift) {
     vncApi.keyEvent(0x1000000 | 0xffe1, true);
@@ -975,7 +1011,7 @@ function handleKeyDown(e: KeyboardEvent): void {
 
   inputEventCount++;
   if (inputEventCount <= 30 || inputEventCount % 100 === 0) {
-    console.log(`[INPUT-DIAG] keydown key="${e.key}" shiftKey=${e.shiftKey} keysym=0x${keysym.toString(16)} tempShift=${needTempShift}`);
+    console.log(`[INPUT-DIAG] keydown key="${e.key}" shiftKey=${e.shiftKey} capsLock=${capsLockOn} e.keyUpper=${keyIsUppercase} effUpper=${effectiveUppercase} keysym=0x${keysym.toString(16)} tempShift=${needTempShift}`);
   }
 }
 
@@ -983,11 +1019,11 @@ function handleKeyUp(e: KeyboardEvent): void {
   if (!isConnected || isTypingTarget(e.target)) return;
   e.preventDefault();
 
-  // 修饰键释放
-  if (e.key === 'Shift') { vncApi.keyEvent(0x1000000 | 0xffe1, false); return; }
-  if (e.key === 'Control') { vncApi.keyEvent(0x1000000 | 0xffe3, false); return; }
-  if (e.key === 'Alt') { vncApi.keyEvent(0x1000000 | 0xffe9, false); return; }
-  if (e.key === 'Meta') { vncApi.keyEvent(0x1000000 | 0xffeb, false); return; }
+  // 修饰键释放 + 更新本地状态
+  if (e.key === 'Shift') { localShiftDown = false; vncApi.keyEvent(0x1000000 | 0xffe1, false); return; }
+  if (e.key === 'Control') { localCtrlDown = false; vncApi.keyEvent(0x1000000 | 0xffe3, false); return; }
+  if (e.key === 'Alt') { localAltDown = false; vncApi.keyEvent(0x1000000 | 0xffe9, false); return; }
+  if (e.key === 'Meta') { localMetaDown = false; vncApi.keyEvent(0x1000000 | 0xffeb, false); return; }
   if (e.key === 'CapsLock' || e.code === 'CapsLock') return;
 
   const keysym = keysymFromKey(e.key);

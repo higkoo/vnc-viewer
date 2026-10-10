@@ -72,19 +72,13 @@ class RfbInput {
         }
         console.log(`[RFB] [INPUT-DIAG] sendKeyEvent: keyCode=${keyCode} keysym=0x${keysym.toString(16)} down=${down}`);
         const isModifier = RfbInput.MODIFIER_KEYSYMS.has(keysym);
-        if (down) {
-            // 按下事件：先更新修饰键，再发送按键
-            if (isModifier) {
-                this.enqueueModifierKey(keysym, true);
-            }
-            this.enqueueKeyEvent(keysym, true);
+        if (isModifier) {
+            // 修饰键：只通过 enqueueModifierKey 发送（带去重），避免重复发送
+            this.enqueueModifierKey(keysym, down);
         }
         else {
-            // 释放事件：先发送按键，再更新修饰键
-            this.enqueueKeyEvent(keysym, false);
-            if (isModifier) {
-                this.enqueueModifierKey(keysym, false);
-            }
+            // 普通键：直接发送
+            this.enqueueKeyEvent(keysym, down);
         }
     }
     /**
@@ -245,8 +239,13 @@ class RfbInput {
     }
     /**
      * 将键盘按键码映射为 RFB keysym
+     * 如果值已设置 KEYSYM_IS_READY_FLAG，说明渲染端直接发来了 X11 keysym，
+     * 清除标记后原样返回；否则按旧式 keyCode 查表映射。
      */
     mapKeyCode(keyCode) {
+        if (keyCode >= RfbInput.KEYSYM_IS_READY_FLAG) {
+            return keyCode - RfbInput.KEYSYM_IS_READY_FLAG;
+        }
         return RfbInput.KEY_MAP[keyCode] || keyCode;
     }
 }
@@ -367,4 +366,9 @@ RfbInput.MODIFIER_KEYSYMS = new Set([
     0xFF7F, // NumLock
     0xFF14, // ScrollLock
 ]);
+/**
+ * 标记位：渲染进程发送时设置此位，表示值已经是 X11 keysym，无需查表映射。
+ * 使用 bit 23（0x800000），避开 X11 keysym 可能使用的位（X11 keysym 最大 0x20000000 左右）。
+ */
+RfbInput.KEYSYM_IS_READY_FLAG = 0x1000000;
 //# sourceMappingURL=input.js.map

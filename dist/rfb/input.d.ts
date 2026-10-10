@@ -94,7 +94,14 @@ export declare class RfbInput {
      */
     getRemoteModifiers(): Set<number>;
     /**
+     * 标记位：渲染进程发送时设置此位，表示值已经是 X11 keysym，无需查表映射。
+     * 使用 bit 23（0x800000），避开 X11 keysym 可能使用的位（X11 keysym 最大 0x20000000 左右）。
+     */
+    static readonly KEYSYM_IS_READY_FLAG = 16777216;
+    /**
      * 将键盘按键码映射为 RFB keysym
+     * 如果值已设置 KEYSYM_IS_READY_FLAG，说明渲染端直接发来了 X11 keysym，
+     * 清除标记后原样返回；否则按旧式 keyCode 查表映射。
      */
     private mapKeyCode;
 }
