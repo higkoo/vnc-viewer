@@ -205,18 +205,12 @@ export class RfbInput {
 
     const isModifier = RfbInput.MODIFIER_KEYSYMS.has(keysym);
 
-    if (down) {
-      // 按下事件：先更新修饰键，再发送按键
-      if (isModifier) {
-        this.enqueueModifierKey(keysym, true);
-      }
-      this.enqueueKeyEvent(keysym, true);
+    if (isModifier) {
+      // 修饰键：只通过 enqueueModifierKey 发送（带去重），避免重复发送
+      this.enqueueModifierKey(keysym, down);
     } else {
-      // 释放事件：先发送按键，再更新修饰键
-      this.enqueueKeyEvent(keysym, false);
-      if (isModifier) {
-        this.enqueueModifierKey(keysym, false);
-      }
+      // 普通键：直接发送
+      this.enqueueKeyEvent(keysym, down);
     }
   }
 

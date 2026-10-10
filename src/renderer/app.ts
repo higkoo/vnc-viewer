@@ -188,8 +188,9 @@ function setupEventListeners(): void {
 
   // 键盘事件提升到 window 级：即使画布因点击工具栏等操作失焦，
   // 键盘仍能送达远程（此前画布失焦后按键会"消失"，表现为无法操作）。
-  window.addEventListener('keydown', handleKeyDown);
-  window.addEventListener('keyup', handleKeyUp);
+  // 使用捕获阶段监听器，确保 Tab 等默认焦点切换键能被 preventDefault 阻止
+  window.addEventListener('keydown', handleKeyDown, true);
+  window.addEventListener('keyup', handleKeyUp, true);
 
   // 窗口大小变化
   window.addEventListener('resize', () => {
@@ -902,31 +903,22 @@ const SHIFT_SYMBOLS: Record<string, number> = {
   ':': 0x3a, '"': 0x22, '<': 0x3c, '>': 0x3e, '?': 0x3f,
 };
 
-// Caps Lock 状态
-let capsLockOn = false;
-
-// 从按键解析 X11 keysym，正确处理字母大小写
-function keysymFromKey(key: string): { keysym: number; needShift: boolean } {
-  // 查表（功能键、符号等）
-  if (KEYSYM[key] !== undefined) return { keysym: KEYSYM[key], needShift: false };
-  if (key.length !== 1) return { keysym: 0, needShift: false };
+// 从按键解析 X11 keysym，返回小写 keysym（字母统一用小写）
+// 不依赖 Caps Lock 状态 — 浏览器已通过 e.shiftKey 和 e.key 正确反映了大小写
+function keysymFromKey(key: string): number {
+  // 查表（功能键、特殊字符、符号等）
+  if (KEYSYM[key] !== undefined) return KEYSYM[key];
+  if (key.length !== 1) return 0;
 
   const code = key.charCodeAt(0);
-  // 字母键：始终返回小写 keysym + 根据大小写决定是否需要 shift
-  if (code >= 65 && code <= 90) {
-    return { keysym: 0x61 + (code - 65), needShift: true };
-  }
-  if (code >= 97 && code <= 122) {
-    return { keysym: code, needShift: false };
-  }
-  // Shift 符号
-  if (SHIFT_SYMBOLS[key] !== undefined) return { keysym: SHIFT_SYMBOLS[key], needShift: true };
-  // 其他字符 (数字)
-  return { keysym: code, needShift: false };
+  // 字母键：统一返回小写 keysym（大写字母 A-Z 对应 a-z 的 keysym）
+  if (code >= 65 && code <= 90) return 0x61 + (code - 65);  // 'A'→'a' keysym
+  if (code >= 97 && code <= 122) return code;               // 'a'→0x61
+  // Shift 符号已经是单字符，但上面 KEYSYM/表中没有 → 直接用其 keysym
+  if (SHIFT_SYMBOLS[key] !== undefined) return SHIFT_SYMBOLS[key];
+  // 数字等其他 ASCII 字符
+  return code;
 }
-
-// 当前跟踪的修饰键状态
-let modShiftDown = false;
 
 function handleKeyDown(e: KeyboardEvent): void {
   if (!isConnected) return;
@@ -941,43 +933,49 @@ function handleKeyDown(e: KeyboardEvent): void {
     if (e.key === '1') { setZoomMode('100'); e.preventDefault(); return; }
   }
 
+  // 焦点切换到 canvas, 阻止默认行为（含 Tab 焦点切换）
   canvas.focus();
   e.preventDefault();
 
-  // Caps Lock 切换
-  if (e.key === 'CapsLock') {
-    capsLockOn = !capsLockOn;
-    return;
-  }
-
-  // 修饰键按下
-  if (e.key === 'Shift') { modShiftDown = true; vncApi.keyEvent(0x1000000 | 0xffe1, true); return; }
+  // 修饰键按下 — 发送对应的 X11 keysym
+  if (e.key === 'Shift') { vncApi.keyEvent(0x1000000 | 0xffe1, true); return; }
   if (e.key === 'Control') { vncApi.keyEvent(0x1000000 | 0xffe3, true); return; }
   if (e.key === 'Alt') { vncApi.keyEvent(0x1000000 | 0xffe9, true); return; }
   if (e.key === 'Meta') { vncApi.keyEvent(0x1000000 | 0xffeb, true); return; }
+  if (e.key === 'CapsLock') {
+    // Caps Lock 按下本身不需要发送 keyEvent（服务器通过 Shift 状态推断大小写）
+    // 但不妨碍按键本身的处理
+    return;
+  }
 
   // 解析字符 keysym
-  const { keysym, needShift } = keysymFromKey(e.key);
+  const keysym = keysymFromKey(e.key);
   if (keysym === 0) return;
 
-  // Caps Lock 对字母有效：翻转 shift 需求
-  const effectiveShift = needShift !== capsLockOn;
+  // 判断是否需要临时注入 Shift:
+  // 浏览器通过 e.shiftKey 已经告诉我们 Shift 修饰键的状态。
+  // 对于字母键，浏览器已经把 Caps Lock + Shift 的优先级算好了:
+  //   - Shift+a → e.key="A", e.shiftKey=true → 需要 shift → 但 Shift 修饰键已经按下（浏览器发了 shift keydown）
+  //   - CapsLock+a → e.key="A", e.shiftKey=false (或 true 取决于平台) → 需要 shift 但远程没 shift
+  // 所以我们只需要: 最终结果是"大写" 但 远程还没 shift 时注入临时 shift
+  // "最终结果是大写" 等价于: keysym 是字母(0x61-0x7a) 且 key 是大写
+  const isLetter = keysym >= 0x61 && keysym <= 0x7a;
+  const keyIsUppercase = (e.key.length === 1 && e.key >= 'A' && e.key <= 'Z');
+  const needTempShift = isLetter && keyIsUppercase && !e.shiftKey;
 
-  // 需要 shift 但当前未按下，先发送 shift down
-  if (effectiveShift && !modShiftDown) {
+  if (needTempShift) {
     vncApi.keyEvent(0x1000000 | 0xffe1, true);
   }
 
   vncApi.keyEvent(0x1000000 | keysym, true);
 
-  // 如果是临时注入的 shift，立即释放
-  if (effectiveShift && !modShiftDown) {
+  if (needTempShift) {
     vncApi.keyEvent(0x1000000 | 0xffe1, false);
   }
 
   inputEventCount++;
-  if (inputEventCount <= 10 || inputEventCount % 20 === 0) {
-    console.log(`[INPUT-DIAG] keydown key=${e.key} keysym=0x${keysym.toString(16)} needShift=${needShift} capsLock=${capsLockOn} effectiveShift=${effectiveShift}`);
+  if (inputEventCount <= 30 || inputEventCount % 100 === 0) {
+    console.log(`[INPUT-DIAG] keydown key="${e.key}" shiftKey=${e.shiftKey} keysym=0x${keysym.toString(16)} tempShift=${needTempShift}`);
   }
 }
 
@@ -986,13 +984,13 @@ function handleKeyUp(e: KeyboardEvent): void {
   e.preventDefault();
 
   // 修饰键释放
-  if (e.key === 'Shift') { modShiftDown = false; vncApi.keyEvent(0x1000000 | 0xffe1, false); return; }
+  if (e.key === 'Shift') { vncApi.keyEvent(0x1000000 | 0xffe1, false); return; }
   if (e.key === 'Control') { vncApi.keyEvent(0x1000000 | 0xffe3, false); return; }
   if (e.key === 'Alt') { vncApi.keyEvent(0x1000000 | 0xffe9, false); return; }
   if (e.key === 'Meta') { vncApi.keyEvent(0x1000000 | 0xffeb, false); return; }
-  if (e.key === 'CapsLock') return;
+  if (e.key === 'CapsLock' || e.code === 'CapsLock') return;
 
-  const { keysym } = keysymFromKey(e.key);
+  const keysym = keysymFromKey(e.key);
   if (keysym === 0) return;
 
   vncApi.keyEvent(0x1000000 | keysym, false);
