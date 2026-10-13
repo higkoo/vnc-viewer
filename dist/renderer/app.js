@@ -88,6 +88,11 @@ function init() {
     setupCanvasResize();
     // 聚焦到主机输入框
     hostInput.focus();
+    // 自动连接：当 host 和 password 都有预填值时，自动发起连接
+    if (hostInput.value && passwordInput.value) {
+        console.log(`[AUTO] host=${hostInput.value}，password 已设置，1s 后自动连接`);
+        setTimeout(handleConnect, 1000);
+    }
 }
 // ---- 事件监听 ----
 function setupEventListeners() {
@@ -881,8 +886,12 @@ const SHIFT_SYMBOLS = {
     '_': 0x5f, '+': 0x2b, '{': 0x7b, '}': 0x7d, '|': 0x7c,
     ':': 0x3a, '"': 0x22, '<': 0x3c, '>': 0x3e, '?': 0x3f,
 };
-// 从按键解析 X11 keysym，返回小写 keysym（字母统一用小写）
-// 不依赖 Caps Lock 状态 — 浏览器已通过 e.shiftKey 和 e.key 正确反映了大小写
+// 从按键解析 X11 keysym：直接使用 e.key 对应的 "视觉" keysym
+// 关键原理：e.key 已经反映了 Shift/Caps Lock 的最终视觉效果
+//   - 'A' → XK_A (0x41)          服务器直接输出 A
+//   - 'a' → XK_a (0x61)          服务器直接输出 a
+//   - '?' → XK_question (0x3f)   通过 SHIFT_SYMBOLS 查表
+// 不再依赖服务器端 Shift 修饰 — 避免不同 VNC 服务器 Shift 处理差异
 function keysymFromKey(key) {
     // 查表（功能键、特殊字符、符号等）
     if (KEYSYM[key] !== undefined)
@@ -890,12 +899,13 @@ function keysymFromKey(key) {
     if (key.length !== 1)
         return 0;
     const code = key.charCodeAt(0);
-    // 字母键：统一返回小写 keysym（大写字母 A-Z 对应 a-z 的 keysym）
+    // 字母键：直接使用 e.key 对应的 X11 keysym
+    // 'A' → 0x41 (XK_A), 'a' → 0x61 (XK_a), 'Z' → 0x5A (XK_Z), etc.
     if (code >= 65 && code <= 90)
-        return 0x61 + (code - 65); // 'A'→'a' keysym
+        return code; // A-Z → XK_A-XK_Z (0x41-0x5A)
     if (code >= 97 && code <= 122)
-        return code; // 'a'→0x61
-    // Shift 符号已经是单字符，但上面 KEYSYM/表中没有 → 直接用其 keysym
+        return code; // a-z → XK_a-XK_z (0x61-0x7a)
+    // Shift 符号
     if (SHIFT_SYMBOLS[key] !== undefined)
         return SHIFT_SYMBOLS[key];
     // 数字等其他 ASCII 字符
@@ -967,44 +977,17 @@ function handleKeyDown(e) {
         return;
     }
     if (e.key === 'CapsLock') {
-        // Caps Lock 按下本身不需要发送 keyEvent
-        // 但本地 Caps Lock 跟踪在 getModifierState 中已处理
+        // Caps Lock 不需要发送到远程 — 远程状态应保持不变
         return;
     }
     // 解析字符 keysym
     const keysym = keysymFromKey(e.key);
     if (keysym === 0)
         return;
-    // 判断该字符是否需要 Shift 修饰:
-    // 通过 e.getModifierState() 获取修饰键物理状态，比 e.shiftKey 更可靠
-    // (e.shiftKey 是"计算后"的状态，可能在某些平台上与 CapsLock 交互不一致)
-    const capsLockOn = !!(e.getModifierState && e.getModifierState('CapsLock'));
-    const isLetter = keysym >= 0x61 && keysym <= 0x7a;
-    // 对于字母: 有效的大小写 = shift XOR capsLock（标准键盘行为）
-    // 大写字符需要 Shift 修饰
-    const keyIsUppercase = (e.key.length === 1 && e.key >= 'A' && e.key <= 'Z');
-    // 用 XOR 综合判断: 最终是否需要大写输出
-    // 如果 e.key 反映了 Caps Lock(e.key 为大写) → keyIsUppercase=true
-    // 如果 e.key 未反映 Caps Lock(Mac 上 e.key 为小写) → 用 capsLockOn 补充
-    const effectiveUppercase = keyIsUppercase !== capsLockOn;
-    // 字母且需要大写: 检查服务器端是否已有 Shift
-    // 服务器端 Shift 状态 = 物理 Shift 键是否按下(因为我们会发送 shift keydown/keyup)
-    // 如果 e.shiftKey=true → 服务器已有 shift → 不需要注入
-    // 如果 e.shiftKey=false → 服务器没有 shift → 需要注入临时 shift
-    // 例外: Shift+CapsLock+字母 → 有效结果为小写，但服务器有 shift
-    //   这种情况无法完美修复（需要事件重序），但极少使用
-    const needTempShift = isLetter && effectiveUppercase && !e.shiftKey;
-    if (needTempShift) {
-        vncApi.keyEvent(0x1000000 | 0xffe1, true);
-    }
-    vncApi.keyEvent(0x1000000 | keysym, true);
-    if (needTempShift) {
-        vncApi.keyEvent(0x1000000 | 0xffe1, false);
-    }
+    // 直接发送 e.keysym — keysymFromKey 已返回对应的大小写 keysym
     inputEventCount++;
-    if (inputEventCount <= 30 || inputEventCount % 100 === 0) {
-        console.log(`[INPUT-DIAG] keydown key="${e.key}" shiftKey=${e.shiftKey} capsLock=${capsLockOn} e.keyUpper=${keyIsUppercase} effUpper=${effectiveUppercase} keysym=0x${keysym.toString(16)} tempShift=${needTempShift}`);
-    }
+    console.log(`[INPUT-DIAG] keydown #${inputEventCount} key="${e.key}" code="${e.code}" shiftKey=${e.shiftKey} keysym=0x${keysym.toString(16)}`);
+    vncApi.keyEvent(0x1000000 | keysym, true);
 }
 function handleKeyUp(e) {
     if (!isConnected || isTypingTarget(e.target))

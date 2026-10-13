@@ -18,8 +18,8 @@ export declare class RfbInput {
      */
     private remoteModifiers;
     /**
-     * 事件缓冲队列
-     * 在缓冲窗口内合并多个事件后一次性发送
+     * 事件缓冲队列（已禁用 — 调试发现缓冲合并导致 Shift+字符的 RFB 事件被合并到同一 TCP 包，
+     * 某些 VNC 服务器处理不当导致 Shift 修饰键失效。现改为每个按键事件立即发送。）
      */
     private eventBuffer;
     private flushTimer;
@@ -42,13 +42,13 @@ export declare class RfbInput {
      */
     sendKeyEventImmediate(keysym: number, down: boolean): void;
     /**
-     * 将按键事件加入缓冲队列
+     * 立即发送普通按键事件（不经缓冲）
      */
-    private enqueueKeyEvent;
+    private sendKeyImmediate;
     /**
-     * 将修饰键事件加入缓冲队列（带状态追踪，避免冗余）
+     * 立即发送修饰键事件（带状态追踪，避免冗余）
      */
-    private enqueueModifierKey;
+    private sendModifierImmediate;
     /**
      * 构建按键事件消息
      * 消息格式: 1-byte msg-type(4), 1-byte down-flag, 2-byte padding, 4-byte keysym

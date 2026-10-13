@@ -52,10 +52,19 @@
             "x64",
             "arm64"
           ]
+        },
+        {
+          "target": "dir",
+          "arch": [
+            "arm64"
+          ]
         }
       ],
       "category": "public.app-category.utilities",
-      "identity": null
+      "identity": null,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.plist",
+      "gatekeeperAssess": false
     },
     "dmg": {
       "title": "VNC Viewer ${version}"

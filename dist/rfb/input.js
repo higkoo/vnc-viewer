@@ -12,6 +12,7 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.RfbInput = void 0;
 const types_1 = require("./types");
+const logger_1 = require("../main/logger");
 /**
  * 修饰键的 RFB keysym 定义
  * 用于追踪远程修饰键状态，避免冗余发送
@@ -49,8 +50,8 @@ class RfbInput {
          */
         this.remoteModifiers = new Set();
         /**
-         * 事件缓冲队列
-         * 在缓冲窗口内合并多个事件后一次性发送
+         * 事件缓冲队列（已禁用 — 调试发现缓冲合并导致 Shift+字符的 RFB 事件被合并到同一 TCP 包，
+         * 某些 VNC 服务器处理不当导致 Shift 修饰键失效。现改为每个按键事件立即发送。）
          */
         this.eventBuffer = [];
         this.flushTimer = null;
@@ -67,41 +68,39 @@ class RfbInput {
     sendKeyEvent(keyCode, down) {
         const keysym = this.mapKeyCode(keyCode);
         if (keysym === 0) {
-            console.warn(`[RFB] [INPUT-DIAG] keyEvent 被忽略：keyCode=${keyCode} 映射到 keysym=0`);
+            (0, logger_1.warn)(`[INPUT-DIAG] keyEvent 被忽略：keyCode=${keyCode} 映射到 keysym=0`);
             return;
         }
-        console.log(`[RFB] [INPUT-DIAG] sendKeyEvent: keyCode=${keyCode} keysym=0x${keysym.toString(16)} down=${down}`);
+        (0, logger_1.info)(`[INPUT-DIAG] sendKeyEvent: keyCode=0x${keyCode.toString(16)} keysym=0x${keysym.toString(16)} down=${down}`);
         const isModifier = RfbInput.MODIFIER_KEYSYMS.has(keysym);
         if (isModifier) {
-            // 修饰键：只通过 enqueueModifierKey 发送（带去重），避免重复发送
-            this.enqueueModifierKey(keysym, down);
+            // 修饰键：立即发送，不经过缓冲队列（保证时效性）
+            this.sendModifierImmediate(keysym, down);
         }
         else {
-            // 普通键：直接发送
-            this.enqueueKeyEvent(keysym, down);
+            // 普通键：也立即发送（禁用缓冲合并，避免与修饰键合包导致服务器处理异常）
+            this.sendKeyImmediate(keysym, down);
         }
     }
     /**
      * 立即发送键盘事件（绕过缓冲，用于紧急按键如 Ctrl+Alt+Del）
      */
     sendKeyEventImmediate(keysym, down) {
-        // 先刷新缓冲队列，保证事件顺序
-        this.flushEventBuffer();
+        // 缓冲已禁用，直接发送
         const msg = this.buildKeyEventMessage(keysym, down);
         this.client.send(msg);
     }
     /**
-     * 将按键事件加入缓冲队列
+     * 立即发送普通按键事件（不经缓冲）
      */
-    enqueueKeyEvent(keysym, down) {
+    sendKeyImmediate(keysym, down) {
         const msg = this.buildKeyEventMessage(keysym, down);
-        this.eventBuffer.push(msg);
-        this.scheduleFlush();
+        this.client.send(msg);
     }
     /**
-     * 将修饰键事件加入缓冲队列（带状态追踪，避免冗余）
+     * 立即发送修饰键事件（带状态追踪，避免冗余）
      */
-    enqueueModifierKey(keysym, down) {
+    sendModifierImmediate(keysym, down) {
         if (down) {
             if (this.remoteModifiers.has(keysym))
                 return; // 已按下，跳过
@@ -113,8 +112,7 @@ class RfbInput {
             this.remoteModifiers.delete(keysym);
         }
         const msg = this.buildKeyEventMessage(keysym, down);
-        this.eventBuffer.push(msg);
-        this.scheduleFlush();
+        this.client.send(msg);
     }
     /**
      * 构建按键事件消息
@@ -250,7 +248,7 @@ class RfbInput {
     }
 }
 exports.RfbInput = RfbInput;
-RfbInput.FLUSH_INTERVAL_MS = 8; // ~120Hz 的刷新率
+RfbInput.FLUSH_INTERVAL_MS = 0; // 禁用缓冲，立即发送
 // X11 键码映射 (keyCode -> RFB keysym)
 RfbInput.KEY_MAP = {
     // 字母

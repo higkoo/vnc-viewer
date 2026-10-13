@@ -5,6 +5,7 @@
 
 // Electron 32.x：require('electron') 正常导出 API 命名空间
 import { app, BrowserWindow, ipcMain, Menu, dialog, MenuItemConstructorOptions } from 'electron';
+
 import * as path from 'path';
 import * as fs from 'fs';
 import { RfbClient } from '../rfb/client';
