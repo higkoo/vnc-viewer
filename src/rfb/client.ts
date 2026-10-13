@@ -66,6 +66,8 @@ export class RfbClient extends EventEmitter {
 
   // 接收缓冲区
   private buffer: Buffer = Buffer.alloc(0);
+  /** buffer 中已消费的前缀偏移（惰性消费，避免频繁拷贝） */
+  private readOffset: number = 0;
 
   // 帧覆盖追踪：记录 32x32 块级别的覆盖状态
   private coverageCols = 0;
@@ -90,15 +92,25 @@ private lastBandwidth: number = 0; // bytes/sec
   // 公开方法用于 handshake 模块
   updateState(state: ConnectionState): void { this.setState(state); }
   getParams(): ConnectionParams { return this.params; }
-  /** 从 buffer 中读取 n 字节，并移除已读部分 */
+  /** 从 buffer 中读取 n 字节，并移除已读部分。
+   * 返回内部缓冲区的零拷贝视图，调用方应立即使用，勿长期持有。 */
   readBuffer(n: number): Buffer | null {
-    if (this.buffer.length < n) return null;
-    const data = this.buffer.slice(0, n);
-    this.buffer = this.buffer.slice(n);
+    if (this.buffer.length - this.readOffset < n) return null;
+    const data = this.buffer.subarray(this.readOffset, this.readOffset + n);
+    this.readOffset += n;
     return data;
   }
-  /** 获取 buffer 当前长度 */
-  bufferLength(): number { return this.buffer.length; }
+  /** 获取未消费数据长度 */
+  bufferLength(): number { return this.buffer.length - this.readOffset; }
+
+  /** 消费 n 字节：惰性推进偏移，超过 1MB 且已消费过半时压缩缓冲区释放内存 */
+  private consume(n: number): void {
+    this.readOffset += n;
+    if (this.readOffset > 1024 * 1024 && this.readOffset * 2 > this.buffer.length) {
+      this.buffer = Buffer.from(this.buffer.subarray(this.readOffset));
+      this.readOffset = 0;
+    }
+  }
 
   constructor() {
     super();
@@ -145,6 +157,7 @@ private lastBandwidth: number = 0; // bytes/sec
     this.socket.on('connect', () => {
       this.cancelConnectTimer();
       this.buffer = Buffer.alloc(0);
+      this.readOffset = 0;
       // 进入握手阶段，启动握手超时
       this.startHandshakeTimer();
       this.setState(ConnectionState.ProtocolVersion);
@@ -154,7 +167,17 @@ private lastBandwidth: number = 0; // bytes/sec
       this.bytesReceived += data.length;
       this.bytesReceivedWindow += data.length;
       this.lastDataAt = Date.now();
-      this.buffer = Buffer.concat([this.buffer, data]);
+      // 快路径：旧数据已全部消费时直接接管新块，避免 concat 拷贝；
+      // 否则仅拼接未消费的剩余部分（配合 readOffset 惰性消费，减少大帧下的 O(n²) 拷贝）
+      if (this.readOffset === this.buffer.length) {
+        this.buffer = data;
+        this.readOffset = 0;
+      } else if (this.readOffset > 0) {
+        this.buffer = Buffer.concat([this.buffer.subarray(this.readOffset), data]);
+        this.readOffset = 0;
+      } else {
+        this.buffer = Buffer.concat([this.buffer, data]);
+      }
       this.resetIdleTimer();
       this.processData();
     });
@@ -195,6 +218,7 @@ private lastBandwidth: number = 0; // bytes/sec
     this.coverageRequestPending = false;
     this.setState(ConnectionState.Disconnected);
     this.buffer = Buffer.alloc(0);
+    this.readOffset = 0;
   }
 
   /**
@@ -283,25 +307,7 @@ private lastBandwidth: number = 0; // bytes/sec
     if (!this.socket) return;
     const utf8 = Buffer.from(text, 'utf8');
 
-    // Extended Clipboard: 使用带标志的消息格式
-    // 标志位:
-    //   bit 0: 纯文本
-    //   bit 1: rich text (RTF)
-    //   bit 2: HTML
-    //   bit 3: XCEL
-    //   bit 4: DIB (图像)
-    //   bit 5: files
-    //   bit 6: text with caps notification
-    //   bit 7-31: 保留
-    const flags = 0x01; // text only
-    const msg = Buffer.alloc(8 + utf8.length);
-    msg[0] = ClientMsgType.ClientCutText; // 6
-    msg[1] = 0; msg[2] = 0; msg[3] = 0; // padding
-    // Extended: 前 4 字节为 flags，后 4 字节为 length
-    msg.writeUInt32BE(flags >>> 0, 4);
-    msg.writeUInt32BE(utf8.length, 8);
-    // 注意：标准 ClientCutText 只有 4 字节 length，没有 flags 字段
-    // 这里调用能力协商后的标准格式
+    // 标准 ClientCutText 格式: type(1) + padding(3) + length(4) + text
     const standardMsg = Buffer.alloc(8 + utf8.length);
     standardMsg[0] = ClientMsgType.ClientCutText;
     standardMsg[1] = 0; standardMsg[2] = 0; standardMsg[3] = 0;
@@ -508,12 +514,14 @@ private lastBandwidth: number = 0; // bytes/sec
    */
   private processData(): void {
     let iterations = 0;
-    while (this.buffer.length > 0) {
+    let hitIterationCap = false;
+    while (this.bufferLength() > 0) {
       if (++iterations > 100) {
-        console.warn('[RFB] processData 超过 100 次迭代，强制退出。state=', this.state, 'bufferLen=', this.buffer.length);
+        hitIterationCap = true;
+        console.warn('[RFB] processData 超过 100 次迭代，让出事件循环后续跑。state=', this.state, 'bufferLen=', this.bufferLength());
         break;
       }
-      const prevLen = this.buffer.length;
+      const prevLen = this.bufferLength();
       switch (this.state) {
         case ConnectionState.ProtocolVersion:
           this.handshake.processProtocolVersion();
@@ -533,9 +541,14 @@ private lastBandwidth: number = 0; // bytes/sec
         default:
           return;
       }
-      if (this.buffer.length === prevLen) {
+      if (this.bufferLength() === prevLen) {
         break;
       }
+    }
+    // 迭代超限时残余数据可能长时间滞留（若无后续 data 事件），
+    // 让出事件循环后主动续跑，而不是被动等待下一个数据包
+    if (hitIterationCap && this.bufferLength() > 0 && this.state === ConnectionState.Connected) {
+      setImmediate(() => this.processData());
     }
   }
 
@@ -543,8 +556,8 @@ private lastBandwidth: number = 0; // bytes/sec
    * 处理服务器消息 (连接建立后)
    */
   private processServerMessage(): void {
-    while (this.buffer.length >= 1) {
-      const msgType = this.buffer[0] as ServerMsgType;
+    while (this.bufferLength() >= 1) {
+      const msgType = this.buffer[this.readOffset] as ServerMsgType;
 
       switch (msgType) {
         case ServerMsgType.FramebufferUpdate:
@@ -554,7 +567,7 @@ private lastBandwidth: number = 0; // bytes/sec
           if (!this.processSetColorMapEntries()) return;
           break;
         case ServerMsgType.Bell:
-          this.buffer = this.buffer.subarray(1);
+          this.consume(1);
           this.emit('bell');
           break;
         case ServerMsgType.ServerCutText:
@@ -568,7 +581,7 @@ private lastBandwidth: number = 0; // bytes/sec
           break;
         default:
           // 未知消息类型，跳过一字节
-          this.buffer = this.buffer.subarray(1);
+          this.consume(1);
           break;
       }
     }
@@ -614,6 +627,7 @@ private lastBandwidth: number = 0; // bytes/sec
 
       // 清空接收缓冲区，防止错误数据污染后续解析
       this.buffer = Buffer.alloc(0);
+      this.readOffset = 0;
 
       if (this.consecutiveDecodeErrors >= RfbClient.MAX_CONSECUTIVE_DECODE_ERRORS) {
         // 连续多次失败，断线重连
@@ -630,9 +644,9 @@ private lastBandwidth: number = 0; // bytes/sec
 
   /** 帧解析主体 */
   private processFramebufferUpdateInner(): boolean {
-    if (this.buffer.length < 4) return false;
+    if (this.bufferLength() < 4) return false;
 
-    const numRects = this.buffer.readUInt16BE(2);
+    const numRects = this.buffer.readUInt16BE(this.readOffset + 2);
     const continuous = numRects === 0xFFFF;
 
     interface PendingRect {
@@ -650,13 +664,13 @@ private lastBandwidth: number = 0; // bytes/sec
 
     // ---- 第一阶段：扫描并确认整帧数据齐备 ----
     while (continuous ? !lastRect : handled < numRects) {
-      if (this.buffer.length < cursor + 12) return false;
+      if (this.bufferLength() < cursor + 12) return false;
 
-      const x = this.buffer.readUInt16BE(cursor);
-      const y = this.buffer.readUInt16BE(cursor + 2);
-      const width = this.buffer.readUInt16BE(cursor + 4);
-      const height = this.buffer.readUInt16BE(cursor + 6);
-      const encoding = this.buffer.readUInt32BE(cursor + 8);
+      const x = this.buffer.readUInt16BE(this.readOffset + cursor);
+      const y = this.buffer.readUInt16BE(this.readOffset + cursor + 2);
+      const width = this.buffer.readUInt16BE(this.readOffset + cursor + 4);
+      const height = this.buffer.readUInt16BE(this.readOffset + cursor + 6);
+      const encoding = this.buffer.readUInt32BE(this.readOffset + cursor + 8);
       cursor += 12;
 
       if (encoding >= 0xFFFFFF00) {
@@ -665,23 +679,23 @@ private lastBandwidth: number = 0; // bytes/sec
           lastRect = true;
           continue;
         }
-        const payload = this.readPseudoEncodingPayload(encoding, width, height, cursor);
+        const payload = this.readPseudoEncodingPayload(encoding, width, height, this.readOffset + cursor);
         if (payload === null) return false;
         pending.push({ kind: 'pseudo', x, y, width, height, encoding, payload });
         cursor += payload.length;
       } else if (encoding === EncodingType.ZRLE) {
-        if (this.buffer.length < cursor + 4) return false;
-        const compressedLen = this.buffer.readUInt32BE(cursor);
-        if (this.buffer.length < cursor + 4 + compressedLen) return false;
+        if (this.bufferLength() < cursor + 4) return false;
+        const compressedLen = this.buffer.readUInt32BE(this.readOffset + cursor);
+        if (this.bufferLength() < cursor + 4 + compressedLen) return false;
         this.markCoverage(x, y, width, height);
         pending.push({
           kind: 'zrle', x, y, width, height, encoding,
-          payload: Buffer.from(this.buffer.subarray(cursor + 4, cursor + 4 + compressedLen)),
+          payload: Buffer.from(this.buffer.subarray(this.readOffset + cursor + 4, this.readOffset + cursor + 4 + compressedLen)),
         });
         cursor += 4 + compressedLen;
       } else {
         const result = this.encoders.decode(
-          this.buffer, cursor, encoding, width, height, this.pixelFormat
+          this.buffer, this.readOffset + cursor, encoding, width, height, this.pixelFormat
         );
         if (result === null) return false;
         this.markCoverage(x, y, width, height);
@@ -709,7 +723,7 @@ private lastBandwidth: number = 0; // bytes/sec
       }
     }
 
-    this.buffer = this.buffer.subarray(cursor);
+    this.consume(cursor);
     this.emit('framebuffer-done');
     this.checkCoverageAndRequest();
     return true;
@@ -881,11 +895,11 @@ private lastBandwidth: number = 0; // bytes/sec
    * 处理 SetColorMapEntries 消息
    */
   private processSetColorMapEntries(): boolean {
-    if (this.buffer.length < 6) return false;
-    const numColors = this.buffer.readUInt16BE(4);
+    if (this.bufferLength() < 6) return false;
+    const numColors = this.buffer.readUInt16BE(this.readOffset + 4);
     const totalSize = 6 + numColors * 6;
-    if (this.buffer.length < totalSize) return false;
-    this.buffer = this.buffer.subarray(totalSize);
+    if (this.bufferLength() < totalSize) return false;
+    this.consume(totalSize);
     return true;
   }
 
@@ -895,30 +909,39 @@ private lastBandwidth: number = 0; // bytes/sec
    * 旧格式:   1-byte msg-type(3), 3-byte padding, 4-byte length, text
    */
   private processServerCutText(): boolean {
-    if (this.buffer.length < 8) return false;
+    if (this.bufferLength() < 8) return false;
 
     // 尝试 Extended Clipboard 格式 (带 flags 字段)
     // 如果前 4 字节 padding 后紧跟的 4 字节 flags 最高位为 1，则为扩展格式
-    const flagsOrLen = this.buffer.readUInt32BE(4);
+    const flagsOrLen = this.buffer.readUInt32BE(this.readOffset + 4);
 
     if (flagsOrLen & 0x80000000) {
       // Extended 格式: flags(4) + length(4) + data
-      if (this.buffer.length < 12) return false;
+      if (this.bufferLength() < 12) return false;
       const flags = flagsOrLen & 0x7FFFFFFF;
-      const len = this.buffer.readUInt32BE(8);
-      if (len > 0x1000000) return false; // 256MB sanity limit
-      if (this.buffer.length < 12 + len) return false;
+      const len = this.buffer.readUInt32BE(this.readOffset + 8);
+      if (len > 0x1000000) {
+        // 畸形长度：等待只会永久卡死，直接报错断开
+        this.emitError(`剪贴板数据长度异常: ${len} 字节`);
+        this.disconnect();
+        return false;
+      }
+      if (this.bufferLength() < 12 + len) return false;
       this.clipboardCapabilities = flags;
-      const text = this.buffer.subarray(12, 12 + len).toString('utf8');
-      this.buffer = this.buffer.subarray(12 + len);
+      const text = this.buffer.subarray(this.readOffset + 12, this.readOffset + 12 + len).toString('utf8');
+      this.consume(12 + len);
       this.emit('clipboard', text);
     } else {
       // 标准格式: length(4) + data
       const len = flagsOrLen;
-      if (len > 0x1000000) return false;
-      if (this.buffer.length < 8 + len) return false;
-      const text = this.buffer.subarray(8, 8 + len).toString('utf8');
-      this.buffer = this.buffer.subarray(8 + len);
+      if (len > 0x1000000) {
+        this.emitError(`剪贴板数据长度异常: ${len} 字节`);
+        this.disconnect();
+        return false;
+      }
+      if (this.bufferLength() < 8 + len) return false;
+      const text = this.buffer.subarray(this.readOffset + 8, this.readOffset + 8 + len).toString('utf8');
+      this.consume(8 + len);
       this.emit('clipboard', text);
     }
     return true;
@@ -930,30 +953,26 @@ private lastBandwidth: number = 0; // bytes/sec
    *        1-byte number-of-screens(0xFF=unspecified), [screens...]
    */
   private processDesktopSize(): boolean {
-    if (this.buffer.length < 6) return false;
-    const width = this.buffer.readUInt16BE(2);
-    const height = this.buffer.readUInt16BE(4);
+    // 消息头: type(1) + padding(1) + width(2) + height(2) + numScreens(1)
+    if (this.bufferLength() < 7) return false;
+    const width = this.buffer.readUInt16BE(this.readOffset + 2);
+    const height = this.buffer.readUInt16BE(this.readOffset + 4);
+    const numScreens = this.buffer[this.readOffset + 6];
+
+    // 屏幕布局项固定 16 字节（id 4 + x/y/w/h 各 2 + flags 4），
+    // 必须等完整消息到达后再消费，否则会协议失步
+    let consumed = 7;
+    if (numScreens !== 0xFF) {
+      if (this.bufferLength() < consumed + numScreens * 16) return false;
+      consumed += numScreens * 16;
+    }
 
     // 更新帧缓冲大小
     this.fbWidth = width;
     this.fbHeight = height;
     this.initCoverage(width, height);
 
-    // 跳过消息头
-    let consumed = 6;
-
-    // 如果有屏幕布局信息，跳过
-    if (this.buffer.length >= consumed + 1) {
-      const numScreens = this.buffer[consumed];
-      consumed += 1;
-      // 每个屏幕 16 + 4 = 20 字节 (id + x + y + w + h + flags + name)
-      // 简化处理：跳过剩余所有数据
-      if (numScreens !== 0xFF && this.buffer.length >= consumed + numScreens * 20) {
-        consumed += numScreens * 20;
-      }
-    }
-
-    this.buffer = this.buffer.subarray(consumed);
+    this.consume(consumed);
     this.emit('desktop-size', { width, height });
     return true;
   }
@@ -967,13 +986,17 @@ private lastBandwidth: number = 0; // bytes/sec
    * 某些 VNC 服务器（如负载均衡器）会发送此消息让客户端连接到另一台服务器
    */
   private processClientRedirect(): boolean {
-    if (this.buffer.length < 10) return false;
-    const hostLen = this.buffer.readUInt32BE(2);
-    if (hostLen > MAX_REASON_LENGTH) return false;
-    if (this.buffer.length < 10 + hostLen) return false;
-    const host = this.buffer.subarray(6, 6 + hostLen).toString('utf8');
-    const port = this.buffer.readUInt32BE(6 + hostLen);
-    this.buffer = this.buffer.subarray(10 + hostLen);
+    if (this.bufferLength() < 10) return false;
+    const hostLen = this.buffer.readUInt32BE(this.readOffset + 2);
+    if (hostLen > MAX_REASON_LENGTH) {
+      this.emitError(`重定向消息长度异常: ${hostLen} 字节`);
+      this.disconnect();
+      return false;
+    }
+    if (this.bufferLength() < 10 + hostLen) return false;
+    const host = this.buffer.subarray(this.readOffset + 6, this.readOffset + 6 + hostLen).toString('utf8');
+    const port = this.buffer.readUInt32BE(this.readOffset + 6 + hostLen);
+    this.consume(10 + hostLen);
 
     console.log(`[RFB] 服务器重定向到 ${host}:${port}`);
     this.emit('redirect', { host, port });

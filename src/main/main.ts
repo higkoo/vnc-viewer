@@ -81,8 +81,18 @@ function createWindow(): void {
     webPreferences: {
       nodeIntegration: false,
       contextIsolation: true,
+      sandbox: true,
       preload: path.join(__dirname, 'preload.js'),
     },
+  });
+
+  // 安全：禁止窗口通过 window.open 打开新窗口
+  mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  // 安全：禁止页面导航到本地文件以外的地址（VNC Viewer 是本地应用，无需外跳）
+  mainWindow.webContents.on('will-navigate', (event, url) => {
+    if (!url.startsWith('file://')) {
+      event.preventDefault();
+    }
   });
 
   mainWindow.loadFile(path.join(__dirname, '..', 'renderer', 'index.html'));
@@ -266,6 +276,14 @@ function createWindow(): void {
 
 function setupIPC(): void {
   ipcMain.handle(IPC_CHANNELS.CONNECT, async (_event, params: ConnectionParams) => {
+    // 参数校验：host 必须非空字符串，port 必须为 1-65535 的整数，不合法直接拒绝
+    const hostValid = typeof params?.host === 'string' && params.host.trim().length > 0;
+    const portValid = Number.isInteger(params?.port) && (params as ConnectionParams).port >= 1 && (params as ConnectionParams).port <= 65535;
+    if (!hostValid || !portValid) {
+      warn(`连接参数非法: host=${JSON.stringify(params?.host)}, port=${JSON.stringify(params?.port)}`);
+      return { success: false, error: '连接参数非法：host 不能为空，port 必须为 1-65535 的整数' };
+    }
+
     if (rfbClient) {
       rfbClient.disconnect();
     }
@@ -288,32 +306,11 @@ function setupIPC(): void {
 
     // 帧缓冲更新：先累积到本帧，避免每个矩形都走一次 IPC
     rfbClient.on('framebuffer-update', (rect: FramebufferRect) => {
-      // 诊断：每帧首矩形打印像素采样
-      if (pendingFrameRects.length === 0 && rect.data.length >= 16) {
-        const d = rect.data;
-        info(`[DIAG] 帧首矩形 rect=(${rect.x},${rect.y},${rect.width}x${rect.height}) enc=${rect.encoding} dataLen=${rect.data.length}`);
-        info(`[DIAG] 前16像素RGBA: ${
-          Array.from({length: 4}, (_, i) => `(${d[i*4]},${d[i*4+1]},${d[i*4+2]},${d[i*4+3]})`).join(' ')
-        }`);
-      }
       pendingFrameRects.push(rect);
     });
 
-    // 帧缓冲完成：整帧收齐后批量发给渲染进程，再请求下一帧增量更新
-    // 同时在此处做诊断统计（帧率、更新请求频率），每秒输出一次汇总
-    let frameCount = 0;
-    let updateRequestCount = 0;
-    let lastDiagAt = Date.now();
+    // 帧缓冲完成：整帧收齐后批量发给渲染进程（不再输出高频 [DIAG] 日志，避免拖慢主进程）
     rfbClient.on('framebuffer-done', () => {
-      // --- 诊断统计 ---
-      frameCount++;
-      const now = Date.now();
-      if (now - lastDiagAt >= 1000) {
-        info(`[DIAG] 帧率: ${frameCount}帧/秒, 更新请求: ${updateRequestCount}次/秒, pendingRects=${pendingFrameRects.length}`);
-        frameCount = 0;
-        updateRequestCount = 0;
-        lastDiagAt = now;
-      }
       // --- 帧数据转发给渲染进程 ---
       // 注意：不在此处请求下一帧增量更新。
       // 帧请求由 RfbClient 内部的 pollTimer 统一调度，避免多路请求导致频率失控。
@@ -321,12 +318,12 @@ function setupIPC(): void {
         if (pendingFrameRects.length > 0) {
           const rects = pendingFrameRects;
           pendingFrameRects = [];
-          // IPC 传输前把每个矩形的 Buffer data 拷贝为新的 Uint8Array，
-          // 使用 Uint8Array.from 做拷贝以避免共享 ArrayBuffer 导致的偏移问题
+          // IPC 传输前用零拷贝视图包装 Buffer（不复制数据，仅引用原 ArrayBuffer 的偏移区间），
+          // Electron structured clone 会正确按视图边界序列化，避免共享 ArrayBuffer 的偏移问题
           mainWindow?.webContents.send(IPC_CHANNELS.FRAMEBUFFER_UPDATE, rects.map((r) => ({
             x: r.x, y: r.y, width: r.width, height: r.height,
             encoding: r.encoding,
-            data: Uint8Array.from(r.data),
+            data: new Uint8Array(r.data.buffer, r.data.byteOffset, r.data.byteLength),
           })));
         }
       }
@@ -341,11 +338,6 @@ function setupIPC(): void {
         info(`[SERVER-INFO] 像素格式: ${pf.bitsPerPixel}bpp depth=${pf.depth} ${pf.trueColor ? 'true-color' : 'indexed'} ${pf.bigEndian ? 'BE' : 'LE'}`);
         info(`[SERVER-INFO] R: max=${pf.redMax} shift=${pf.redShift}  G: max=${pf.greenMax} shift=${pf.greenShift}  B: max=${pf.blueMax} shift=${pf.blueShift}`);
       }
-    });
-
-    // 诊断：帧请求发送计数
-    rfbClient.on('update-request', () => {
-      updateRequestCount++;
     });
 
     // 解码异常后的画面重新同步：请求一次全量更新

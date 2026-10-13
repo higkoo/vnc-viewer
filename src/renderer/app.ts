@@ -48,6 +48,15 @@ enum ConnectionState {
   Error = 8,
 }
 
+// 响铃用的 AudioContext 单例：首次使用时才创建，之后复用（浏览器对 AudioContext 数量有限制）
+let audioContext: AudioContext | null = null;
+function getAudioContext(): AudioContext {
+  if (!audioContext) {
+    audioContext = new AudioContext();
+  }
+  return audioContext;
+}
+
 // ---- DOM 引用 ----
 function getEl<T extends HTMLElement>(id: string): T {
   return document.getElementById(id) as T;
@@ -273,9 +282,9 @@ function setupIPCListeners(): void {
   });
 
   vncApi.onBell(() => {
-    // 系统响铃
+    // 系统响铃（复用模块级单例 AudioContext，避免每次响铃新建导致资源泄漏）
     try {
-      const ctx = new AudioContext();
+      const ctx = getAudioContext();
       const osc = ctx.createOscillator();
       osc.type = 'sine';
       osc.frequency.value = 800;
@@ -495,15 +504,10 @@ function setupCanvasResize(): void {
 }
 
 // ---- 渲染 ----
-let totalRectsRendered = 0;
 function renderRect(rect: { x: number; y: number; width: number; height: number; data: number[] | Buffer; encoding: number }): void {
   if (!fbCanvas) {
     console.error('[RENDER] fbCanvas 为 null，跳过渲染');
     return;
-  }
-  totalRectsRendered++;
-  if (totalRectsRendered <= 5 || totalRectsRendered % 50 === 0) {
-    console.log(`[RENDER] rect #${totalRectsRendered}: (${rect.x},${rect.y},${rect.width}x${rect.height}) enc=${rect.encoding} dataType=${rect.data?.constructor?.name} dataLen=${rect.data?.length}`);
   }
 
   const ctx = canvas.getContext('2d')!;

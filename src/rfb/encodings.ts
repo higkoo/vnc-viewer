@@ -98,7 +98,15 @@ export class EncodingDecoders {
     if (this.zrleQueue.length === 0) return;
 
     const out = this.inflateAll();
-    if (out === null || out.length === 0) return;
+    if (out === null) {
+      // inflateSync 配合 Z_SYNC_FLUSH 对不完整流也能产出数据，
+      // 返回 null 说明流数据已损坏或超出输出上限；继续累积只会永久卡死
+      // 且累积缓冲无界增长，这里直接重置流状态并丢弃积压矩形
+      console.error('[RFB] ZRLE zlib 流解压失败，重置流状态并丢弃积压矩形');
+      this.resetStreams();
+      return;
+    }
+    if (out.length === 0) return;
 
     let cursor = this.zrleOutConsumed;
     let drained = 0;
@@ -486,16 +494,36 @@ export class EncodingDecoders {
           const rawLen = tw * th * cpi;
           if (buffer.length < offset + consumed + rawLen) return null;
 
-          for (let row = 0; row < th; row++) {
-            for (let col = 0; col < tw; col++) {
-              const color = this.readCPixel(
-                buffer, offset + consumed + (row * tw + col) * cpi, format, cpi
-              );
-              const dstOff = ((ty + row) * width + tx + col) * 4;
-              fb[dstOff] = color[0];
-              fb[dstOff + 1] = color[1];
-              fb[dstOff + 2] = color[2];
-              fb[dstOff + 3] = 255;
+          // 快路径：3 字节 CPIXEL + 小端 + 标准格式（红16/绿8/蓝0，三分量 8bit）
+          if (cpi === 3 && !format.bigEndian && format.trueColor &&
+              format.redMax === 255 && format.greenMax === 255 && format.blueMax === 255) {
+            const base = offset + consumed;
+            for (let row = 0; row < th; row++) {
+              const srcRow = base + row * tw * 3;
+              let dstOff = ((ty + row) * width + tx) * 4;
+              for (let col = 0; col < tw; col++) {
+                const s = srcRow + col * 3;
+                // 小端 3 字节 CPIXEL：线序 [低,中,高]，像素值 = b0 | b1<<8 | b2<<16
+                // 标准格式下 R 在高位字节（b2）、G 居中（b1）、B 在低位（b0）
+                fb[dstOff] = buffer[s + 2];     // R
+                fb[dstOff + 1] = buffer[s + 1]; // G
+                fb[dstOff + 2] = buffer[s];     // B
+                fb[dstOff + 3] = 255;
+                dstOff += 4;
+              }
+            }
+          } else {
+            for (let row = 0; row < th; row++) {
+              for (let col = 0; col < tw; col++) {
+                const color = this.readCPixel(
+                  buffer, offset + consumed + (row * tw + col) * cpi, format, cpi
+                );
+                const dstOff = ((ty + row) * width + tx + col) * 4;
+                fb[dstOff] = color[0];
+                fb[dstOff + 1] = color[1];
+                fb[dstOff + 2] = color[2];
+                fb[dstOff + 3] = 255;
+              }
             }
           }
           consumed += rawLen;
@@ -659,8 +687,25 @@ export class EncodingDecoders {
   ): Buffer {
     const bpp = format.bitsPerPixel / 8;
     const result = Buffer.alloc(width * height * 4);
+    const pixelCount = width * height;
 
-    for (let i = 0; i < width * height; i++) {
+    // 快路径：32bpp 小端真彩色且三分量均 8bit（握手时强制设置的标准格式）。
+    // 避免逐像素的函数调用、数组分配与 Math.round，Raw 全屏帧可快 5-10 倍
+    if (bpp === 4 && !format.bigEndian && format.trueColor &&
+        format.redMax === 255 && format.greenMax === 255 && format.blueMax === 255) {
+      const rs = format.redShift, gs = format.greenShift, bs = format.blueShift;
+      for (let i = 0; i < pixelCount; i++) {
+        const v = data.readUInt32LE(i * 4);
+        const dstOff = i * 4;
+        result[dstOff] = (v >>> rs) & 0xFF;
+        result[dstOff + 1] = (v >>> gs) & 0xFF;
+        result[dstOff + 2] = (v >>> bs) & 0xFF;
+        result[dstOff + 3] = 255;
+      }
+      return result;
+    }
+
+    for (let i = 0; i < pixelCount; i++) {
       const srcOff = i * bpp;
       const dstOff = i * 4;
 
@@ -681,13 +726,22 @@ export class EncodingDecoders {
     fb: Buffer, x: number, y: number, w: number, h: number,
     color: number[], fbWidth: number
   ): void {
-    for (let row = 0; row < h; row++) {
-      for (let col = 0; col < w; col++) {
-        const off = ((y + row) * fbWidth + x + col) * 4;
-        fb[off] = color[0];
-        fb[off + 1] = color[1];
-        fb[off + 2] = color[2];
-        fb[off + 3] = color[3];
+    if (w <= 0 || h <= 0) return;
+    // 第一行按字节填充，后续行整行内存拷贝（避免逐像素双循环）
+    const rowStart = (y * fbWidth + x) * 4;
+    const rowLen = w * 4;
+    for (let col = 0; col < w; col++) {
+      const off = rowStart + col * 4;
+      fb[off] = color[0];
+      fb[off + 1] = color[1];
+      fb[off + 2] = color[2];
+      fb[off + 3] = color[3];
+    }
+    if (h > 1) {
+      const firstRow = fb.subarray(rowStart, rowStart + rowLen);
+      const stride = fbWidth * 4;
+      for (let row = 1; row < h; row++) {
+        firstRow.copy(fb, rowStart + row * stride);
       }
     }
   }
@@ -747,21 +801,18 @@ export class EncodingDecoders {
       const jpegData = buffer.subarray(offset, offset + jpegLen);
 
       try {
-        // jpeg-js 解码返回 RGBA 格式 (BGRA 强制选项)
+        // jpeg-js 解码返回 RGBA 格式
         const decoded = jpeg.decode(jpegData, {
           useTArray: true,
           formatAsRGBA: true,
         });
-        const fb = Buffer.alloc(width * height * 4);
-        // jpeg-js 输出为 RGBA，VNC 使用 BGRA — 需要交换 R/B
-        for (let i = 0; i < width * height; i++) {
-          const src = i * 4;
-          const dst = i * 4;
-          fb[dst] = decoded.data[src + 2];     // B (from R)
-          fb[dst + 1] = decoded.data[src + 1]; // G
-          fb[dst + 2] = decoded.data[src];     // R (from B)
-          fb[dst + 3] = 255;                    // A
-        }
+        // 渲染端（ImageData）期望 R-first RGBA，与其他解码器输出一致，
+        // 无需交换 R/B（旧实现误交换导致 JPEG 区域红蓝颠倒）
+        const fb = Buffer.from(
+          decoded.data.buffer as ArrayBuffer,
+          decoded.data.byteOffset,
+          decoded.data.byteLength
+        );
         return { pixels: fb, consumed: 1 + lenBytes + jpegLen };
       } catch (err) {
         console.error('[RFB] Tight JPEG 解码失败:', err);

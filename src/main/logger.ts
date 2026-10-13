@@ -40,6 +40,56 @@ function formatTime(d: Date): string {
   return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}.${p(d.getMilliseconds(), 3)}`;
 }
 
+// 日志文件写入：缓冲批量异步写（累计超 4KB 或每 2s flush 一次），避免高频日志同步阻塞主进程
+const WRITE_BUF_LIMIT = 4 * 1024;
+const WRITE_FLUSH_INTERVAL = 2000;
+let writeBuf: string[] = [];
+let writeBufBytes = 0;
+let flushTimer: NodeJS.Timeout | null = null;
+
+function flushLogs(): void {
+  if (flushTimer) {
+    clearTimeout(flushTimer);
+    flushTimer = null;
+  }
+  if (writeBuf.length === 0) return;
+  const data = writeBuf.join('') + '\n';
+  writeBuf = [];
+  writeBufBytes = 0;
+  try {
+    fs.appendFile(getLogFile(), data, () => {
+      // ignore：异步写失败不影响运行
+    });
+  } catch {
+    // ignore
+  }
+}
+
+function appendLogLine(line: string): void {
+  writeBuf.push(line);
+  writeBufBytes += Buffer.byteLength(line, 'utf8') + 1;
+  if (writeBufBytes >= WRITE_BUF_LIMIT) {
+    flushLogs();
+  } else if (!flushTimer) {
+    flushTimer = setTimeout(flushLogs, WRITE_FLUSH_INTERVAL);
+    // 定时器不阳止进程退出
+    flushTimer.unref();
+  }
+}
+
+// 进程退出前把缓冲内的日志落盘
+process.on('exit', () => {
+  if (writeBuf.length > 0) {
+    try {
+      fs.appendFileSync(getLogFile(), writeBuf.join('') + '\n');
+    } catch {
+      // ignore
+    }
+    writeBuf = [];
+    writeBufBytes = 0;
+  }
+});
+
 export function log(level: LogLevel, msg: string): void {
   const entry: LogEntry = { time: formatTime(new Date()), level, msg };
   buffer.push(entry);
@@ -49,11 +99,11 @@ export function log(level: LogLevel, msg: string): void {
   } catch {
     // ignore：渲染进程尚未就绪
   }
-  // 输出到控制台 + 日志文件
+  // 输出到控制台 + 缓冲异步写入日志文件
   const line = `[${entry.time}] [${level.toUpperCase()}] ${msg}`;
   console.log(line);
   try {
-    fs.appendFileSync(getLogFile(), line + '\n');
+    appendLogLine(line);
   } catch {
     // ignore
   }

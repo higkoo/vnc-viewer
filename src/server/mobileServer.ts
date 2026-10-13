@@ -18,6 +18,22 @@ interface MobileSession {
 
 const sessions = new Map<WebSocket, MobileSession>();
 
+/**
+ * 同源校验：若请求带 Origin 头，则其主机部分必须与请求 Host 一致才放行；
+ * 无 Origin 的请求放行（兼容老客户端）。
+ * 返回 true 表示校验通过。
+ */
+function isSameOrigin(req: http.IncomingMessage): boolean {
+  const origin = req.headers.origin;
+  if (!origin) return true;
+  try {
+    const originHost = new URL(origin).host;
+    return originHost === (req.headers.host || "");
+  } catch {
+    return false;
+  }
+}
+
 function getMimeType(ext: string): string {
   const map: Record<string, string> = {
     ".html": "text/html; charset=utf-8",
@@ -41,6 +57,13 @@ export class MobileServer {
     this.setupWebSocket();
 
     this.httpServer.on("upgrade", (req, socket, head) => {
+      // WebSocket 握手同源校验：带 Origin 且与 Host 不一致则拒绝，防止跨站 WebSocket 劫持
+      if (!isSameOrigin(req)) {
+        warn(`[手机代理] WebSocket 握手被拒绝（跨站 Origin）: ${req.headers.origin}`);
+        socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
+        socket.destroy();
+        return;
+      }
       const url = req.url || "";
       if (url.startsWith("/proxy")) {
         this.wss.handleUpgrade(req, socket, head, (ws) => {
@@ -55,12 +78,18 @@ export class MobileServer {
   private handleHttp(req: http.IncomingMessage, res: http.ServerResponse): void {
     const pathname = (req.url || "/").split("?")[0];
 
+    // HTTP 请求同样做同源校验（带 Origin 且与 Host 不一致则拒绝）
+    if (!isSameOrigin(req)) {
+      warn(`[手机代理] HTTP 请求被拒绝（跨站 Origin）: ${req.headers.origin}`);
+      res.writeHead(403, { "Content-Type": "text/plain" });
+      res.end("Forbidden");
+      return;
+    }
+
     // 解析到允许的静态根目录内，规范化后校验真实路径，防止路径穿越
     let filePath: string;
     if (pathname === "/" || pathname === "/index.html") {
       filePath = path.join(MOBILE_ROOT, "index.html");
-    } else if (pathname === "/app.js") {
-      filePath = path.join(MOBILE_ROOT, "app.js");
     } else {
       // 仅允许移动端目录内的静态资源，并拒绝任何目录分隔符向上回溯
       const relative = pathname.replace(/^\/+/, "");
@@ -82,8 +111,8 @@ export class MobileServer {
       }
       res.writeHead(200, {
         "Content-Type": getMimeType(ext),
-        // 静态资源允许跨域；但该页面为项目自托管，不鼓励放开 CORS，仅用于调试。
-        "Access-Control-Allow-Origin": "*",
+        // CORS 仅回显同源校验通过的请求 Origin（不再使用通配符 *，避免接口被任意站点调用）
+        "Access-Control-Allow-Origin": req.headers.origin || "",
       });
       res.end(data);
     });
@@ -165,11 +194,13 @@ export class MobileServer {
     warn(`[手机代理] 命令错误: ${msg}`);
     if (session.ws.readyState !== WebSocket.OPEN) return;
     try {
-      const errBytes = Buffer.byteLength(msg, "utf8");
+      // 错误协议中长度字段只有 1 字节（uint8），消息超过 255 字节时截断，避免写出错包
+      // Buffer.write 传入 length 限制时不会写出半个多字节字符，截断是安全的
+      const errBytes = Math.min(Buffer.byteLength(msg, "utf8"), 255);
       const errMsg = Buffer.alloc(2 + errBytes);
       errMsg[0] = 0x02; // Error signal
       errMsg.writeUInt8(errBytes, 1);
-      errMsg.write(msg, 2, "utf8");
+      errMsg.write(msg, 2, errBytes, "utf8");
       session.ws.send(errMsg);
     } catch {
       // ignore

@@ -8,13 +8,15 @@
  */
 
 import { RfbClient } from './client';
-import { SecurityType, ConnectionState, RFB_VERSIONS, RfbVersion } from './types';
+import { SecurityType, EncodingType, ConnectionState, RFB_VERSIONS, RfbVersion } from './types';
 import { desEcbEncrypt } from './des';
 
 export class RfbHandshake {
   private client: RfbClient;
   private securityTypes: SecurityType[] = [];
   private authChallengeSent: boolean = false;
+  /** 已选择的安全类型（单一来源，避免多处优先级表不一致） */
+  private selectedSecurityType: SecurityType | null = null;
 
   constructor(client: RfbClient) {
     this.client = client;
@@ -162,6 +164,7 @@ export class RfbHandshake {
       this.client.send(buf);
     }
 
+    this.selectedSecurityType = selectedType;
     this.handleAuthentication(selectedType);
   }
 
@@ -195,9 +198,9 @@ export class RfbHandshake {
   }
 
   private handleAuthMSLogon(): void {
-    console.log('[RFB] MS-Logon 认证简化处理');
-    this.client.updateState(ConnectionState.ClientInit);
-    this.sendClientInit();
+    // MS-Logon 走 processPlainAuth 的明文认证路径（见 handleAuthentication），
+    // 保留占位避免误调用；实现见 processPlainAuth。
+    void this;
   }
 
   private reverseBits(b: number): number {
@@ -221,22 +224,9 @@ export class RfbHandshake {
     }
   }
 
-  /** 获取当前选择的安全类型 */
+  /** 获取当前选择的安全类型（以 handleSecurityType 保存的为准） */
   private getCurrentSecurityType(): SecurityType {
-    // 从 securityTypes 中选出的第一个即是已选类型
-    const priority = [
-      SecurityType.None,
-      SecurityType.VncAuth,
-      SecurityType.MSLogon,
-      SecurityType.Plain,
-      SecurityType.Tight,
-    ];
-    for (const pref of priority) {
-      if (this.securityTypes.includes(pref)) {
-        return pref;
-      }
-    }
-    return this.securityTypes[0] || SecurityType.Invalid;
+    return this.selectedSecurityType ?? this.securityTypes[0] ?? SecurityType.Invalid;
   }
 
   /**
@@ -323,14 +313,19 @@ export class RfbHandshake {
 
     const status = result.readUInt32BE(0);
     if (status !== 0) {
-      const reasonLenBuf = this.client.readBuffer(4);
-      if (reasonLenBuf) {
-        const len = reasonLenBuf.readUInt32BE(0);
-        if (len > 0 && len < 4096) {
-          const reason = this.client.readBuffer(len);
-          if (reason) {
-            this.client.emitError(`${failureMsg}: ${reason.toString('utf8')}`);
-            return;
+      // 原子性保护：失败原因必须完整可用才读取，
+      // 否则已消费的 result 字节会在重入时被误解析为长度 → 协议失步。
+      // 认证已失败，直接用通用错误信息报错（服务器随后会关闭连接）。
+      if (this.client.bufferLength() >= 4) {
+        const reasonLenBuf = this.client.readBuffer(4);
+        if (reasonLenBuf) {
+          const len = reasonLenBuf.readUInt32BE(0);
+          if (len > 0 && len < 4096 && this.client.bufferLength() >= len) {
+            const reason = this.client.readBuffer(len);
+            if (reason) {
+              this.client.emitError(`${failureMsg}: ${reason.toString('utf8')}`);
+              return;
+            }
           }
         }
       }
@@ -416,17 +411,21 @@ export class RfbHandshake {
 
     this.client.setFramebufferInfo(fbWidth, fbHeight, standardFormat, name);
 
-    // 诊断模式：仅请求 Raw 编码，排除压缩编码解码器导致的解析失败
-    // 如果 Raw 能正常显示，说明问题在 ZRLE/Tight 解码器
+    // 按优先级请求编码（服务器选择列表中第一个它支持的）：
+    // ZRLE 压缩率最高且现代服务器普遍支持，Hextile 作次选，CopyRect 复用
+    // 未变化区域，Raw 仅作最后兑底。此前仅请求 Raw（诊断模式遗留）导致
+    // 带宽放大数十倍，ZRLE/Hextile 解码器长期闲置。
     this.client.setEncodings([
-      0,    // Raw
-      1,    // CopyRect
-      0xFFFFFF11, // RichCursor
-      0xFFFFFF10, // Cursor
-      0xFFFFFF18, // PointerPos
-      0xFFFFFF20, // LastRect
-      0xFFFFFF21, // NewFBSize
-      0xFFFFFF22, // DesktopName
+      EncodingType.ZRLE,       // 16: Zlib 游程编码（首选）
+      EncodingType.Hextile,    // 5: 分块编码（次选）
+      EncodingType.CopyRect,   // 1: 区域复制
+      EncodingType.Raw,        // 0: 原始像素（兑底）
+      EncodingType.RichCursor, // 伪编码: 彩色光标
+      EncodingType.Cursor,     // 伪编码: 光标
+      EncodingType.PointerPos, // 伪编码: 指针位置
+      EncodingType.LastRect,   // 伪编码: 帧结束标记
+      EncodingType.NewFBSize,  // 伪编码: 分辨率变化
+      EncodingType.DesktopName,// 伪编码: 桌面名称
     ]);
 
     // 通知连接完成

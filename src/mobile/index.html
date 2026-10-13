@@ -5,7 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover">
 <meta name="theme-color" content="#1a1a2e">
 <title>VNC Viewer - 移动版</title>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/pako/2.1.0/pako.min.js"></script>
+<!-- pako 本地引用（复制自 node_modules/pako/dist/pako.min.js，随构建同步到 dist/mobile/vendor/） -->
+<script src="vendor/pako.min.js"></script>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body {
@@ -2038,6 +2039,8 @@ function toggleKeyboard() {
 // ====== 触摸事件处理 (增强: 平滑缩放 / 中心点锚定 / 平移跟随) ======
 let lastPinchCenterX = 0, lastPinchCenterY = 0;
 let lastPanX = 0, lastPanY = 0;
+// touchmove 发送 pointer 事件的节流时间戳（参考桌面端，限流至 15ms）
+let lastPointerSendTime = 0;
 
 function applyCanvasTransform() {
   canvas.style.width = (fbW * scale) + 'px';
@@ -2112,8 +2115,13 @@ canvas.addEventListener('touchmove', (e) => {
       lastPanX = e.touches[0].clientX;
       lastPanY = e.touches[0].clientY;
     } else {
-      if (client && client.connected) {
-        client.sendPointerEvent(x, y, 1);
+      // 节流：touchmove 触发频率高，限制 pointer 事件发送间隔至 15ms
+      const now = performance.now();
+      if (now - lastPointerSendTime >= 15) {
+        lastPointerSendTime = now;
+        if (client && client.connected) {
+          client.sendPointerEvent(x, y, 1);
+        }
       }
     }
   } else if (e.touches.length === 2 && isPanning) {

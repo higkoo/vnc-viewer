@@ -107,14 +107,15 @@
     "@capacitor/android": "^8.5.1",
     "@capacitor/cli": "^8.5.1",
     "@capacitor/core": "^8.5.1",
+    "@types/jpeg-js": "^0.3.0",
     "@types/ws": "^8.18.1",
     "electron": "~32.2.0",
     "electron-builder": "^26.15.3",
     "typescript": "^5.5.0"
   },
   "dependencies": {
-    "@types/jpeg-js": "^0.3.0",
     "jpeg-js": "^0.4.4",
+    "pako": "^2.2.0",
     "ws": "^8.21.3"
   }
 }
