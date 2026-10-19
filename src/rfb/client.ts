@@ -383,23 +383,21 @@ private lastBandwidth: number = 0; // bytes/sec
 
   private resetIdleTimer(): void {
     this.cancelIdleTimer();
-    // 预警定时器：超时前 10 秒打日志，方便诊断是定时器未重置还是服务端真无响应
-    // 注意：不能使用嵌套 setTimeout — 内层 setTimeout 返回的新 id 赋值给 this.idleTimer 后，
-    // 下次调用 resetIdleTimer 时 cancelIdleTimer 只能清除最新的 timer，导致旧的预警 timer 泄露。
-    // 解决方案：预警逻辑通过单次定时器 + 时间差判断实现。
+    // 空闲预警定时器：仅打印诊断日志，【不断开连接】。
+    //
+    // 背景：RFC 6143 规定服务器对"无画面变化"的增量更新请求可以不发送任何
+    // 响应。静态屏幕（用户阅读远程内容）是正常场景，此前据此断开连接
+    // （IDLE_TIMEOUT 后 emitError + disconnect）导致用户每 40 秒被踢线。
+    // 真实断线（服务器进程退出/网络中断）由 socket 的 close/error 事件捕获，
+    // 配合 setKeepAlive 的 TCP 保活兜底，无需应用层空闲判定。
     this.idleTimer = setTimeout(() => {
       if (this.state !== ConnectionState.Connected) return;
       const idleMs = Date.now() - this.lastDataAt;
       if (idleMs >= IDLE_TIMEOUT) {
-        // 真正超时
-        this.emitError('空闲超时：服务器长时间无响应');
-        this.disconnect();
-      } else {
-        // 预警阶段：还未到完整超时，重新设定精确剩余时间
-        console.warn(`[RFB] [IDLE-WARN] 即将空闲超时，距超时还有 ${((IDLE_TIMEOUT - idleMs) / 1000).toFixed(1)}s`);
-        this.resetIdleTimer();
+        console.warn(`[RFB] [IDLE-WARN] 已 ${(idleMs / 1000).toFixed(0)}s 未收到服务器数据（静态屏幕属正常，保持连接）`);
       }
-    }, IDLE_TIMEOUT - 10000);
+      this.resetIdleTimer();
+    }, IDLE_TIMEOUT);
   }
 
   private cancelIdleTimer(): void {
@@ -713,11 +711,29 @@ private lastBandwidth: number = 0; // bytes/sec
     }
 
     // ---- 第二阶段：整帧齐备，按线序统一处理 ----
+    // 先消费接收缓冲区（ZRLE 解码为异步，payload 已拷贝到 pending）
+    this.consume(cursor);
+
+    // ZRLE 矩形的 tile 数据经异步解压流产出，需等全部解齐再发 framebuffer-done，
+    // 否则静态屏幕下（服务器不再响应增量请求）首帧会永远卡在待转发队列
+    let zrleRemaining = 0;
+    let frameDoneSent = false;
+    const finishFrame = (): void => {
+      if (frameDoneSent) return;
+      frameDoneSent = true;
+      this.emit('framebuffer-done');
+      this.checkCoverageAndRequest();
+    };
+
     for (const p of pending) {
       if (p.kind === 'zrle') {
+        zrleRemaining++;
         this.encoders.feedZrle(
           p.payload!, p.x, p.y, p.width, p.height, this.pixelFormat,
-          (rect) => this.emit('framebuffer-update', rect)
+          (rect) => this.emit('framebuffer-update', rect),
+          () => {
+            if (--zrleRemaining === 0) finishFrame();
+          }
         );
       } else if (p.kind === 'decode') {
         this.currentEncoding = p.encoding;
@@ -730,9 +746,7 @@ private lastBandwidth: number = 0; // bytes/sec
       }
     }
 
-    this.consume(cursor);
-    this.emit('framebuffer-done');
-    this.checkCoverageAndRequest();
+    if (zrleRemaining === 0) finishFrame();
     return true;
   }
 

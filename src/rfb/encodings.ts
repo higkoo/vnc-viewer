@@ -26,95 +26,187 @@ export class EncodingDecoders {
   /**
    * ZRLE 持久化 zlib 流状态。
    *
-   * 服务器（x11vnc / TigerVNC）通常跨矩形复用同一个 zlib 流：首块带 zlib 头，
-   * 后续块是 raw deflate 续流并以 Z_SYNC_FLUSH 结尾。
+   * RFC 6143 §7.7.6 明确规定：「整个 RFB 连接共用单一 zlib 流对象，ZRLE
+   * 矩形必须严格按序解码；服务器在每个矩形结束时把 zlib 流 flush 到字节
+   * 边界」。因此第 2+ 个矩形的压缩数据可能反向引用前面矩形的像素
+   * （deflate 滑动窗口），必须用一个跨矩形存活的 Inflate 流持续喂入，
+   * 不能每帧/每矩形用全新 inflater 单独解压。
    *
-   * 这里采用「全缓冲区重复解压」模型：
-   * - 每到达一个矩形的压缩数据就追加到累积缓冲；
-   * - 每次把累积的全部压缩数据交给 zlib 重新解压——zlib 自己维护滑动窗口与
-   *   回溯引用状态，无需手动管理 32KB 字典，从根源消除字典失配导致的像素错位；
-   * - 解压输出中只取「上次已消费位置之后」的新数据解析矩形，避免重复解析；
-   * - 全部矩形解出后清空累积缓冲，防止无界增长。
+   * 旧实现「队列清空即清空累积缓冲」导致后续矩形解压必败
+   * （invalid distance too far back），画面只剩零星补丁 —— 已按本标准重写。
    *
-   * 复杂度 O(n²)（n = 矩形数），但 VNC 帧通常 < 30 矩形、累积压缩数据 < 1MB，
-   * 重复解压耗时在毫秒级，可忽略。
+   * 两个实现要点：
+   * 1. Node 的 zlib 流输出经事件循环异步到达（write/flush 后当轮取不到），
+   *    因此每次 'data' / write 完成回调都调度一次延迟 drain，而不是假设
+   *    写入后输出立即可用；
+   * 2. 每个排队的矩形带 onComplete 回调（解出/丢弃时触发），供客户端
+   *    判断「整帧 ZRLE 矩形已齐备」再发 framebuffer-done，避免静态屏幕
+   *    下首帧被卡在待转发队列里。
+   *
+   * 兼容两种服务器行为：
+   * - 共享流 + 每矩形 Z_SYNC_FLUSH（TigerVNC / x11vnc / libvncserver）；
+   * - 每矩形独立完整流（Z_FINISH，检测到流结束后自动开新流）。
    */
-  /** 累积的全部压缩数据（从连接/帧开始） */
-  private zrleAccumulated: Buffer = Buffer.alloc(0);
-  /** 已解压输出中已被解析消费的字节数 */
-  private zrleOutConsumed: number = 0;
+  /** 持久解压流（跨 ZRLE 矩形存活） */
+  private zrleInflate: zlib.Inflate | null = null;
+  /** 当前流是否已结束（Z_FINISH），下一个矩形需开新流 */
+  private zrleStreamEnded = false;
+  /** 当前流是否已损坏（需重置后重开） */
+  private zrleStreamFailed = false;
+  /** 当前流是否已产出过输出（用于 raw deflate 兜底判断） */
+  private zrleStreamGotOutput = false;
+  /** 当前流是否已尝试过 raw deflate 兜底 */
+  private zrleTriedRaw = false;
+  /** 最近一次写入的压缩块（raw 兜底重试用） */
+  private zrleLastChunk: Buffer | null = null;
+  /** 解压输出累积缓冲（仅保留未消费部分） */
+  private zrleOut: Buffer = Buffer.alloc(0);
+  /** 解压输出中已被 tile 解析消费的字节数 */
+  private zrleOutPos = 0;
   /** 已喂入压缩数据、等待 tile 数据齐备的矩形 */
   private zrleQueue: {
     x: number; y: number; width: number; height: number; format: PixelFormat;
+    emit: (rect: FramebufferRect) => void;
+    onComplete?: () => void;
   }[] = [];
+  /** 延迟 drain 是否已调度（合并多来源触发） */
+  private zrleDrainScheduled = false;
   private static readonly MAX_OUTPUT = 64 * 1024 * 1024;
 
   /** 新建连接或重连时重置流状态 */
   resetStreams(): void {
-    this.zrleAccumulated = Buffer.alloc(0);
-    this.zrleOutConsumed = 0;
+    // 通知所有等待中的矩形完成回调，避免客户端帧流程卡死
+    const queue = this.zrleQueue;
     this.zrleQueue = [];
+    for (const q of queue) {
+      try { q.onComplete?.(); } catch { /* 忽略 */ }
+    }
+    if (this.zrleInflate) {
+      try { this.zrleInflate.destroy(); } catch { /* 忽略 */ }
+    }
+    this.zrleInflate = null;
+    this.zrleStreamEnded = false;
+    this.zrleStreamFailed = false;
+    this.zrleStreamGotOutput = false;
+    this.zrleTriedRaw = false;
+    this.zrleLastChunk = null;
+    this.zrleOut = Buffer.alloc(0);
+    this.zrleOutPos = 0;
   }
 
   /**
    * 喂入一个 ZRLE 矩形的压缩数据。
    *
-   * 把压缩块追加到累积缓冲，记录矩形元信息，然后尝试从解压输出中解出积压矩形。
+   * 把压缩块写入持久解压流（服务器跨矩形复用同一 zlib 流），
+   * 记录矩形元信息与回调，输出异步到达后自动排空解码。
    */
   feedZrle(
     compressed: Buffer,
     x: number, y: number, width: number, height: number,
     format: PixelFormat,
-    emit: (rect: FramebufferRect) => void
+    emit: (rect: FramebufferRect) => void,
+    onComplete?: () => void
   ): void {
-    this.zrleAccumulated = Buffer.concat([this.zrleAccumulated, compressed]);
-    this.zrleQueue.push({ x, y, width, height, format });
-    this.drainZrle(emit);
+    this.zrleQueue.push({ x, y, width, height, format, emit, onComplete });
+    this.pushCompressed(compressed);
+    // 同步尝试一次（数据极小或流已就绪时可直接解出），
+    // 主要解码由 'data'/write 回调调度的延迟 drain 完成
+    this.drainZrle();
   }
 
-  /** 解压当前累积的全部压缩数据 */
-  private inflateAll(): Buffer | null {
-    if (this.zrleAccumulated.length === 0) return null;
-    try {
-      return zlib.inflateSync(this.zrleAccumulated, {
-        finishFlush: zlib.constants.Z_SYNC_FLUSH,
-        maxOutputLength: EncodingDecoders.MAX_OUTPUT,
-      });
-    } catch (err) {
-      // 兜底：首块可能为 raw deflate（无 zlib 头）
-      try {
-        return zlib.inflateRawSync(this.zrleAccumulated, {
-          finishFlush: zlib.constants.Z_SYNC_FLUSH,
-          maxOutputLength: EncodingDecoders.MAX_OUTPUT,
-        });
-      } catch (e) {
-        return null;
-      }
+  /** 向持久解压流写入压缩数据，解压输出经 'data' 事件异步进入 zrleOut */
+  private pushCompressed(chunk: Buffer): void {
+    if (chunk.length === 0) return;
+
+    // 流已结束（服务器逐矩形完整压缩）或已损坏或尚未建立：开新流
+    if (this.zrleInflate === null || this.zrleStreamEnded || this.zrleStreamFailed) {
+      this.openInflateStream(false);
     }
+    const stream = this.zrleInflate;
+    if (!stream) return;
+    this.zrleLastChunk = chunk;
+    try {
+      stream.write(chunk, () => this.scheduleDrain());
+    } catch { /* 忽略，等待 error 事件处理 */ }
+  }
+
+  /** 建立新的持久解压流（zlib 或 raw deflate） */
+  private openInflateStream(raw: boolean): void {
+    if (this.zrleInflate) {
+      try { this.zrleInflate.destroy(); } catch { /* 忽略 */ }
+    }
+    this.zrleStreamEnded = false;
+    this.zrleStreamFailed = false;
+    this.zrleStreamGotOutput = false;
+    const stream = raw
+      ? zlib.createInflateRaw({ finishFlush: zlib.constants.Z_SYNC_FLUSH })
+      : zlib.createInflate({ finishFlush: zlib.constants.Z_SYNC_FLUSH });
+    stream.on('data', (c: Buffer) => {
+      this.zrleStreamGotOutput = true;
+      this.appendOut(c);
+      this.scheduleDrain();
+    });
+    stream.on('end', () => {
+      // 完整流结束（服务器逐矩形独立压缩）：下一个矩形开新流
+      this.zrleStreamEnded = true;
+      this.scheduleDrain();
+    });
+    stream.on('error', () => {
+      // 首块即失败且尚无输出：疑似 raw deflate（无 zlib 头），兜底重试一次
+      if (!this.zrleTriedRaw && !this.zrleStreamGotOutput && this.zrleLastChunk) {
+        this.zrleTriedRaw = true;
+        const chunk = this.zrleLastChunk;
+        this.openInflateStream(true);
+        try {
+          this.zrleInflate?.write(chunk, () => this.scheduleDrain());
+        } catch { /* 放弃 */ }
+        return;
+      }
+      // 流损坏：标记失败，由 drainZrle 清理后下个矩形重开流
+      this.zrleStreamFailed = true;
+      this.scheduleDrain();
+    });
+    this.zrleInflate = stream;
+  }
+
+  /** 累积解压输出（超限视为损坏数据，整体重置） */
+  private appendOut(chunk: Buffer): void {
+    this.zrleOut = this.zrleOut.length === 0
+      ? chunk
+      : Buffer.concat([this.zrleOut, chunk]);
+    if (this.zrleOut.length - this.zrleOutPos > EncodingDecoders.MAX_OUTPUT) {
+      console.error('[RFB] ZRLE 解压输出超限，重置流状态');
+      this.resetStreams();
+    }
+  }
+
+  /** 调度一次延迟 drain（合并 'data' / write 回调 / end / error 多来源） */
+  private scheduleDrain(): void {
+    if (this.zrleDrainScheduled) return;
+    this.zrleDrainScheduled = true;
+    setImmediate(() => {
+      this.zrleDrainScheduled = false;
+      this.drainZrle();
+    });
   }
 
   /** 从解压输出中尽可能多地解出积压矩形的 tile 数据 */
-  private drainZrle(emit: (rect: FramebufferRect) => void): void {
-    if (this.zrleQueue.length === 0) return;
-
-    const out = this.inflateAll();
-    if (out === null) {
-      // inflateSync 配合 Z_SYNC_FLUSH 对不完整流也能产出数据，
-      // 返回 null 说明流数据已损坏或超出输出上限；继续累积只会永久卡死
-      // 且累积缓冲无界增长，这里直接重置流状态并丢弃积压矩形
-      console.error('[RFB] ZRLE zlib 流解压失败，重置流状态并丢弃积压矩形');
+  private drainZrle(): void {
+    if (this.zrleStreamFailed) {
+      // 流已损坏：丢弃全部积压矩形，下个矩形重开流
       this.resetStreams();
       return;
     }
-    if (out.length === 0) return;
+    if (this.zrleQueue.length === 0) return;
 
-    let cursor = this.zrleOutConsumed;
+    let cursor = this.zrleOutPos;
     let drained = 0;
 
-    for (const q of this.zrleQueue) {
-      const res = this.decodeZRLETiles(out, cursor, q.width, q.height, q.format);
-      if (res === null) break; // tile 数据尚未解出，等待后续块
-      emit({
+    while (drained < this.zrleQueue.length) {
+      const q = this.zrleQueue[drained];
+      const res = this.decodeZRLETiles(this.zrleOut, cursor, q.width, q.height, q.format);
+      if (res === null) break; // tile 数据尚未解出，等待后续压缩块
+      q.emit({
         x: q.x, y: q.y, width: q.width, height: q.height,
         encoding: EncodingType.ZRLE, data: res.pixels,
       } as FramebufferRect);
@@ -124,13 +216,23 @@ export class EncodingDecoders {
 
     if (drained === 0) return;
 
-    this.zrleOutConsumed = cursor;
+    // 触发已完成矩形的完成回调（客户端据此判断整帧齐备）
+    const done = this.zrleQueue.slice(0, drained);
     this.zrleQueue = this.zrleQueue.slice(drained);
+    for (const q of done) {
+      try { q.onComplete?.(); } catch { /* 忽略 */ }
+    }
 
-    // 全部解出：重置累积，避免无界增长
-    if (this.zrleQueue.length === 0) {
-      this.zrleAccumulated = Buffer.alloc(0);
-      this.zrleOutConsumed = 0;
+    this.zrleOutPos = cursor;
+
+    // 压缩回收：已全部消费时直接清空；残留过多时丢弃已消费前缀
+    // （持久 Inflate 自带滑动窗口，丢弃旧输出不影响后续解压）
+    if (this.zrleOutPos >= this.zrleOut.length) {
+      this.zrleOut = Buffer.alloc(0);
+      this.zrleOutPos = 0;
+    } else if (this.zrleOutPos > 4 * 1024 * 1024) {
+      this.zrleOut = this.zrleOut.subarray(this.zrleOutPos);
+      this.zrleOutPos = 0;
     }
   }
 
