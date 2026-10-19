@@ -149,6 +149,8 @@ export class EncodingDecoders {
         return this.decodeCopyRect(buffer, offset);
       case EncodingType.RRE:
         return this.decodeRRE(buffer, offset, width, height, format);
+      case EncodingType.CoRRE:
+        return this.decodeCoRRE(buffer, offset, width, height, format);
       case EncodingType.Hextile:
         return this.decodeHextile(buffer, offset, width, height, format);
       case EncodingType.Tight:
@@ -160,6 +162,78 @@ export class EncodingDecoders {
         // 未知编码，尝试跳过
         return null;
     }
+  }
+
+  /**
+   * CoRRE 编码 (Compressed RRE)
+   *
+   * UltraVNC 变体 —— 经 REA 反编译 vncviewer.exe 的 FramebufferUpdate
+   * 分发器（case 4）在指令级确认，与 RFC 6143 §7.7.4 的 zlib 压缩格式
+   * **不同**：
+   *   4 字节 numSubRects (BE)
+   *   bytesPerPixel 字节背景像素
+   *   numSubRects × (bytesPerPixel + 4) 字节，每个子矩形：
+   *     bytesPerPixel 字节前景像素 + x(1) + y(1) + w(1) + h(1)
+   * 坐标为无符号单字节、相对矩形原点，无 zlib 压缩。
+   * 子矩形数量上限 20000000（与 UltraVNC 一致）。
+   *
+   * 兼容性：若检测到数据以 zlib 头开始（0x78 且校验位有效），说明服务端
+   * 发送的是 RFC 6143 标准 CoRRE（zlib 流 + 2 字节坐标），本实现不支持，
+   * 返回 null 交由帧恢复逻辑处理，避免协议失步。
+   */
+  private decodeCoRRE(
+    buffer: Buffer, offset: number,
+    width: number, height: number, format: PixelFormat
+  ): DecodeResult | null {
+    const bpp = Math.ceil(format.bitsPerPixel / 8);
+    if (buffer.length < offset + 4 + bpp) return null;
+
+    const numSubRects = buffer.readUInt32BE(offset);
+    const bgColor = this.readPixel(buffer, offset + 4, format);
+    let consumed = 4 + bpp;
+
+    // 整个矩形先铺背景色（与 UltraVNC FillSolidRect 行为一致）
+    const fb = Buffer.alloc(width * height * 4);
+    this.fillRect(fb, 0, 0, width, height, bgColor, width);
+
+    if (numSubRects === 0) return { pixels: fb, consumed };
+    if (numSubRects > 20000000) {
+      console.error(`[RFB] CoRRE 子矩形数量异常: ${numSubRects}`);
+      return null;
+    }
+
+    // RFC 6143 标准 CoRRE 检测：数据以 zlib 流开始
+    if (buffer.length >= offset + consumed + 2) {
+      const b0 = buffer[offset + consumed];
+      const b1 = buffer[offset + consumed + 1];
+      if (b0 === 0x78 && (((b0 << 8) | b1) % 31 === 0)) {
+        console.warn('[RFB] CoRRE: 检测到 RFC 6143 标准 zlib 格式（暂不支持，仅支持 UltraVNC 紧凑格式）');
+        return null;
+      }
+    }
+
+    const entrySize = bpp + 4;
+    const totalLen = entrySize * numSubRects;
+    if (buffer.length < offset + consumed + totalLen) return null;
+
+    for (let i = 0; i < numSubRects; i++) {
+      const entryOff = offset + consumed + i * entrySize;
+      const fgColor = this.readPixel(buffer, entryOff, format);
+      const sx = buffer[entryOff + bpp];
+      const sy = buffer[entryOff + bpp + 1];
+      const sw = buffer[entryOff + bpp + 2];
+      const sh = buffer[entryOff + bpp + 3];
+      // 坐标相对矩形原点，裁剪到矩形范围内（UltraVNC FillSolidRect 同样做边界裁剪）
+      const x = Math.min(sx, width);
+      const y = Math.min(sy, height);
+      const w = Math.min(sw, width - x);
+      const h = Math.min(sh, height - y);
+      if (w > 0 && h > 0) {
+        this.fillRect(fb, x, y, w, h, fgColor, width);
+      }
+    }
+
+    return { pixels: fb, consumed: consumed + totalLen };
   }
 
   /**
@@ -256,6 +330,11 @@ export class EncodingDecoders {
    *   bit 2: ForegroundSpecified
    *   bit 3: AnySubrects
    *   bit 4: SubrectsColoured
+   *   bit 5: (UltraVNC 扩展) 本 tile 为 zlib 压缩的原始像素流
+   *   bit 6: (UltraVNC 扩展) 本 tile 为 zlib 压缩的标准 Hextile tile 数据
+   * UltraVNC 扩展位（0x20/0x40）经 REA 反编译 vncviewer.exe 的 Hextile
+   * 解码器（按 8/16/32bpp 三份变体）确认：后跟 2 字节大端压缩长度，
+   * 再跟 zlib 数据；Raw 位优先于扩展位。
    */
   private decodeHextile(
     buffer: Buffer, offset: number,
@@ -271,8 +350,7 @@ export class EncodingDecoders {
     // 某 tile 未携带 BackgroundSpecified / ForegroundSpecified 时，应沿用
     // 上一 tile 的颜色。原实现对每个 tile 都从黑色重算，导致第二块起
     // 出现黑底/错色（服务端普遍依赖该状态以压缩数据）。
-    let prevBg: number[] = [0, 0, 0, 255];
-    let prevFg: number[] = [0, 0, 0, 255];
+    const tileState = { bg: [0, 0, 0, 255] as number[], fg: [0, 0, 0, 255] as number[] };
 
     // 处理 16x16 的块
     for (let ty = 0; ty < height; ty += 16) {
@@ -287,10 +365,65 @@ export class EncodingDecoders {
         remaining--;
 
         const isRaw = (subEnc & 0x01) !== 0;
-        const bgSpec = (subEnc & 0x02) !== 0;
-        const fgSpec = (subEnc & 0x04) !== 0;
-        const anySub = (subEnc & 0x08) !== 0;
-        const subCol = (subEnc & 0x10) !== 0;
+        // UltraVNC 扩展：zlib 压缩 tile（Raw 位优先）
+        const isZlibRaw = !isRaw && (subEnc & 0x20) !== 0;
+        const isZlibTile = !isRaw && !isZlibRaw && (subEnc & 0x40) !== 0;
+
+        if (isZlibRaw) {
+          // UltraVNC: 2 字节压缩长度 + zlib(tw*th*bpp 原始像素)
+          if (remaining < 2) return null;
+          const compLen = buffer.readUInt16BE(offset + consumed);
+          consumed += 2;
+          remaining -= 2;
+          if (remaining < compLen) return null;
+          let rawData: Buffer;
+          try {
+            rawData = zlib.inflateSync(
+              buffer.subarray(offset + consumed, offset + consumed + compLen),
+              { finishFlush: zlib.constants.Z_SYNC_FLUSH },
+            );
+          } catch (err) {
+            console.error('[RFB] Hextile(zlibRaw) 解压失败:', err);
+            return null;
+          }
+          consumed += compLen;
+          remaining -= compLen;
+          const rawLen = tw * th * bpp;
+          if (rawData.length < rawLen) return null;
+          const rgbaData = this.convertToRGBA(rawData.subarray(0, rawLen), tw, th, format);
+          for (let row = 0; row < th; row++) {
+            const srcOff = row * tw * 4;
+            const dstOff = ((ty + row) * width + tx) * 4;
+            rgbaData.copy(fb, dstOff, srcOff, srcOff + tw * 4);
+          }
+          continue;
+        }
+
+        if (isZlibTile) {
+          // UltraVNC: 2 字节压缩长度 + zlib(标准 Hextile tile 数据)
+          if (remaining < 2) return null;
+          const compLen = buffer.readUInt16BE(offset + consumed);
+          consumed += 2;
+          remaining -= 2;
+          if (remaining < compLen) return null;
+          let tileData: Buffer;
+          try {
+            tileData = zlib.inflateSync(
+              buffer.subarray(offset + consumed, offset + consumed + compLen),
+              { finishFlush: zlib.constants.Z_SYNC_FLUSH },
+            );
+          } catch (err) {
+            console.error('[RFB] Hextile(zlibTile) 解压失败:', err);
+            return null;
+          }
+          consumed += compLen;
+          remaining -= compLen;
+          const res = this.decodeHextileTileBody(
+            tileData, 0, tw, th, subEnc, format, fb, tx, ty, width, tileState
+          );
+          if (res === null) return null;
+          continue;
+        }
 
         if (isRaw) {
           // Raw tile (RFC 6143 §7.7.3): Raw 位置位时后续直接是像素数据，
@@ -311,63 +444,91 @@ export class EncodingDecoders {
           continue;
         }
 
-        // 背景色：本 tile 指定则更新状态；否则沿用上一 tile 的背景色
-        if (bgSpec) {
-          if (remaining < bpp) return null;
-          prevBg = this.readPixel(buffer, offset + consumed, format);
-          consumed += bpp;
-          remaining -= bpp;
-        }
-        // 前景色同理
-        if (fgSpec) {
-          if (remaining < bpp) return null;
-          prevFg = this.readPixel(buffer, offset + consumed, format);
-          consumed += bpp;
-          remaining -= bpp;
-        }
-
-        // 整个 tile 先铺背景（含「本 tile 未显式发背景」的延续背景）
-        this.fillRect(fb, tx, ty, tw, th, prevBg, width);
-
-        // 子矩形用前景覆盖
-        if (anySub) {
-          const numSubRects = buffer[offset + consumed];
-          consumed++;
-          remaining--;
-
-          for (let s = 0; s < numSubRects; s++) {
-            let scolor = prevFg;
-            if (subCol) {
-              if (remaining < bpp + 2) return null;
-              scolor = this.readPixel(buffer, offset + consumed, format);
-              consumed += bpp;
-              remaining -= bpp;
-            } else {
-              if (remaining < 2) return null;
-            }
-
-            // 子矩形位置和大小编码在2字节中
-            const posByte = buffer[offset + consumed];
-            const sizeByte = buffer[offset + consumed + 1];
-            consumed += 2;
-            remaining -= 2;
-
-            const sx = (posByte >> 4) & 0x0F;
-            const sy = posByte & 0x0F;
-            const sw = (sizeByte >> 4) & 0x0F;
-            const sh = sizeByte & 0x0F;
-
-            // 限制子矩形在块范围内
-            const actualSw = Math.min(sw + 1, tw - sx);
-            const actualSh = Math.min(sh + 1, th - sy);
-
-            this.fillRect(fb, tx + sx, ty + sy, actualSw, actualSh, scolor, width);
-          }
-        }
+        // 标准 Hextile tile：从主缓冲区解析
+        const res = this.decodeHextileTileBody(
+          buffer, offset + consumed, tw, th, subEnc, format, fb, tx, ty, width, tileState
+        );
+        if (res === null) return null;
+        consumed += res.consumed;
+        remaining -= res.consumed;
       }
     }
 
     return { pixels: fb, consumed };
+  }
+
+  /**
+   * 解析标准 Hextile tile 体（背景/前景/子矩形），写入帧缓冲。
+   * 数据可来自主缓冲区（普通 tile）或解压后的缓冲区（UltraVNC zlib tile）。
+   * @returns 消耗的字节数；数据不足返回 null
+   */
+  private decodeHextileTileBody(
+    data: Buffer, dataOffset: number,
+    tw: number, th: number, subEnc: number,
+    format: PixelFormat, fb: Buffer,
+    tx: number, ty: number, width: number,
+    tileState: { bg: number[]; fg: number[] },
+  ): { consumed: number } | null {
+    const bpp = format.bitsPerPixel / 8;
+    let pos = 0;
+    const avail = () => data.length - dataOffset - pos;
+
+    const bgSpec = (subEnc & 0x02) !== 0;
+    const fgSpec = (subEnc & 0x04) !== 0;
+    const anySub = (subEnc & 0x08) !== 0;
+    const subCol = (subEnc & 0x10) !== 0;
+
+    // 背景色：本 tile 指定则更新状态；否则沿用上一 tile 的背景色
+    if (bgSpec) {
+      if (avail() < bpp) return null;
+      tileState.bg = this.readPixel(data, dataOffset + pos, format);
+      pos += bpp;
+    }
+    // 前景色同理
+    if (fgSpec) {
+      if (avail() < bpp) return null;
+      tileState.fg = this.readPixel(data, dataOffset + pos, format);
+      pos += bpp;
+    }
+
+    // 整个 tile 先铺背景（含「本 tile 未显式发背景」的延续背景）
+    this.fillRect(fb, tx, ty, tw, th, tileState.bg, width);
+
+    // 子矩形用前景覆盖
+    if (anySub) {
+      if (avail() < 1) return null;
+      const numSubRects = data[dataOffset + pos];
+      pos++;
+
+      for (let s = 0; s < numSubRects; s++) {
+        let scolor = tileState.fg;
+        if (subCol) {
+          if (avail() < bpp + 2) return null;
+          scolor = this.readPixel(data, dataOffset + pos, format);
+          pos += bpp;
+        } else {
+          if (avail() < 2) return null;
+        }
+
+        // 子矩形位置和大小编码在2字节中
+        const posByte = data[dataOffset + pos];
+        const sizeByte = data[dataOffset + pos + 1];
+        pos += 2;
+
+        const sx = (posByte >> 4) & 0x0F;
+        const sy = posByte & 0x0F;
+        const sw = (sizeByte >> 4) & 0x0F;
+        const sh = sizeByte & 0x0F;
+
+        // 限制子矩形在块范围内
+        const actualSw = Math.min(sw + 1, tw - sx);
+        const actualSh = Math.min(sh + 1, th - sy);
+
+        this.fillRect(fb, tx + sx, ty + sy, actualSw, actualSh, scolor, width);
+      }
+    }
+
+    return { consumed: pos };
   }
 
   /**

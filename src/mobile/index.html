@@ -619,6 +619,8 @@ class Encodings {
   }
 
   static decodeRRE(data, x, y, w, h, fb, fbWidth) {
+    // RFC 6143 §7.7.2：子矩形坐标/宽高均为 2 字节大端（UltraVNC 实现一致，
+    // 经反编译确认；旧实现误用 1 字节坐标）。
     let pos = 0;
     const numSubrects = data.readUInt32BE(pos); pos += 4;
     const bgB = data[pos++], bgG = data[pos++], bgR = data[pos++];
@@ -634,7 +636,10 @@ class Encodings {
     }
     for (let i = 0; i < numSubrects; i++) {
       const fgB = data[pos++], fgG = data[pos++], fgR = data[pos++];
-      const sx = data[pos++], sy = data[pos++], sw = data[pos++], sh = data[pos++];
+      const sx = data.readUInt16BE(pos); pos += 2;
+      const sy = data.readUInt16BE(pos); pos += 2;
+      const sw = data.readUInt16BE(pos); pos += 2;
+      const sh = data.readUInt16BE(pos); pos += 2;
       for (let row = 0; row < sh; row++) {
         const dst = ((y + sy + row) * fbWidth + (x + sx)) * 4;
         for (let col = 0; col < sw; col++) {
@@ -645,6 +650,56 @@ class Encodings {
         }
       }
     }
+  }
+
+  static decodeCoRRE(buf, pos, x, y, w, h, fb, fbWidth) {
+    // CoRRE — UltraVNC 紧凑变体（经 REA 反编译 vncviewer.exe 指令级确认，
+    // 与 RFC 6143 的 zlib 格式不同）：
+    //   4 字节 numSubRects (BE) + 3 字节背景像素
+    //   numSubRects × (3 字节前景像素 + x(1) + y(1) + w(1) + h(1))
+    if (buf.length < pos + 7) return null;
+    const numSub = (buf[pos] << 24) | (buf[pos + 1] << 16) | (buf[pos + 2] << 8) | buf[pos + 3];
+    pos += 4;
+    if (numSub > 20000000) return null;
+    const bgB = buf[pos++], bgG = buf[pos++], bgR = buf[pos++];
+    for (let row = 0; row < h; row++) {
+      const dst = ((y + row) * fbWidth + x) * 4;
+      for (let col = 0; col < w; col++) {
+        fb[dst + col * 4] = bgB;
+        fb[dst + col * 4 + 1] = bgG;
+        fb[dst + col * 4 + 2] = bgR;
+        fb[dst + col * 4 + 3] = 255;
+      }
+    }
+    if (numSub === 0) return pos;
+    // RFC 6143 标准 CoRRE（zlib）检测：数据以 zlib 头开始则暂不支持
+    if (buf.length >= pos + 2) {
+      const b0 = buf[pos], b1 = buf[pos + 1];
+      if (b0 === 0x78 && (((b0 << 8) | b1) % 31 === 0)) {
+        console.warn('CoRRE: RFC zlib 格式暂不支持（仅 UltraVNC 紧凑格式）');
+        return null;
+      }
+    }
+    const entrySize = 3 + 4;
+    if (buf.length < pos + numSub * entrySize) return null;
+    for (let i = 0; i < numSub; i++) {
+      const off = pos + i * entrySize;
+      const fgB = buf[off], fgG = buf[off + 1], fgR = buf[off + 2];
+      const sx = buf[off + 3], sy = buf[off + 4], sw = buf[off + 5], sh = buf[off + 6];
+      // 裁剪到矩形范围（单字节无符号坐标，相对矩形原点）
+      const cx = Math.min(sx, w), cy = Math.min(sy, h);
+      const cw = Math.min(sw, w - cx), ch = Math.min(sh, h - cy);
+      for (let row = 0; row < ch; row++) {
+        const dst = ((y + cy + row) * fbWidth + (x + cx)) * 4;
+        for (let col = 0; col < cw; col++) {
+          fb[dst + col * 4] = fgB;
+          fb[dst + col * 4 + 1] = fgG;
+          fb[dst + col * 4 + 2] = fgR;
+          fb[dst + col * 4 + 3] = 255;
+        }
+      }
+    }
+    return pos + numSub * entrySize;
   }
 
   static decodeHextile(data, x, y, w, h, fb, fbWidth) {
@@ -738,6 +793,14 @@ class Encodings {
   }
 
   static decodeZRLE(data, x, y, w, h, fb, fbWidth) {
+    // ZRLE tile 格式（与桌面端一致，经 REA 反编译 UltraVNC vncviewer.exe 核对）：
+    //   tileType 字节：bit7=RLE 标志，低 7 位=调色板大小(1..127)
+    //   - 0            = Raw tile（CPIXEL 序列）
+    //   - 1            = 纯色（1 个 CPIXEL）
+    //   - 2..16        = 打包调色板（1/2/4 位每像素，逐行字节对齐）
+    //   - 17..127      = 1 字节索引每像素
+    //   - 带 0x80 位   = 上述调色板 + RLE 像素流：
+    //       [index|0x80] 后跟 (run长度-1) 的 255 分段字节；单像素为裸 index
     try {
       const decompressed = pako.inflate(data);
       const reader = new Uint8Array(decompressed);
@@ -750,130 +813,102 @@ class Encodings {
           const th = Math.min(64, h - ty * 64);
           const tx0 = x + tx * 64;
           const ty0 = y + ty * 64;
-          const subEnc = reader[pos++];
-          if (subEnc === 0) {
-            // Raw
-            for (let row = 0; row < th; row++) {
-              const dst = ((ty0 + row) * fbWidth + tx0) * 4;
-              for (let col = 0; col < tw; col++) {
-                fb[dst + col * 4] = reader[pos++];
-                fb[dst + col * 4 + 1] = reader[pos++];
-                fb[dst + col * 4 + 2] = reader[pos++];
-                fb[dst + col * 4 + 3] = 255;
-              }
-            }
-          } else if (subEnc >= 1 && subEnc <= 3) {
-            // Solid
-            const r = reader[pos], g = reader[pos + 1], b = reader[pos + 2];
-            pos += subEnc * 3;
-            for (let row = 0; row < th; row++) {
-              const dst = ((ty0 + row) * fbWidth + tx0) * 4;
-              for (let col = 0; col < tw; col++) {
-                fb[dst + col * 4] = b;
-                fb[dst + col * 4 + 1] = g;
-                fb[dst + col * 4 + 2] = r;
-                fb[dst + col * 4 + 3] = 255;
-              }
-            }
-          } else if (subEnc >= 4 && subEnc <= 6) {
-            // Packed palette
-            const paletteSize = subEnc === 4 ? 2 : (subEnc === 5 ? 4 : 16);
+          if (pos >= reader.length) return;
+          const tileType = reader[pos++];
+          const subType = tileType & 0x7F;
+          const isRLE = (tileType & 0x80) !== 0;
+
+          if (subType >= 1 && subType <= 127) {
+            // 调色板（CPIXEL 3 字节，线序 [B,G,R]）
             const palette = [];
-            for (let i = 0; i < paletteSize; i++) {
-              palette.push({ r: reader[pos++], g: reader[pos++], b: reader[pos++] });
-            }
-            const bitsPerPixel = subEnc === 4 ? 1 : (subEnc === 5 ? 2 : 4);
-            const pixelsPerByte = 8 / bitsPerPixel;
-            const mask = (1 << bitsPerPixel) - 1;
-            for (let row = 0; row < th; row++) {
-              const dst = ((ty0 + row) * fbWidth + tx0) * 4;
-              for (let col = 0; col < tw; col++) {
-                const byteIdx = Math.floor(col / pixelsPerByte);
-                const bitShift = (pixelsPerByte - 1 - (col % pixelsPerByte)) * bitsPerPixel;
-                const idx = (reader[pos + byteIdx] >> bitShift) & mask;
-                const c = palette[idx];
-                fb[dst + col * 4] = c.b;
-                fb[dst + col * 4 + 1] = c.g;
-                fb[dst + col * 4 + 2] = c.r;
-                fb[dst + col * 4 + 3] = 255;
-              }
-              pos += Math.ceil(tw / pixelsPerByte);
-            }
-          } else if (subEnc >= 7 && subEnc <= 9) {
-            // Palette RLE
-            const paletteSize = subEnc === 7 ? 2 : (subEnc === 8 ? 4 : 16);
-            const palette = [];
-            for (let i = 0; i < paletteSize; i++) {
+            for (let i = 0; i < subType; i++) {
               palette.push({ r: reader[pos + 2], g: reader[pos + 1], b: reader[pos] });
               pos += 3;
             }
-            const bitsPerPixel = subEnc === 7 ? 1 : (subEnc === 8 ? 2 : 4);
-            const pixelsPerByte = 8 / bitsPerPixel;
-            const mask = (1 << bitsPerPixel) - 1;
-            let remaining = tw * th;
-            let row = 0, col = 0;
-            while (remaining > 0) {
-              const byte = reader[pos++];
-              const isRle = byte & 0x80;
-              const idx = (byte >> (8 - bitsPerPixel - 1)) & mask;
-              let runLen = 1;
-              if (isRle) {
-                runLen = byte & 0x7f;
-                if (runLen === 0) runLen = reader[pos++] + 1;
-                else runLen += 1;
-              }
-              const c = palette[idx];
-              for (let k = 0; k < runLen && remaining > 0; k++) {
-                const dst = ((ty0 + row) * fbWidth + (tx0 + col)) * 4;
-                fb[dst] = c.b;
-                fb[dst + 1] = c.g;
-                fb[dst + 2] = c.r;
-                fb[dst + 3] = 255;
-                col++;
-                if (col >= tw) { col = 0; row++; }
-                remaining--;
-              }
-            }
-          } else if (subEnc === 16) {
-            // Plain RLE
-            pos--;
-            let row = 0, col = 0;
-            let remaining = tw * th;
-            while (remaining > 0) {
-              const r = reader[pos], g = reader[pos + 1], b = reader[pos + 2];
-              pos += 3;
-              let runLen = 1;
-              if (pos < reader.length && reader[pos] === 0) {
-                pos++;
-                runLen = 1;
-                let shift = 0;
-                while (pos < reader.length) {
-                  const byte = reader[pos++];
-                  runLen |= (byte & 0x7f) << shift;
-                  shift += 7;
-                  if (!(byte & 0x80)) break;
+            if (isRLE) {
+              // RLE 像素流：跨行连续
+              let remaining = tw * th;
+              let row = 0, col = 0;
+              while (remaining > 0 && pos < reader.length) {
+                const b = reader[pos++];
+                let idx, runLen = 1;
+                if (b & 0x80) {
+                  idx = b & 0x7F;
+                  for (;;) {
+                    if (pos >= reader.length) break;
+                    const c = reader[pos++];
+                    runLen += c;
+                    if (c < 255) break;
+                  }
+                } else {
+                  idx = b;
+                }
+                const c = palette[idx] || { r: 0, g: 0, b: 0 };
+                for (let k = 0; k < runLen && remaining > 0; k++) {
+                  const dst = ((ty0 + row) * fbWidth + (tx0 + col)) * 4;
+                  fb[dst] = c.b; fb[dst + 1] = c.g; fb[dst + 2] = c.r; fb[dst + 3] = 255;
+                  col++;
+                  if (col >= tw) { col = 0; row++; }
+                  remaining--;
                 }
               }
-              for (let k = 0; k < runLen && remaining > 0; k++) {
-                const dst = ((ty0 + row) * fbWidth + (tx0 + col)) * 4;
-                fb[dst] = b;
-                fb[dst + 1] = g;
-                fb[dst + 2] = r;
-                fb[dst + 3] = 255;
-                col++;
-                if (col >= tw) { col = 0; row++; }
-                remaining--;
+            } else if (subType === 1) {
+              // 纯色 tile
+              const c = palette[0];
+              for (let row = 0; row < th; row++) {
+                const dst = ((ty0 + row) * fbWidth + tx0) * 4;
+                for (let col = 0; col < tw; col++) {
+                  fb[dst + col * 4] = c.b;
+                  fb[dst + col * 4 + 1] = c.g;
+                  fb[dst + col * 4 + 2] = c.r;
+                  fb[dst + col * 4 + 3] = 255;
+                }
               }
+            } else if (subType <= 16) {
+              // 打包调色板：2 色=1bit、3-4 色=2bit、5-16 色=4bit，逐行字节对齐
+              const bits = subType <= 2 ? 1 : (subType <= 4 ? 2 : 4);
+              const pixelsPerByte = 8 / bits;
+              const mask = (1 << bits) - 1;
+              const rowBytes = Math.ceil(tw / pixelsPerByte);
+              for (let row = 0; row < th; row++) {
+                const dst = ((ty0 + row) * fbWidth + tx0) * 4;
+                const rowStart = pos + row * rowBytes;
+                for (let col = 0; col < tw; col++) {
+                  const byteIdx = Math.floor(col / pixelsPerByte);
+                  const bitShift = (pixelsPerByte - 1 - (col % pixelsPerByte)) * bits;
+                  const idx = (reader[rowStart + byteIdx] >> bitShift) & mask;
+                  const c = palette[idx] || { r: 0, g: 0, b: 0 };
+                  fb[dst + col * 4] = c.b;
+                  fb[dst + col * 4 + 1] = c.g;
+                  fb[dst + col * 4 + 2] = c.r;
+                  fb[dst + col * 4 + 3] = 255;
+                }
+              }
+              pos += rowBytes * th;
+            } else {
+              // 调色板 > 16 色：每像素 1 字节索引
+              for (let row = 0; row < th; row++) {
+                const dst = ((ty0 + row) * fbWidth + tx0) * 4;
+                for (let col = 0; col < tw; col++) {
+                  const c = palette[reader[pos + row * tw + col]] || { r: 0, g: 0, b: 0 };
+                  fb[dst + col * 4] = c.b;
+                  fb[dst + col * 4 + 1] = c.g;
+                  fb[dst + col * 4 + 2] = c.r;
+                  fb[dst + col * 4 + 3] = 255;
+                }
+              }
+              pos += tw * th;
             }
-          } else if (subEnc === 128) {
-            // Skip (bg color)
+          } else {
+            // Raw tile：CPIXEL 序列（线序 [B,G,R]）
             for (let row = 0; row < th; row++) {
               const dst = ((ty0 + row) * fbWidth + tx0) * 4;
               for (let col = 0; col < tw; col++) {
-                fb[dst + col * 4] = 0;
-                fb[dst + col * 4 + 1] = 0;
-                fb[dst + col * 4 + 2] = 0;
+                fb[dst + col * 4] = reader[pos + 2];
+                fb[dst + col * 4 + 1] = reader[pos + 1];
+                fb[dst + col * 4 + 2] = reader[pos];
                 fb[dst + col * 4 + 3] = 255;
+                pos += 3;
               }
             }
           }
@@ -1213,7 +1248,37 @@ class MobileRfbClient {
         this._doSecurityType(password);
       } else {
         this._send(new TextEncoder().encode('RFB 003.003\n'));
-        this._doVncAuth(password);
+        // RFB 3.3: 服务端直接发送 4 字节大端安全类型（无列表、无 SecurityResult-for-None）
+        this._expect(4, (data) => {
+          const secType = (data[0] << 24) | (data[1] << 16) | (data[2] << 8) | data[3];
+          if (secType === 0) {
+            this._readFailureReason();
+          } else if (secType === 1) {
+            this._sendClientInit(password);
+          } else if (secType === 2) {
+            this._doVncAuth(password);
+          } else {
+            log('error', '不支持的安全类型: ' + secType);
+            if (this.onError) this.onError('不支持的安全类型: ' + secType);
+          }
+        });
+      }
+    });
+  }
+
+  /** 读取服务端失败原因（4 字节长度 + UTF-8 文本） */
+  _readFailureReason() {
+    this._expect(4, (lenData) => {
+      const len = (lenData[0] << 24) | (lenData[1] << 16) | (lenData[2] << 8) | lenData[3];
+      if (len > 0 && len < 4096) {
+        this._expect(len, (reason) => {
+          const text = new TextDecoder().decode(reason);
+          log('error', '服务器拒绝连接: ' + text);
+          if (this.onError) this.onError('服务器拒绝连接: ' + text);
+        });
+      } else {
+        log('error', '服务器拒绝连接');
+        if (this.onError) this.onError('服务器拒绝连接');
       }
     });
   }
@@ -1222,11 +1287,8 @@ class MobileRfbClient {
     this._expect(1, (data) => {
       const numTypes = data[0];
       if (numTypes === 0) {
-        this._expect(4, (err) => {
-          const reason = new TextDecoder().decode(err);
-          log('error', '服务器拒绝连接: ' + reason);
-          if (this.onError) this.onError('认证失败: ' + reason);
-        });
+        // 服务端拒绝连接：4 字节原因长度 + 原因文本
+        this._readFailureReason();
         return;
       }
       this._expect(numTypes, (types) => {
@@ -1262,14 +1324,24 @@ class MobileRfbClient {
       const response = vncAuth(password, challenge);
       this._send(response);
       this._expect(4, (result) => {
-        const status = (result[3] << 24) | (result[2] << 16) | (result[1] << 8) | result[0];
+        // SecurityResult 为大端（旧实现误按小端读取）
+        const status = (result[0] << 24) | (result[1] << 16) | (result[2] << 8) | result[3];
         if (status === 0) {
           log('info', 'VNC 认证成功');
           this._sendClientInit(password);
-        } else {
-          const reason = status === 1 ? '密码错误' : '认证失败 (错误码: ' + status + ')';
+        } else if (status === 0xFFFFFFFF || status === 0xFFFFFFFA) {
+          const reason = status === 0xFFFFFFFA ? '认证尝试次数过多' : '服务端要求重新协商安全类型';
           log('error', reason);
           if (this.onError) this.onError(reason);
+        } else {
+          // RFB 3.7+ 失败时服务端附 4 字节原因长度 + 原因文本
+          if (this.versionMinor >= 7) {
+            this._readFailureReason();
+          } else {
+            const reason = status === 1 ? '密码错误' : '认证失败 (错误码: ' + status + ')';
+            log('error', reason);
+            if (this.onError) this.onError(reason);
+          }
         }
       });
     });
@@ -1341,17 +1413,25 @@ class MobileRfbClient {
   }
 
   _setEncodings() {
+    // 编码值经 REA 反编译 UltraVNC vncviewer.exe 核对修正（旧列表把
+    // Hextile/RRE/CopyRect/ZRLE 误作负值 -5/-2/-1/-16，DesktopSize 与
+    // DesktopName 值颠倒，导致这些编码实际从未生效）：
+    //   ZRLE=16, Tight=7, Hextile=5, CoRRE=4, CopyRect=1, RRE=2, Raw=0
+    //   NewFBSize=-223, DesktopName=-222, LastRect=-224,
+    //   RichCursor=-239, Cursor=-240
     const encodings = [
-      -16,  // ZRLE
-      7,    // Tight (含 JPEG - 高压缩比优先)
-      -255, // DesktopSize
-      -223, // DesktopName
-      -24,  // LastRect
-      -5,   // Hextile
-      -2,   // RRE
-      -239, // Cursor
-      -1,   // CopyRect
-      0,    // Raw
+      16,    // ZRLE
+      7,     // Tight (含 JPEG - 高压缩比优先)
+      5,     // Hextile
+      4,     // CoRRE (UltraVNC 紧凑变体)
+      -223,  // NewFBSize (DesktopSize)
+      -222,  // DesktopName
+      -224,  // LastRect
+      -239,  // RichCursor
+      -240,  // Cursor (单色: 2 CPIXEL + mask)
+      1,     // CopyRect
+      2,     // RRE
+      0,     // Raw
     ];
     const msg = new Uint8Array(2 + encodings.length * 4);
     msg[0] = 2; // SetEncodings
@@ -1410,7 +1490,7 @@ class MobileRfbClient {
       // 握手完成前不处理 FramebufferUpdate，等待更多数据
       if (!this.connected) break;
 
-      // 等待 FramebufferUpdate 消息
+      // 等待服务器消息
       if (this.buffer.length < 4) break;
       const msgType = this.buffer[0];
       if (msgType === 0) {
@@ -1418,9 +1498,47 @@ class MobileRfbClient {
         await this._processFramebufferUpdate();
         // _processFramebufferUpdate 已经通过 setTimeout 调度后续处理
         return;
-      } else {
-        // 未知消息类型，忽略
+      } else if (msgType === 1) {
+        // SetColourMapEntries: type(1)+pad(1)+first(2)+num(2)+num*6
+        if (this.buffer.length < 6) break;
+        const numColours = (this.buffer[4] << 8) | this.buffer[5];
+        const total = 6 + numColours * 6;
+        if (this.buffer.length < total) break;
+        this._consume(total);
+      } else if (msgType === 2) {
+        // Bell
         this._consume(1);
+      } else if (msgType === 3) {
+        // ServerCutText: type(1)+pad(3)+length(4)+text
+        // Extended Clipboard（UltraVNC）：length 高位标记，载荷 = flags(4)+data
+        if (this.buffer.length < 8) break;
+        const len = (this.buffer[4] << 24) | (this.buffer[5] << 16) | (this.buffer[6] << 8) | this.buffer[7];
+        const payloadLen = (len & 0x80000000) ? (len & 0x7FFFFFFF) : len;
+        const total = 8 + payloadLen;
+        if (this.buffer.length < total) break;
+        // 移动端不使用远程剪贴板，仅消费
+        this._consume(total);
+      } else if (msgType === 251) {
+        // DesktopSize (Extended Desktop Size 响应):
+        // type(1)+pad(1)+w(2)+h(2)+numScreens(1)+numScreens*16
+        if (this.buffer.length < 7) break;
+        const numScreens = this.buffer[6];
+        let total = 7;
+        if (numScreens !== 0xFF) total += numScreens * 16;
+        if (this.buffer.length < total) break;
+        const newW = (this.buffer[2] << 8) | this.buffer[3];
+        const newH = (this.buffer[4] << 8) | this.buffer[5];
+        if (newW > 0 && newH > 0 && (newW !== this.fbWidth || newH !== this.fbHeight)) {
+          this.fbWidth = newW;
+          this.fbHeight = newH;
+          this.framebuffer = new Uint8Array(this.fbWidth * this.fbHeight * 4);
+          if (this.onResize) this.onResize(this.fbWidth, this.fbHeight);
+        }
+        this._consume(total);
+      } else {
+        // 未知消息类型：无法安全跳过（负载长度未知），中断等待
+        log('warn', '未知服务器消息类型: ' + msgType);
+        break;
       }
     }
   }
@@ -1446,13 +1564,13 @@ class MobileRfbClient {
 
         pos += 12;
 
-        if (enc === 0xFFFFFF20) {
+        if (enc === -224) {
           // LastRect
           rectsProcessed++;
           continue;
         }
 
-        if (enc === 0xFFFFFF21) {
+        if (enc === -223) {
           // DesktopSize (NewFBSize)
           this.fbWidth = rw;
           this.fbHeight = rh;
@@ -1462,7 +1580,7 @@ class MobileRfbClient {
           continue;
         }
 
-        if (enc === 0xFFFFFF22) {
+        if (enc === -222) {
           // DesktopName
           if (this.buffer.length < pos + 4) return false;
           const nameLen = (this.buffer[pos] << 24) | (this.buffer[pos + 1] << 16) | (this.buffer[pos + 2] << 8) | this.buffer[pos + 3];
@@ -1475,24 +1593,42 @@ class MobileRfbClient {
           continue;
         }
 
-        if (enc === 0xFFFFFF10) {
-          // Cursor (含 AND/XOR mask)
-          const pixelsLen = rw * rh * 4;
+        if (enc === -240) {
+          // Cursor (XCursor): 2 个 CPIXEL 颜色（前景/背景）+ mask
+          // 格式经 REA 反编译 UltraVNC vncviewer.exe 光标处理器确认
+          // （旧实现误按「像素+mask」解析）。
+          const cpi = 3; // 32bpp CPIXEL
           const maskLen = Math.ceil(rw / 8) * rh;
-          const cursorLen = pixelsLen + maskLen;
+          const cursorLen = cpi * 2 + maskLen;
           if (this.buffer.length < pos + cursorLen) return false;
-          // x, y 是热点位置 (hotspot)
-          const pixelData = this.buffer.slice(pos, pos + pixelsLen);
-          const maskData = this.buffer.slice(pos + pixelsLen, pos + pixelsLen + maskLen);
+          // CPIXEL 3 字节线序 [低,中,高]，标准 32bpp 格式下 R 在高位字节
+          const readCPixelRGB = (o) => [
+            this.buffer[pos + o + 2], this.buffer[pos + o + 1], this.buffer[pos + o]
+          ];
+          const fg = readCPixelRGB(0);
+          const bg = readCPixelRGB(cpi);
+          const maskStart = pos + cpi * 2;
+          const maskRowBytes = Math.ceil(rw / 8);
+          // 展开为 RGBA：mask bit 1 = 前景色，0 = 背景色（双色光标，无透明）
+          const pixelData = new Uint8Array(rw * rh * 4);
+          for (let row = 0; row < rh; row++) {
+            for (let col = 0; col < rw; col++) {
+              const bit = (this.buffer[maskStart + row * maskRowBytes + (col >> 3)] >> (7 - (col & 7))) & 1;
+              const c = bit ? fg : bg;
+              const off = (row * rw + col) * 4;
+              pixelData[off] = c[0]; pixelData[off + 1] = c[1];
+              pixelData[off + 2] = c[2]; pixelData[off + 3] = 255;
+            }
+          }
           if (typeof decodeRemoteCursor === 'function') {
-            decodeRemoteCursor(rx, ry, rw, rh, pixelData, maskData);
+            decodeRemoteCursor(rx, ry, rw, rh, pixelData, null);
           }
           pos += cursorLen;
           rectsProcessed++;
           continue;
         }
 
-        if (enc === 0xFFFFFF11) {
+        if (enc === -239) {
           // RichCursor (含 alpha 通道)
           const pixelsLen = rw * rh * 4;
           const maskLen = Math.ceil(rw / 8) * rh;
@@ -1514,21 +1650,27 @@ class MobileRfbClient {
           if (this.buffer.length < pos + bytesNeeded) return false;
           Encodings.decodeRaw(this.buffer.slice(pos, pos + bytesNeeded), rx, ry, rw, rh, this.framebuffer, this.fbWidth);
           pos += bytesNeeded;
-        } else if (enc === -1 || enc === 0xFFFFFFFF) {
+        } else if (enc === 1) {
           // CopyRect
           if (this.buffer.length < pos + 4) return false;
           // 使用正确的参数: rect 的宽高 rw, rh 而不是坐标差
           Encodings.decodeCopyRect(this.buffer.slice(pos, pos + 4), rx, ry, rw, rh, this.framebuffer, this.fbWidth);
           pos += 4;
-        } else if (enc === -2 || enc === 0xFFFFFFFE) {
+        } else if (enc === 2) {
           // RRE
           if (this.buffer.length < pos + 4) return false;
           const numSub = (this.buffer[pos] << 24) | (this.buffer[pos + 1] << 16) | (this.buffer[pos + 2] << 8) | this.buffer[pos + 3];
-          const rreBytes = 4 + 3 + numSub * (3 + 4);
+          // RRE：子矩形 = 3 字节像素 + 2 字节×4 坐标（RFC 6143）
+          const rreBytes = 4 + 3 + numSub * (3 + 8);
           if (this.buffer.length < pos + rreBytes) return false;
           Encodings.decodeRRE(this.buffer.slice(pos, pos + rreBytes), rx, ry, rw, rh, this.framebuffer, this.fbWidth);
           pos += rreBytes;
-        } else if (enc === -5 || enc === 0xFFFFFFFB) {
+        } else if (enc === 4) {
+          // CoRRE (UltraVNC 紧凑变体: 计数+bg+[像素+4 单字节坐标]，无 zlib)
+          const decoded = Encodings.decodeCoRRE(this.buffer, pos, rx, ry, rw, rh, this.framebuffer, this.fbWidth);
+          if (decoded === null) return false;
+          pos = decoded;
+        } else if (enc === 5) {
           // Hextile
           try {
             const decoded = this._decodeHextilePartial(this.buffer, pos, rx, ry, rw, rh);
@@ -1537,7 +1679,7 @@ class MobileRfbClient {
           } catch (e) {
             return false;
           }
-        } else if (enc === -16 || enc === 0xFFFFFFEF) {
+        } else if (enc === 16) {
           // ZRLE
           if (this.buffer.length < pos + 4) return false;
           const zrleLen = (this.buffer[pos] << 24) | (this.buffer[pos + 1] << 16) | (this.buffer[pos + 2] << 8) | this.buffer[pos + 3];
@@ -1581,9 +1723,16 @@ class MobileRfbClient {
   }
 
   _decodeHextilePartial(buf, startPos, rx, ry, rw, rh) {
+    // Hextile 16x16 tile 解码。
+    // 背景/前景色跨 tile 延续（RFC 6143 §7.7.3，UltraVNC 实现一致）；
+    // UltraVNC 扩展子编码（经 REA 反编译确认）：
+    //   bit5 (0x20): 2 字节压缩长度 + zlib(tw*th*3 原始像素)
+    //   bit6 (0x40): 2 字节压缩长度 + zlib(标准 Hextile tile 数据)
     let pos = startPos;
     const tilesX = Math.ceil(rw / 16);
     const tilesY = Math.ceil(rh / 16);
+    let bgB = 0, bgG = 0, bgR = 0;
+    let fgB = 0, fgG = 0, fgR = 0;
     for (let ty = 0; ty < tilesY; ty++) {
       for (let tx = 0; tx < tilesX; tx++) {
         if (buf.length < pos + 1) return null;
@@ -1609,64 +1758,129 @@ class MobileRfbClient {
           continue;
         }
 
-        let bgB = 0, bgG = 0, bgR = 0;
+        // UltraVNC 扩展：zlib 压缩的原始像素 tile
+        if (subEnc & 0x20) {
+          if (buf.length < pos + 2) return null;
+          const compLen = (buf[pos] << 8) | buf[pos + 1];
+          pos += 2;
+          if (buf.length < pos + compLen) return null;
+          let raw;
+          try {
+            raw = pako.inflate(buf.subarray(pos, pos + compLen));
+          } catch (e) {
+            console.error('Hextile(zlibRaw) 解压失败:', e);
+            return null;
+          }
+          pos += compLen;
+          if (raw.length < tw * th * 3) return null;
+          let ri = 0;
+          for (let row = 0; row < th; row++) {
+            const dst = ((ty0 + row) * this.fbWidth + tx0) * 4;
+            for (let col = 0; col < tw; col++) {
+              this.framebuffer[dst + col * 4] = raw[ri++];
+              this.framebuffer[dst + col * 4 + 1] = raw[ri++];
+              this.framebuffer[dst + col * 4 + 2] = raw[ri++];
+              this.framebuffer[dst + col * 4 + 3] = 255;
+            }
+          }
+          continue;
+        }
+
+        // UltraVNC 扩展：zlib 压缩的标准 Hextile tile 数据
+        let tileBuf = buf, tilePos = pos;
+        if (subEnc & 0x40) {
+          if (buf.length < pos + 2) return null;
+          const compLen = (buf[pos] << 8) | buf[pos + 1];
+          pos += 2;
+          if (buf.length < pos + compLen) return null;
+          try {
+            tileBuf = pako.inflate(buf.subarray(pos, pos + compLen));
+          } catch (e) {
+            console.error('Hextile(zlibTile) 解压失败:', e);
+            return null;
+          }
+          pos += compLen;
+          tilePos = 0;
+        }
+
         if (subEnc & 2) {
-          if (buf.length < pos + 3) return null;
-          bgB = buf[pos++]; bgG = buf[pos++]; bgR = buf[pos++];
+          if (tileBuf.length < tilePos + 3) return null;
+          bgB = tileBuf[tilePos++]; bgG = tileBuf[tilePos++]; bgR = tileBuf[tilePos++];
         }
-
-        let fgB = 0, fgG = 0, fgR = 0;
         if (subEnc & 4) {
-          if (buf.length < pos + 3) return null;
-          fgB = buf[pos++]; fgG = buf[pos++]; fgR = buf[pos++];
+          if (tileBuf.length < tilePos + 3) return null;
+          fgB = tileBuf[tilePos++]; fgG = tileBuf[tilePos++]; fgR = tileBuf[tilePos++];
         }
 
-        if (subEnc & 8) {
-          // AnySubrects
-          if (buf.length < pos + 1) return null;
-          const numSubrects = buf[pos++];
-          for (let row = 0; row < th; row++) {
-            const dst = ((ty0 + row) * this.fbWidth + tx0) * 4;
-            for (let col = 0; col < tw; col++) {
-              this.framebuffer[dst + col * 4] = bgB;
-              this.framebuffer[dst + col * 4 + 1] = bgG;
-              this.framebuffer[dst + col * 4 + 2] = bgR;
-              this.framebuffer[dst + col * 4 + 3] = 255;
-            }
+        if (subEnc & 0x40) {
+          // zlib tile：从解压缓冲区解析，消费计数按解压数据推进
+          const res = this._decodeHextileTileBody(tileBuf, tilePos, subEnc, tw, th, tx0, ty0,
+            { get bg() { return [bgB, bgG, bgR]; }, set bg(v) { bgB = v[0]; bgG = v[1]; bgR = v[2]; },
+              get fg() { return [fgB, fgG, fgR]; }, set fg(v) { fgB = v[0]; fgG = v[1]; fgR = v[2]; } });
+          if (res === null) return null;
+          continue;
+        }
+
+        // 标准 tile：从主缓冲区解析
+        const res = this._decodeHextileTileBody(buf, tilePos, subEnc, tw, th, tx0, ty0,
+          { get bg() { return [bgB, bgG, bgR]; }, set bg(v) { bgB = v[0]; bgG = v[1]; bgR = v[2]; },
+            get fg() { return [fgB, fgG, fgR]; }, set fg(v) { fgB = v[0]; fgG = v[1]; fgR = v[2]; } });
+        if (res === null) return null;
+        pos = tilePos + res;
+      }
+    }
+    return pos;
+  }
+
+  /** 解析标准 Hextile tile 体（背景/前景/子矩形）并写入帧缓冲 */
+  _decodeHextileTileBody(buf, pos, subEnc, tw, th, tx0, ty0, state) {
+    if (subEnc & 8) {
+      // AnySubrects
+      if (buf.length < pos + 1) return null;
+      const numSubrects = buf[pos++];
+      for (let row = 0; row < th; row++) {
+        const dst = ((ty0 + row) * this.fbWidth + tx0) * 4;
+        for (let col = 0; col < tw; col++) {
+          this.framebuffer[dst + col * 4] = state.bg[0];
+          this.framebuffer[dst + col * 4 + 1] = state.bg[1];
+          this.framebuffer[dst + col * 4 + 2] = state.bg[2];
+          this.framebuffer[dst + col * 4 + 3] = 255;
+        }
+      }
+      for (let s = 0; s < numSubrects; s++) {
+        if (subEnc & 16) {
+          if (buf.length < pos + 3) return null;
+          state.fg = [buf[pos++], buf[pos++], buf[pos++]];
+        }
+        if (buf.length < pos + 2) return null;
+        const sr = buf[pos++];
+        const sx = (sr >> 4) & 0x0f;
+        const sy = sr & 0x0f;
+        const ss = buf[pos++];
+        const sw2 = (ss >> 4) & 0x0f;
+        const sh2 = ss & 0x0f;
+        // 裁剪到 tile 范围内
+        const cw = Math.min(sw2 + 1, tw - sx);
+        const ch = Math.min(sh2 + 1, th - sy);
+        for (let row = 0; row < ch; row++) {
+          const dst = ((ty0 + sy + row) * this.fbWidth + (tx0 + sx)) * 4;
+          for (let col = 0; col < cw; col++) {
+            this.framebuffer[dst + col * 4] = state.fg[0];
+            this.framebuffer[dst + col * 4 + 1] = state.fg[1];
+            this.framebuffer[dst + col * 4 + 2] = state.fg[2];
+            this.framebuffer[dst + col * 4 + 3] = 255;
           }
-          for (let s = 0; s < numSubrects; s++) {
-            if (subEnc & 16) {
-              if (buf.length < pos + 3) return null;
-              fgB = buf[pos++]; fgG = buf[pos++]; fgR = buf[pos++];
-            }
-            if (buf.length < pos + 2) return null;
-            const sr = buf[pos++];
-            const sx = (sr >> 4) & 0x0f;
-            const sy = sr & 0x0f;
-            const ss = buf[pos++];
-            const sw2 = (ss >> 4) & 0x0f;
-            const sh2 = ss & 0x0f;
-            for (let row = 0; row < sh2 + 1; row++) {
-              const dst = ((ty0 + sy + row) * this.fbWidth + (tx0 + sx)) * 4;
-              for (let col = 0; col < sw2 + 1; col++) {
-                this.framebuffer[dst + col * 4] = fgB;
-                this.framebuffer[dst + col * 4 + 1] = fgG;
-                this.framebuffer[dst + col * 4 + 2] = fgR;
-                this.framebuffer[dst + col * 4 + 3] = 255;
-              }
-            }
-          }
-        } else {
-          // Solid background
-          for (let row = 0; row < th; row++) {
-            const dst = ((ty0 + row) * this.fbWidth + tx0) * 4;
-            for (let col = 0; col < tw; col++) {
-              this.framebuffer[dst + col * 4] = bgB;
-              this.framebuffer[dst + col * 4 + 1] = bgG;
-              this.framebuffer[dst + col * 4 + 2] = bgR;
-              this.framebuffer[dst + col * 4 + 3] = 255;
-            }
-          }
+        }
+      }
+    } else {
+      // Solid background
+      for (let row = 0; row < th; row++) {
+        const dst = ((ty0 + row) * this.fbWidth + tx0) * 4;
+        for (let col = 0; col < tw; col++) {
+          this.framebuffer[dst + col * 4] = state.bg[0];
+          this.framebuffer[dst + col * 4 + 1] = state.bg[1];
+          this.framebuffer[dst + col * 4 + 2] = state.bg[2];
+          this.framebuffer[dst + col * 4 + 3] = 255;
         }
       }
     }

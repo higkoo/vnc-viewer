@@ -5,14 +5,36 @@
 ## 功能特性
 
 - **RFB 协议** — 支持 RFB 3.3/3.7/3.8 协议版本
-- **多种认证** — VNC 认证（DES 挑战-响应）、None 认证
-- **编码支持** — Raw、CopyRect、RRE、Hextile、ZRLE（Zlib 解压）
-- **伪编码** — 光标、RichCursor、PointerPos、LastRect、NewFBSize、DesktopName
+- **多种认证** — VNC 认证（DES 挑战-响应）、None 认证、MSLogon I/II（112/113，明文用户名+密码）
+- **编码支持** — Raw、CopyRect、RRE、CoRRE（UltraVNC 紧凑变体）、Hextile（含 UltraVNC zlib 压缩 tile 扩展）、ZRLE（Zlib 解压）
+- **伪编码** — 光标（单色：2 CPIXEL + mask）、RichCursor（像素 + mask）、PointerPos、LastRect、NewFBSize、DesktopName
+- **扩展剪贴板** — UltraVNC Extended Clipboard（flags + data 格式）
 - **输入转发** — 键盘事件（X11 Keysym 映射）、鼠标事件（5 键+滚轮）
 - **Canvas 渲染** — 高性能像素渲染，支持缩放适配/实际大小
 - **macOS 原生** — 原生菜单栏、全屏模式、深色主题、Retina 支持
 - **跨平台** — 基于 Electron，可在 macOS / Windows / Linux 运行
 - **手机支持** — 内置 WebSocket 代理服务器，手机浏览器可直接连接和操控远程桌面
+
+## UltraVNC 反编译重构（REA + Ghidra）
+
+协议层细节经 REA（Ghidra 12.1.4）反编译 `UltraVNC vncviewer.exe`（x64 PE）逐项核对，
+关键结论已落地到 `src/rfb/` 与 `src/mobile/`（两端逻辑保持一致）：
+
+| 项目 | 反编译结论 | 重构内容 |
+|------|-----------|---------|
+| 编码值 | CoRRE=4、Zlib=6、Tight=7、ZlibHex=8、Ultra=9/10、ZYWRLE=17、XZ=18/19、ZSTD=25~29 | 修正 `TightZstd` 17→26（17 实为 ZYWRLE），补齐 CoRRE 及 UltraVNC 编码族 |
+| CoRRE 格式 | UltraVNC 变体：计数(4)+背景(bpp)+[像素(bpp)+x/y/w/h 各 1 字节]，无 zlib（RFC 6143 的 zlib+2 字节坐标格式不被支持，已做检测拒绝） | 新增 CoRRE 解码器（桌面+移动） |
+| Hextile | UltraVNC 扩展子编码 0x20（zlib 原始像素 tile）/0x40（zlib 标准 tile），后跟 2 字节压缩长度 | Hextile 解码器支持扩展子编码 |
+| 安全类型 | MSLogon=112/113（非 129）；129/130 为 RSA-AES 变体；结果码 0xFFFFFFFF=继续协商下一类型、0xFFFFFFFA=尝试过多 | 修正安全类型枚举与优先级表，认证结果完整处理 |
+| 认证失败 | RFB 3.7+ 失败附 4 字节原因长度+文本（原子性读取） | 修正扩展失败原因解析 |
+| Cursor 伪编码 | 单色光标 = 2 个 CPIXEL（前/背景）+ mask；RichCursor = 像素 + mask | 修正单色光标解析（旧实现误按像素+mask） |
+| 扩展剪贴板 | 载荷 = flags(4, BE) + data，**无内层长度字段** | 修正 ServerCutText 扩展格式解析 |
+| RRE | 子矩形坐标为 2 字节大端（RFC 6143） | 修正移动端 RRE（旧实现误用 1 字节） |
+| ZRLE | tileType 低 7 位=调色板大小、bit7=RLE；打包调色板逐行字节对齐 | 重写移动端 ZRLE（旧实现 tileType 映射错误） |
+| 版本协商 | UltraVNC 另支持 minor 14/16/18（安全类型列表 4 字节计数） | 统一回退 3.8（兼容性更好），已注释说明 |
+
+> UltraVNC 专属的 DSM 插件加密、SecureVNC 插件、文件传输等依赖 Windows 专有组件，
+> 多平台项目不予移植（保持纯协议层跨平台）。
 
 ## 项目架构
 

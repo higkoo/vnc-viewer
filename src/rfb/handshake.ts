@@ -8,7 +8,7 @@
  */
 
 import { RfbClient } from './client';
-import { SecurityType, EncodingType, ConnectionState, RFB_VERSIONS, RfbVersion } from './types';
+import { SecurityType, SecurityResult, EncodingType, ConnectionState, RFB_VERSIONS, RfbVersion } from './types';
 import { desEcbEncrypt } from './des';
 
 export class RfbHandshake {
@@ -17,6 +17,8 @@ export class RfbHandshake {
   private authChallengeSent: boolean = false;
   /** 已选择的安全类型（单一来源，避免多处优先级表不一致） */
   private selectedSecurityType: SecurityType | null = null;
+  /** 已尝试过的安全类型（Continue 流程中剔除，避免重复选择失败的类型） */
+  private triedSecurityTypes: Set<SecurityType> = new Set();
 
   constructor(client: RfbClient) {
     this.client = client;
@@ -42,7 +44,10 @@ export class RfbHandshake {
     }
 
     const serverVersion = match[1];
-    // 选择双方都支持的最高版本
+    // 选择双方都支持的最高版本。
+    // 注：UltraVNC vncviewer.exe 另支持 minor 14/16/18（安全类型列表改用
+    // 4 字节计数，经反编译确认）；本项目统一回退到 3.8（1 字节计数），
+    // 行为等价且兼容性更好。
     let selectedVersion: RfbVersion = '003.003';
     for (const v of RFB_VERSIONS) {
       if (v <= serverVersion) {
@@ -130,11 +135,16 @@ export class RfbHandshake {
   }
 
   private handleSecurityType(): void {
-    // 优先选择: None > VncAuth > MSLogon > Tight
+    // 优先选择（值经 REA 反编译 UltraVNC vncviewer.exe 核对）：
+    // None > VncAuth > MSLogonI(112) > MSLogonII(113) > Plain > Tight > TLS
+    // 注意：MSLogon 实际为 112/113（旧实现误作 129，129/130 实为 RSA-AES 变体）。
+    // Tight/TLS/RA2 等需要 RSA/TLS 实现，本项目暂不支持（会走「不支持」错误分支）。
     const priority = [
       SecurityType.None,
       SecurityType.VncAuth,
-      SecurityType.MSLogon,
+      SecurityType.MSLogonI,
+      SecurityType.MSLogonII,
+      SecurityType.Plain,
       SecurityType.Tight,
       SecurityType.TLS,
       SecurityType.RA2,
@@ -143,6 +153,7 @@ export class RfbHandshake {
 
     let selectedType: SecurityType | null = null;
     for (const pref of priority) {
+      if (this.triedSecurityTypes.has(pref)) continue;
       if (this.securityTypes.includes(pref)) {
         selectedType = pref;
         break;
@@ -154,6 +165,7 @@ export class RfbHandshake {
       return;
     }
 
+    this.triedSecurityTypes.add(selectedType);
     console.log(`[RFB] 选择安全类型: ${selectedType} (${SecurityType[selectedType]})`);
 
     // 回复选择的安全类型 (RFB 3.7+ 需要发送1字节)
@@ -170,7 +182,7 @@ export class RfbHandshake {
 
   /**
    * 阶段 3: 认证
-   * 支持: None, VncAuth, MSLogon, Plain (VeNCrypt 子类型)
+   * 支持: None, VncAuth, MSLogonI/II, Plain (VeNCrypt 子类型)
    */
   private handleAuthentication(type: SecurityType): void {
     switch (type) {
@@ -184,9 +196,10 @@ export class RfbHandshake {
         this.authChallengeSent = false;
         this.client.updateState(ConnectionState.Authentication);
         break;
-      case SecurityType.MSLogon:
+      case SecurityType.MSLogonI:
+      case SecurityType.MSLogonII:
       case SecurityType.Plain:
-        // MSLogon 和 Plain 都使用用户名+密码明文认证
+        // MSLogonI/II 和 Plain 都使用用户名+密码明文认证
         console.log(`[RFB] ${SecurityType[type]} 认证`);
         this.authChallengeSent = false;
         this.client.updateState(ConnectionState.Authentication);
@@ -217,7 +230,8 @@ export class RfbHandshake {
    */
   processAuthentication(): void {
     const selectedType = this.getCurrentSecurityType();
-    if (selectedType === SecurityType.MSLogon || selectedType === SecurityType.Plain) {
+    if (selectedType === SecurityType.MSLogonI || selectedType === SecurityType.MSLogonII ||
+        selectedType === SecurityType.Plain) {
       this.processPlainAuth();
     } else {
       this.processVncAuth();
@@ -305,37 +319,59 @@ export class RfbHandshake {
   }
 
   /**
-   * 读取 4 字节认证结果，成功则进入 ClientInit
+   * 读取 4 字节认证结果（SecurityResult，大端）。
+   * 结果码语义经 REA 反编译 UltraVNC vncviewer.exe 的认证结果处理确认：
+   *   0            = 成功
+   *   1/2/3        = 失败（RFB 3.7+ 失败时服务端会附 4 字节原因长度+原因文本）
+   *   0xFFFFFFFF  = Continue：服务端要求继续尝试列表中的下一个安全类型
+   *   0xFFFFFFFA  = TooManyTries：尝试次数过多
+   * RFB < 3.7（minor<7）失败时不附带原因文本。
    */
   private readAuthResult(failureMsg: string): void {
     const result = this.client.readBuffer(4);
     if (!result) return;
 
     const status = result.readUInt32BE(0);
-    if (status !== 0) {
-      // 原子性保护：失败原因必须完整可用才读取，
-      // 否则已消费的 result 字节会在重入时被误解析为长度 → 协议失步。
-      // 认证已失败，直接用通用错误信息报错（服务器随后会关闭连接）。
-      if (this.client.bufferLength() >= 4) {
-        const reasonLenBuf = this.client.readBuffer(4);
-        if (reasonLenBuf) {
-          const len = reasonLenBuf.readUInt32BE(0);
-          if (len > 0 && len < 4096 && this.client.bufferLength() >= len) {
-            const reason = this.client.readBuffer(len);
-            if (reason) {
-              this.client.emitError(`${failureMsg}: ${reason.toString('utf8')}`);
-              return;
-            }
-          }
-        }
-      }
-      this.client.emitError(failureMsg);
+
+    if (status === SecurityResult.Ok) {
+      console.log('[RFB] 认证成功');
+      this.client.updateState(ConnectionState.ClientInit);
+      this.sendClientInit();
       return;
     }
 
-    console.log('[RFB] 认证成功');
-    this.client.updateState(ConnectionState.ClientInit);
-    this.sendClientInit();
+    if (status === SecurityResult.Continue) {
+      // 服务端要求继续协商：剔除已失败的类型后重新选择
+      console.log('[RFB] 服务端要求继续协商下一个安全类型');
+      this.client.updateState(ConnectionState.Security);
+      this.handleSecurityType();
+      return;
+    }
+
+    if (status === SecurityResult.TooManyTries) {
+      this.client.emitError('认证尝试次数过多');
+      return;
+    }
+
+    // 失败：RFB 3.7+ 附带原因文本（4 字节长度 + UTF-8 文本）。
+    // 原子性保护：必须等原因文本完整可用才消费，否则已消费的长度字节
+    // 会在重入时被误解析，导致协议失步。
+    const minor = parseInt(this.client.getServerVersion().split('.')[1] || '3', 10);
+    if (minor >= 7) {
+      const lenBuf = this.client.peekBuffer(4);
+      if (lenBuf) {
+        const reasonLen = lenBuf.readUInt32BE(0);
+        if (reasonLen > 0 && reasonLen < 4096) {
+          const full = this.client.peekBuffer(4 + reasonLen);
+          if (full) {
+            this.client.readBuffer(4 + reasonLen);
+            this.client.emitError(`${failureMsg}: ${full.subarray(4).toString('utf8')}`);
+            return;
+          }
+        }
+      }
+    }
+    this.client.emitError(failureMsg);
   }
 
   /**
@@ -412,16 +448,17 @@ export class RfbHandshake {
     this.client.setFramebufferInfo(fbWidth, fbHeight, standardFormat, name);
 
     // 按优先级请求编码（服务器选择列表中第一个它支持的）：
-    // ZRLE 压缩率最高且现代服务器普遍支持，Hextile 作次选，CopyRect 复用
-    // 未变化区域，Raw 仅作最后兑底。此前仅请求 Raw（诊断模式遗留）导致
-    // 带宽放大数十倍，ZRLE/Hextile 解码器长期闲置。
+    // ZRLE 压缩率最高且现代服务器普遍支持，Hextile 作次选，CoRRE 为
+    // UltraVNC 系服务器的紧凑 RRE 变体（反编译确认其格式），CopyRect 复用
+    // 未变化区域，Raw 仅作最后兑底。
     this.client.setEncodings([
       EncodingType.ZRLE,       // 16: Zlib 游程编码（首选）
-      EncodingType.Hextile,    // 5: 分块编码（次选）
+      EncodingType.Hextile,    // 5: 分块编码（次选，含 UltraVNC zlib 扩展）
+      EncodingType.CoRRE,      // 4: 压缩 RRE（UltraVNC 紧凑变体）
       EncodingType.CopyRect,   // 1: 区域复制
       EncodingType.Raw,        // 0: 原始像素（兑底）
       EncodingType.RichCursor, // 伪编码: 彩色光标
-      EncodingType.Cursor,     // 伪编码: 光标
+      EncodingType.Cursor,     // 伪编码: 单色光标（2 CPIXEL + mask）
       EncodingType.PointerPos, // 伪编码: 指针位置
       EncodingType.LastRect,   // 伪编码: 帧结束标记
       EncodingType.NewFBSize,  // 伪编码: 分辨率变化

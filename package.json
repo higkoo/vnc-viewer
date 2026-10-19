@@ -5,7 +5,8 @@
   "main": "dist/main/main.js",
   "scripts": {
     "build": "tsc && node scripts/copy-assets.js",
-    "test": "npm run build && node scripts/rfb-connection-test.js",
+    "test": "npm run build && node scripts/decoder-sanity-test.js && node scripts/rfb-connection-test.js",
+    "test:decoders": "npm run build && node scripts/decoder-sanity-test.js",
     "start": "npm run build && electron .",
     "dev": "npm run build && electron-builder --dir --publish never && open release/mac-arm64/VNC\\ Viewer.app || open release/mac/VNC\\ Viewer.app",
     "pack": "npm run build && electron-builder --dir --publish never",

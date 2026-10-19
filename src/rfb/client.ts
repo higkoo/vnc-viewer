@@ -103,6 +103,13 @@ private lastBandwidth: number = 0; // bytes/sec
   /** 获取未消费数据长度 */
   bufferLength(): number { return this.buffer.length - this.readOffset; }
 
+  /** 查看缓冲区前 n 字节（不消费）；数据不足返回 null。
+   *  返回内部缓冲区的零拷贝视图，调用方应立即使用，勿长期持有。 */
+  peekBuffer(n: number): Buffer | null {
+    if (this.buffer.length - this.readOffset < n) return null;
+    return this.buffer.subarray(this.readOffset, this.readOffset + n);
+  }
+
   /** 消费 n 字节：惰性推进偏移，超过 1MB 且已消费过半时压缩缓冲区释放内存 */
   private consume(n: number): void {
     this.readOffset += n;
@@ -826,6 +833,16 @@ private lastBandwidth: number = 0; // bytes/sec
   }
 
   /**
+   * CPIXEL 字节数 (RFC 6143 §7.7.5)：8bpp=1, 16bpp=2, 32bpp=3（三分量均 ≤255）
+   */
+  private cpixelSize(): number {
+    const f = this.pixelFormat;
+    if (f.bitsPerPixel === 8) return 1;
+    if (f.bitsPerPixel === 16) return 2;
+    return (f.redMax <= 255 && f.greenMax <= 255 && f.blueMax <= 255) ? 3 : 4;
+  }
+
+  /**
    * 读取伪编码矩形的附加数据
    */
   private readPseudoEncodingPayload(
@@ -846,6 +863,18 @@ private lastBandwidth: number = 0; // bytes/sec
 
       case EncodingType.Cursor:
       case EncodingType.RichCursor: {
+        // RichCursor (0xFFFFFF11): 像素 (bpp*w*h) + mask (ceil(w/8)*h)
+        // Cursor/XCursor (0xFFFFFF10): 2 个 CPIXEL 颜色（前景/背景）+ mask
+        //   —— 经 REA 反编译 UltraVNC vncviewer.exe 光标处理器确认，
+        //      旧实现误将两者都按「像素+mask」解析。
+        if (encoding === EncodingType.Cursor) {
+          const cpi = this.cpixelSize();
+          const colorsLen = cpi * 2;
+          const maskLen = Math.ceil(width / 8) * height;
+          const total = colorsLen + maskLen;
+          if (this.buffer.length < dataOffset + total) return null;
+          return Buffer.from(this.buffer.subarray(dataOffset, dataOffset + total));
+        }
         const bytesPerPixel = Math.max(1, Math.ceil(this.pixelFormat.bitsPerPixel / 8));
         const pixelsLen = width * height * bytesPerPixel;
         const maskLen = Math.ceil(width / 8) * height;
@@ -883,7 +912,8 @@ private lastBandwidth: number = 0; // bytes/sec
 
       case EncodingType.Cursor:
       case EncodingType.RichCursor:
-        this.emit('cursor', { width, height });
+        // 透传光标数据：Cursor 载荷 = 2 CPIXEL + mask；RichCursor = 像素 + mask
+        this.emit('cursor', { width, height, encoding, data: payload });
         break;
 
       default:
@@ -904,46 +934,58 @@ private lastBandwidth: number = 0; // bytes/sec
   }
 
   /**
-   * 处理服务器剪贴板文本 (Extended Clipboard)
-   * 标准格式: 1-byte msg-type(3), 3-byte padding, 4-byte flags, 4-byte length, text
-   * 旧格式:   1-byte msg-type(3), 3-byte padding, 4-byte length, text
+   * 处理服务器剪贴板文本
+   * 标准格式: 1-byte msg-type(3), 3-byte padding, 4-byte length, text
+   * Extended Clipboard (UltraVNC 扩展，经 REA 反编译确认):
+   *   长度字段高位 (0x80000000) 置位；载荷 = flags(4, BE) + data，
+   *   **无内层长度字段**（旧实现误读 4 字节内层长度，导致与 UltraVNC
+   *   服务器 clipboard 同步错位）。
+   *   flags 高位字节为动作：0x02=请求客户端剪贴板, 0x08=能力通告,
+   *   0x10=提供剪贴板数据（文本）; 低位为格式掩码。
    */
   private processServerCutText(): boolean {
     if (this.bufferLength() < 8) return false;
 
-    // 尝试 Extended Clipboard 格式 (带 flags 字段)
-    // 如果前 4 字节 padding 后紧跟的 4 字节 flags 最高位为 1，则为扩展格式
     const flagsOrLen = this.buffer.readUInt32BE(this.readOffset + 4);
 
     if (flagsOrLen & 0x80000000) {
-      // Extended 格式: flags(4) + length(4) + data
-      if (this.bufferLength() < 12) return false;
-      const flags = flagsOrLen & 0x7FFFFFFF;
-      const len = this.buffer.readUInt32BE(this.readOffset + 8);
-      if (len > 0x1000000) {
+      // Extended Clipboard 格式
+      const payloadLen = flagsOrLen & 0x7FFFFFFF;
+      if (payloadLen < 4 || payloadLen > 0x1000000) {
         // 畸形长度：等待只会永久卡死，直接报错断开
-        this.emitError(`剪贴板数据长度异常: ${len} 字节`);
+        this.emitError(`剪贴板数据长度异常: ${payloadLen} 字节`);
         this.disconnect();
         return false;
       }
-      if (this.bufferLength() < 12 + len) return false;
-      this.clipboardCapabilities = flags;
-      const text = this.buffer.subarray(this.readOffset + 12, this.readOffset + 12 + len).toString('utf8');
-      this.consume(12 + len);
-      this.emit('clipboard', text);
-    } else {
-      // 标准格式: length(4) + data
-      const len = flagsOrLen;
-      if (len > 0x1000000) {
-        this.emitError(`剪贴板数据长度异常: ${len} 字节`);
-        this.disconnect();
-        return false;
+      if (this.bufferLength() < 8 + payloadLen) return false;
+      const extFlags = this.buffer.readUInt32BE(this.readOffset + 8);
+      const action = (extFlags >>> 24) & 0xFF;
+      this.clipboardCapabilities = extFlags & 0x00FFFFFF;
+      const dataLen = payloadLen - 4;
+
+      if (action === 0x02) {
+        // 服务端请求客户端剪贴板：仅记录，不主动回送（避免隐私外泄）
+        console.log('[RFB] [CLIPBOARD] 服务端请求客户端剪贴板（未自动回送）');
+      } else if (dataLen > 0) {
+        // 0x10（提供数据）等：载荷为剪贴板文本
+        const text = this.buffer.subarray(this.readOffset + 12, this.readOffset + 12 + dataLen).toString('utf8');
+        this.emit('clipboard', text);
       }
-      if (this.bufferLength() < 8 + len) return false;
-      const text = this.buffer.subarray(this.readOffset + 8, this.readOffset + 8 + len).toString('utf8');
-      this.consume(8 + len);
-      this.emit('clipboard', text);
+      this.consume(8 + payloadLen);
+      return true;
     }
+
+    // 标准格式: length(4) + data
+    const len = flagsOrLen;
+    if (len > 0x1000000) {
+      this.emitError(`剪贴板数据长度异常: ${len} 字节`);
+      this.disconnect();
+      return false;
+    }
+    if (this.bufferLength() < 8 + len) return false;
+    const text = this.buffer.subarray(this.readOffset + 8, this.readOffset + 8 + len).toString('utf8');
+    this.consume(8 + len);
+    this.emit('clipboard', text);
     return true;
   }
 
