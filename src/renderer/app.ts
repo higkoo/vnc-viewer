@@ -14,8 +14,10 @@ interface VncApi {
   onConnectionState: (callback: (state: number) => void) => void;
   onServerInfo: (callback: (info: any) => void) => void;
   onError: (callback: (msg: string) => void) => void;
+  onReconnectStatus: (callback: (status: { reconnecting: boolean; attempt?: number; maxAttempts?: number; delayMs?: number }) => void) => void;
   onBell: (callback: () => void) => void;
   onClipboard: (callback: (text: string) => void) => void;
+  onBandwidth: (callback: (bytesPerSec: number) => void) => void;
   onDesktopSize: (callback: (size: any) => void) => void;
   onMenuNewConnection: (callback: () => void) => void;
   onMenuDisconnect: (callback: () => void) => void;
@@ -75,6 +77,7 @@ const statusIndicator = getEl<HTMLSpanElement>('status-indicator');
 const statusText = getEl<HTMLSpanElement>('status-text');
 const serverInfoText = getEl<HTMLSpanElement>('server-info-text');
 const qualityText = getEl<HTMLSpanElement>('quality-text');
+const statsText = getEl<HTMLSpanElement>('stats-text');
 const zoomText = getEl<HTMLSpanElement>('zoom-text');
 const toolbarEl = getEl<HTMLDivElement>('toolbar');
 const canvas = getEl<HTMLCanvasElement>('vnc-canvas');
@@ -121,6 +124,9 @@ let fbCanvas: ImageData | null = null;
 
 // 背景填充：已禁用以保留真实黑色像素（VNC 服务器应在首帧发送完整画面）
 let lastFrameTime = 0;
+// 渲染统计（状态栏帧率显示）
+let frameCount = 0;
+let lastFpsAt = 0;
 
 // 鼠标状态
 let mouseButtonMask = 0;
@@ -130,6 +136,8 @@ let isPointerInside = false;
 
 // 连接状态
 let currentState = ConnectionState.Disconnected;
+// 连接监督是否正在安排自动重连（重连期间不断线拆除界面）
+let reconnectInProgress = false;
 
 // ---- 初始化 ----
 function init(): void {
@@ -235,17 +243,22 @@ function setupIPCListeners(): void {
       renderRect(rect);
     }
     lastFrameTime = Date.now();
+    // 整帧只做一次 GPU 上传（脏区合并 + rAF 节律，参考 Octop 流媒体层的帧节流设计）
+    schedulePaint();
     // 背景填充已禁用：x11vnc 等服务器首帧即发完整画面，bf 时机不对会覆盖真实黑色像素
   });
 
   vncApi.onConnectionState((state: number) => {
     currentState = state;
     updateStatusBar(state);
-    // 连接意外断开时自动重置 UI 状态
-    if (state === ConnectionState.Disconnected && isConnected) {
+    // 连接意外断开时自动重置 UI 状态。
+    // 例外：连接监督正在安排自动重连时保留界面（黑屏片刻后会自动恢复），
+    // 不弹连接对话框、不清帧缓冲——重连成功后服务器会重发全量帧。
+    if (state === ConnectionState.Disconnected && isConnected && !reconnectInProgress) {
       console.log('[INPUT-DIAG] 连接已断开，重置 UI 状态，停止发送输入事件');
       isConnected = false;
       fbCanvas = null;
+      if (statsText) statsText.textContent = '';
       toolbarEl.classList.add('hidden');
       statusBar.classList.add('hidden');
       emptyState.classList.remove('hidden');
@@ -255,6 +268,12 @@ function setupIPCListeners(): void {
       connectBtn.disabled = false;
       connectBtn.textContent = '连接';
     }
+  });
+
+  // 自动重连状态：重连期间保留远程画面，状态栏显示退避进度
+  vncApi.onReconnectStatus((status) => {
+    reconnectInProgress = status.reconnecting;
+    showReconnectStatus(status);
   });
 
   vncApi.onServerInfo((info) => {
@@ -297,6 +316,25 @@ function setupIPCListeners(): void {
   vncApi.onClipboard((text) => {
     navigator.clipboard.writeText(text).catch(() => {});
   });
+
+  // 带宽统计（主进程每秒上报，状态栏显示）
+  let lastBandwidth = 0;
+  vncApi.onBandwidth((bytesPerSec: number) => {
+    lastBandwidth = bytesPerSec;
+    updateStatsDisplay();
+  });
+
+  // 帧率统计：本地统计每秒实际上屏帧数（rAF 合并后的真实帧率）
+  lastFpsAt = Date.now();
+  setInterval(() => {
+    const now = Date.now();
+    const elapsed = (now - lastFpsAt) / 1000;
+    if (elapsed <= 0) return;
+    const fps = frameCount / elapsed;
+    frameCount = 0;
+    lastFpsAt = now;
+    updateStatsDisplay(fps, lastBandwidth);
+  }, 1000);
 
   vncApi.onDesktopSize((size) => {
     fbWidth = size.width;
@@ -465,6 +503,9 @@ function setupCanvas(): void {
   for (let i = 0; i < fbCanvas.data.length; i++) {
     fbCanvas.data[i] = 0;
   }
+  // 立即全屏绘制一次黑色底，避免残留上一连接的画面
+  markDirty(0, 0, fbWidth, fbHeight);
+  schedulePaint();
 }
 
 function applyZoomFit(): void {
@@ -504,13 +545,47 @@ function setupCanvasResize(): void {
 }
 
 // ---- 渲染 ----
+// 帧内累积脏区，整帧只做一次 putImageData：
+// - 避免每矩形一次 GPU 上传（40 矩形帧 = 40 次上传 → 1 次）；
+// - requestAnimationFrame 节律：帧数据到达快于屏幕刷新时自动合并，
+//   丢弃中间帧只画最新状态（参考 Octop 流媒体层的帧节流设计）。
+let dirtyX0 = 0, dirtyY0 = 0, dirtyX1 = -1, dirtyY1 = -1;
+let paintScheduled = false;
+
+function markDirty(x: number, y: number, w: number, h: number): void {
+  if (dirtyX1 < dirtyX0) {
+    dirtyX0 = x; dirtyY0 = y; dirtyX1 = x + w; dirtyY1 = y + h;
+  } else {
+    if (x < dirtyX0) dirtyX0 = x;
+    if (y < dirtyY0) dirtyY0 = y;
+    if (x + w > dirtyX1) dirtyX1 = x + w;
+    if (y + h > dirtyY1) dirtyY1 = y + h;
+  }
+}
+
+function schedulePaint(): void {
+  if (paintScheduled) return;
+  paintScheduled = true;
+  requestAnimationFrame(() => {
+    paintScheduled = false;
+    if (!fbCanvas || dirtyX1 < dirtyX0) return;
+    // 钳制到帧缓冲范围，取帧内所有 rect 的外接矩形一次上传
+    const x = Math.max(0, dirtyX0);
+    const y = Math.max(0, dirtyY0);
+    const w = Math.min(dirtyX1, fbWidth) - x;
+    const h = Math.min(dirtyY1, fbHeight) - y;
+    dirtyX1 = dirtyX0 - 1; // 重置脏区
+    if (w <= 0 || h <= 0) return;
+    canvas.getContext('2d')!.putImageData(fbCanvas, 0, 0, x, y, w, h);
+    frameCount++;
+  });
+}
+
 function renderRect(rect: { x: number; y: number; width: number; height: number; data: number[] | Buffer; encoding: number }): void {
   if (!fbCanvas) {
     console.error('[RENDER] fbCanvas 为 null，跳过渲染');
     return;
   }
-
-  const ctx = canvas.getContext('2d')!;
 
   if (rect.encoding === 1) {
     // CopyRect: data 为大端序 srcX/srcY（各 2 字节）
@@ -529,7 +604,7 @@ function renderRect(rect: { x: number; y: number; width: number; height: number;
       const dstOff = (dy * fbWidth + rect.x) * 4;
       px.copyWithin(dstOff, srcOff, srcOff + copyW * 4);
     }
-    ctx.putImageData(fbCanvas, 0, 0, rect.x, rect.y, rect.width, rect.height);
+    markDirty(rect.x, rect.y, rect.width, rect.height);
     return;
   }
 
@@ -562,8 +637,7 @@ function renderRect(rect: { x: number; y: number; width: number; height: number;
     dst.set(data.subarray(srcStart, srcStart + w * 4), dstStart);
   }
 
-  // 只渲染更新区域
-  ctx.putImageData(fbCanvas, 0, 0, x, y, w, h);
+  markDirty(x, y, w, h);
 }
 
 /**
@@ -1088,6 +1162,43 @@ function updateStatusBar(state: number): void {
       statusText.textContent = '错误';
       break;
   }
+}
+
+// ---- 自动重连状态（连接监督：意外断线后指数退避重连）----
+// 重连期间状态栏显示进度；重连成功/取消后恢复由 updateStatusBar 接管
+function showReconnectStatus(status: {
+  reconnecting: boolean; attempt?: number; maxAttempts?: number; delayMs?: number;
+}): void {
+  if (status.reconnecting && status.attempt) {
+    statusIndicator.className = 'status-indicator connecting';
+    const secs = status.delayMs ? (status.delayMs / 1000).toFixed(0) : '?';
+    statusText.textContent = `重连中 ${status.attempt}/${status.maxAttempts ?? '?'}（${secs}s 后）`;
+    if (connectBtn) {
+      connectBtn.disabled = true;
+      connectBtn.textContent = '重连中';
+    }
+  } else if (isConnected) {
+    updateStatusBar(ConnectionState.Connected);
+  } else {
+    updateStatusBar(ConnectionState.Disconnected);
+  }
+}
+
+// ---- 状态栏统计：帧率 + 带宽（参考 Octop 的状态探测/可观测性设计）----
+function updateStatsDisplay(fps?: number, bytesPerSec?: number): void {
+  if (!statsText) return;
+  if (!isConnected) {
+    statsText.textContent = '';
+    return;
+  }
+  const parts: string[] = [];
+  if (fps !== undefined) parts.push(`${fps.toFixed(0)} fps`);
+  if (bytesPerSec !== undefined && bytesPerSec > 0) {
+    parts.push(bytesPerSec >= 1024 * 1024
+      ? `${(bytesPerSec / 1024 / 1024).toFixed(1)} MB/s`
+      : `${(bytesPerSec / 1024).toFixed(0)} KB/s`);
+  }
+  statsText.textContent = parts.join(' · ');
 }
 
 // ---- 启动 ----

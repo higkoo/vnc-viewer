@@ -190,14 +190,25 @@ private lastBandwidth: number = 0; // bytes/sec
     });
 
     this.socket.on('error', (err: Error) => {
-      this.emitError(`连接错误: ${err.message}`);
+      // 已建立的连接出错才算“意外中断”（可重连）；连接/握手阶段的失败
+      // 由调用方按一次性错误处理（ Octop 风格：仅对活跃流做重试 ）
+      const wasConnected = this.state === ConnectionState.Connected;
+      const msg = `连接错误: ${err.message}`;
+      // 先发 dropped：让连接监督有机会在状态切换到 Disconnected 之前
+      // 通知渲染层进入重连中，避免界面被提前拆除
+      if (wasConnected) this.emitDropped(msg);
+      this.emitError(msg);
       this.disconnect();
     });
 
     this.socket.on('close', () => {
+      const wasConnected = this.state === ConnectionState.Connected;
       if (this.state !== ConnectionState.Disconnected) {
+        if (wasConnected) this.emitDropped('连接已关闭');
         this.emitError('连接已关闭');
         this.setState(ConnectionState.Disconnected);
+      } else if (wasConnected) {
+        this.emitDropped('连接已关闭');
       }
     });
 
@@ -457,6 +468,9 @@ private lastBandwidth: number = 0; // bytes/sec
     this.lastBandwidth = 0;
     this.clipboardCapabilities = 0;
     this.input.resetModifierState();
+    this.fatal = false;
+    this.dropEmitted = false;
+    this.consecutiveDecodeErrors = 0;
   }
 
   private setState(state: ConnectionState): void {
@@ -504,6 +518,23 @@ private lastBandwidth: number = 0; // bytes/sec
     if (this.state !== ConnectionState.Disconnected) {
       this.setState(ConnectionState.Error);
     }
+  }
+
+  /**
+   * 标记致命错误（认证失败、尝试次数过多等）。
+   * 致命错误重连无意义，连接监督据此放弃自动重连。
+   */
+  markFatal(): void { this.fatal = true; }
+  isFatal(): boolean { return this.fatal; }
+
+  /**
+   * 连接意外中断事件（已建立的连接非用户主动断开）。
+   * 每个连接实例最多触发一次，供连接监督安排自动重连。
+   */
+  private emitDropped(reason: string): void {
+    if (this.dropEmitted) return;
+    this.dropEmitted = true;
+    this.emit('dropped', reason);
   }
 
   send(data: Buffer): void {
@@ -595,6 +626,10 @@ private lastBandwidth: number = 0; // bytes/sec
   /** 连续解码失败计数，用于判断是否需要断线重连 */
   private consecutiveDecodeErrors: number = 0;
   private static readonly MAX_CONSECUTIVE_DECODE_ERRORS = 10;
+  /** 是否为致命错误（认证失败等，自动重连无意义） */
+  private fatal = false;
+  /** 意外断线事件是否已触发（每实例至多一次） */
+  private dropEmitted = false;
 
   /**
    * 处理 FramebufferUpdate 消息
@@ -636,7 +671,9 @@ private lastBandwidth: number = 0; // bytes/sec
 
       if (this.consecutiveDecodeErrors >= RfbClient.MAX_CONSECUTIVE_DECODE_ERRORS) {
         // 连续多次失败，断线重连
-        this.emitError(`连续 ${this.consecutiveDecodeErrors} 帧解码失败，断开连接`);
+        const msg = `连续 ${this.consecutiveDecodeErrors} 帧解码失败，断开连接`;
+        this.emitDropped(msg);
+        this.emitError(msg);
         this.disconnect();
         return false;
       }

@@ -274,28 +274,88 @@ function createWindow(): void {
 
 // ---- IPC 处理器 ----
 
-function setupIPC(): void {
-  ipcMain.handle(IPC_CHANNELS.CONNECT, async (_event, params: ConnectionParams) => {
-    // 参数校验：host 必须非空字符串，port 必须为 1-65535 的整数，不合法直接拒绝
-    const hostValid = typeof params?.host === 'string' && params.host.trim().length > 0;
-    const portValid = Number.isInteger(params?.port) && (params as ConnectionParams).port >= 1 && (params as ConnectionParams).port <= 65535;
-    if (!hostValid || !portValid) {
-      warn(`连接参数非法: host=${JSON.stringify(params?.host)}, port=${JSON.stringify(params?.port)}`);
-      return { success: false, error: '连接参数非法：host 不能为空，port 必须为 1-65535 的整数' };
+// ---- 连接监督：意外断线自动重连（指数退避）----
+// 设计参考 TencentCloud/Octop 的会话管理哲学：仅对“已建立的活跃流”做有界
+// 重试；用户主动断开、认证失败等致命错误不重试；退避 1s→2s→4s…（上限 30s），
+// 最多 10 次后放弃并明确告知用户，避免无限重试耗尽资源。
+let userInitiatedDisconnect = false;
+let reconnectAttempts = 0;
+let reconnectTimer: NodeJS.Timeout | null = null;
+/** 已为其安排重连的连接实例（同一连接的 error/dropped 成对触发只安排一次） */
+let reconnectScheduledFor: RfbClient | null = null;
+const RECONNECT_MAX_ATTEMPTS = 10;
+const RECONNECT_BASE_DELAY_MS = 1000;
+const RECONNECT_MAX_DELAY_MS = 30000;
+
+function cancelReconnect(): void {
+  if (reconnectTimer !== null) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+}
+
+function notifyReconnectStatus(status: {
+  reconnecting: boolean; attempt?: number; maxAttempts?: number; delayMs?: number;
+}): void {
+  mainWindow?.webContents.send(IPC_CHANNELS.RECONNECT_STATUS, status);
+}
+
+/**
+ * 安排一次自动重连（指数退避）。
+ * @param reason 中断原因（日志/UI 用）
+ * @param client 触发重连的连接实例；同一实例的重复触发（error 与 dropped
+ *   成对出现）不会重复安排，避免退避级别被无谓跳过。
+ */
+function scheduleReconnect(reason: string, client?: RfbClient): void {
+  if (client !== undefined && reconnectScheduledFor === client && reconnectTimer !== null) {
+    return;
+  }
+  reconnectScheduledFor = client ?? null;
+  cancelReconnect();
+  if (userInitiatedDisconnect || !currentConnectionParams) return;
+
+  if (reconnectAttempts >= RECONNECT_MAX_ATTEMPTS) {
+    const msg = `连接持续中断，自动重连已放弃（已尝试 ${RECONNECT_MAX_ATTEMPTS} 次）：${reason}`;
+    error(msg);
+    notifyReconnectStatus({ reconnecting: false });
+    mainWindow?.webContents.send(IPC_CHANNELS.ERROR, msg);
+    return;
+  }
+
+  reconnectAttempts++;
+  const delayMs = Math.min(
+    RECONNECT_BASE_DELAY_MS * 2 ** (reconnectAttempts - 1),
+    RECONNECT_MAX_DELAY_MS,
+  );
+  info(`连接意外中断（${reason}），${(delayMs / 1000).toFixed(1)}s 后进行第 ${reconnectAttempts}/${RECONNECT_MAX_ATTEMPTS} 次重连`);
+  notifyReconnectStatus({
+    reconnecting: true, attempt: reconnectAttempts,
+    maxAttempts: RECONNECT_MAX_ATTEMPTS, delayMs,
+  });
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    if (currentConnectionParams && !userInitiatedDisconnect) {
+      startConnection(currentConnectionParams);
     }
+  }, delayMs);
+}
 
-    if (rfbClient) {
-      rfbClient.disconnect();
-    }
+/** 建立 RFB 连接并挂接全部事件（首次连接与自动重连共用） */
+function startConnection(params: ConnectionParams): void {
+  if (rfbClient) {
+    rfbClient.disconnect();
+    rfbClient = null;
+  }
+  pendingFrameRects = [];
+  rfbClient = new RfbClient();
+  // 闭包捕获本次连接的实例：'state' handler 在断线时会把模块级 rfbClient
+  // 置空，后续 dropped/error 回调需要仍能访问本实例
+  const client = rfbClient;
 
-    currentConnectionParams = params;
-    rfbClient = new RfbClient();
-    pendingFrameRects = [];
+  info(`正在连接 ${params.host}:${params.port} ${params.shared ? '(共享模式)' : ''}`);
 
-    info(`正在连接 ${params.host}:${params.port} ${params.shared ? '(共享模式)' : ''}`);
-
-    // 状态变更
-    rfbClient.on('state', (state: ConnectionState) => {
+  // 状态变更
+  client.on('state', (state: ConnectionState) => {
       mainWindow?.webContents.send(IPC_CHANNELS.CONNECTION_STATE, state);
       info(`连接状态: ${connectionStateLabel(state)}`);
       // 断开后清空引用，让输入 handler 能准确诊断"连接已断开"
@@ -305,12 +365,12 @@ function setupIPC(): void {
     });
 
     // 帧缓冲更新：先累积到本帧，避免每个矩形都走一次 IPC
-    rfbClient.on('framebuffer-update', (rect: FramebufferRect) => {
+    client.on('framebuffer-update', (rect: FramebufferRect) => {
       pendingFrameRects.push(rect);
     });
 
     // 帧缓冲完成：整帧收齐后批量发给渲染进程（不再输出高频 [DIAG] 日志，避免拖慢主进程）
-    rfbClient.on('framebuffer-done', () => {
+    client.on('framebuffer-done', () => {
       // --- 帧数据转发给渲染进程 ---
       // 注意：不在此处请求下一帧增量更新。
       // 帧请求由 RfbClient 内部的 pollTimer 统一调度，避免多路请求导致频率失控。
@@ -329,10 +389,17 @@ function setupIPC(): void {
       }
     });
 
-    // 服务器信息
-    rfbClient.on('server-info', (info_: any) => {
+    // 服务器信息（握手完成）：重连成功则重置退避计数
+    client.on('server-info', (info_: any) => {
       const pf = info_.pixelFormat;
       mainWindow?.webContents.send(IPC_CHANNELS.SERVER_INFO, info_);
+      if (reconnectAttempts > 0) {
+        info(`自动重连成功（第 ${reconnectAttempts} 次尝试）`);
+        reconnectAttempts = 0;
+        reconnectScheduledFor = null;
+        cancelReconnect();
+        notifyReconnectStatus({ reconnecting: false });
+      }
       info(`[SERVER-INFO] ${info_.name} ${info_.width}x${info_.height}`);
       if (pf) {
         info(`[SERVER-INFO] 像素格式: ${pf.bitsPerPixel}bpp depth=${pf.depth} ${pf.trueColor ? 'true-color' : 'indexed'} ${pf.bigEndian ? 'BE' : 'LE'}`);
@@ -340,41 +407,87 @@ function setupIPC(): void {
       }
     });
 
-    // 解码异常后的画面重新同步：请求一次全量更新
-    rfbClient.on('framebuffer-resync', () => {
+    // 解码异常后的画面重新同步：请求一次全量刷新
+    client.on('framebuffer-resync', () => {
       if (rfbClient && rfbClient.getState() === ConnectionState.Connected) {
         pendingFrameRects = [];
         rfbClient.requestFramebufferUpdate(false);
       }
     });
 
-    // 错误
-    rfbClient.on('error', (msg: string) => {
-      mainWindow?.webContents.send(IPC_CHANNELS.ERROR, msg);
-      error(msg);
+    // 错误分两类：
+    // 1. 致命错误（认证失败等）→ 直接通知用户，放弃重连；
+    // 2. 非致命错误 → 若已在重连流程中（重连尝试本身连不上），安排下一次
+    //    退避重试，保证重连链不断；首次连接的失败仍按立即报错处理。
+    client.on('error', (msg: string) => {
+      if (client.isFatal()) {
+        mainWindow?.webContents.send(IPC_CHANNELS.ERROR, msg);
+        error(msg);
+      } else if (reconnectAttempts > 0) {
+        warn(`重连尝试失败（${msg}），将按退避继续重试`);
+        scheduleReconnect(msg, client);
+      } else {
+        mainWindow?.webContents.send(IPC_CHANNELS.ERROR, msg);
+        error(msg);
+      }
+    });
+
+    // 意外断线（已建立的连接非用户主动断开）：安排自动重连
+    client.on('dropped', (reason: string) => {
+      if (client.isFatal()) return; // 双保险：致命错误不重连
+      scheduleReconnect(reason, client);
     });
 
     // 桌面大小变化
-    rfbClient.on('desktop-size', (size: { width: number; height: number }) => {
+    client.on('desktop-size', (size: { width: number; height: number }) => {
       mainWindow?.webContents.send(IPC_CHANNELS.SET_DESKTOP_SIZE, size);
     });
 
+    // 带宽测量（每秒 bytes/sec，供状态栏显示）
+    client.on('bandwidth', (bytesPerSec: number) => {
+      mainWindow?.webContents.send(IPC_CHANNELS.BANDWIDTH, bytesPerSec);
+    });
+
     // 响铃
-    rfbClient.on('bell', () => {
+    client.on('bell', () => {
       mainWindow?.webContents.send(IPC_CHANNELS.BELL);
     });
 
     // 剪贴板
-    rfbClient.on('clipboard', (text: string) => {
+    client.on('clipboard', (text: string) => {
       mainWindow?.webContents.send(IPC_CHANNELS.CLIPBOARD, text);
     });
 
     // 连接
-    rfbClient.connect(params);
+    client.connect(params);
+}
+
+function setupIPC(): void {
+  ipcMain.handle(IPC_CHANNELS.CONNECT, async (_event, params: ConnectionParams) => {
+    // 参数校验：host 必须非空字符串，port 必须为 1-65535 的整数，不合法直接拒绝
+    const hostValid = typeof params?.host === 'string' && params.host.trim().length > 0;
+    const portValid = Number.isInteger(params?.port) && (params as ConnectionParams).port >= 1 && (params as ConnectionParams).port <= 65535;
+    if (!hostValid || !portValid) {
+      warn(`连接参数非法: host=${JSON.stringify(params?.host)}, port=${JSON.stringify(params?.port)}`);
+      return { success: false, error: '连接参数非法：host 不能为空，port 必须为 1-65535 的整数' };
+    }
+
+    // 用户主动发起的新连接：清零重连状态
+    userInitiatedDisconnect = false;
+    reconnectAttempts = 0;
+    reconnectScheduledFor = null;
+    cancelReconnect();
+    currentConnectionParams = params;
+    notifyReconnectStatus({ reconnecting: false });
+
+    startConnection(params);
     return { success: true };
   });
 
   ipcMain.handle(IPC_CHANNELS.DISCONNECT, async () => {
+    // 用户主动断开：取消一切自动重连
+    userInitiatedDisconnect = true;
+    cancelReconnect();
     if (rfbClient) {
       if (currentConnectionParams) {
         info(`断开连接 ${currentConnectionParams.host}:${currentConnectionParams.port}`);
@@ -383,6 +496,7 @@ function setupIPC(): void {
       rfbClient = null;
     }
     pendingFrameRects = [];
+    notifyReconnectStatus({ reconnecting: false });
     return { success: true };
   });
 
@@ -503,6 +617,9 @@ app.whenReady().then(() => {
 });
 
 app.on('window-all-closed', () => {
+  // 窗口关闭：取消一切自动重连，避免后台重连泄漏连接
+  userInitiatedDisconnect = true;
+  cancelReconnect();
   if (rfbClient) {
     rfbClient.disconnect();
     rfbClient = null;

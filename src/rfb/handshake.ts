@@ -349,6 +349,7 @@ export class RfbHandshake {
     }
 
     if (status === SecurityResult.TooManyTries) {
+      this.client.markFatal();
       this.client.emitError('认证尝试次数过多');
       return;
     }
@@ -365,12 +366,14 @@ export class RfbHandshake {
           const full = this.client.peekBuffer(4 + reasonLen);
           if (full) {
             this.client.readBuffer(4 + reasonLen);
+            this.client.markFatal();
             this.client.emitError(`${failureMsg}: ${full.subarray(4).toString('utf8')}`);
             return;
           }
         }
       }
     }
+    this.client.markFatal();
     this.client.emitError(failureMsg);
   }
 

@@ -188,12 +188,12 @@ export const IPC_CHANNELS = {
   SERVER_INFO: 'rfb:server-info',
   BELL: 'rfb:bell',
   CLIPBOARD: 'rfb:clipboard',
+  BANDWIDTH: 'rfb:bandwidth',
   ERROR: 'rfb:error',
+  RECONNECT_STATUS: 'rfb:reconnect-status',
   SET_ENCODINGS: 'rfb:set-encodings',
   SET_PIXEL_FORMAT: 'rfb:set-pixel-format',
   SET_DESKTOP_SIZE: 'rfb:request-desktop-size',
-  // 带宽统计
-  BANDWIDTH: 'rfb:bandwidth',
   // 服务器重定向
   REDIRECT: 'rfb:redirect',
   // 应用日志

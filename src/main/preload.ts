@@ -22,6 +22,8 @@ const IPC = {
   BELL: 'rfb:bell',
   CLIPBOARD: 'rfb:clipboard',
   ERROR: 'rfb:error',
+  BANDWIDTH: 'rfb:bandwidth',
+  RECONNECT_STATUS: 'rfb:reconnect-status',
   SET_ENCODINGS: 'rfb:set-encodings',
   SET_PIXEL_FORMAT: 'rfb:set-pixel-format',
   SET_DESKTOP_SIZE: 'rfb:request-desktop-size',
@@ -71,11 +73,17 @@ const api = {
   onError: (callback: (msg: string) => void) => {
     ipcRenderer.on(IPC.ERROR, (_event, msg) => callback(msg));
   },
+  onReconnectStatus: (callback: (status: { reconnecting: boolean; attempt?: number; maxAttempts?: number; delayMs?: number }) => void) => {
+    ipcRenderer.on(IPC.RECONNECT_STATUS, (_event, status) => callback(status));
+  },
   onBell: (callback: () => void) => {
     ipcRenderer.on(IPC.BELL, () => callback());
   },
   onClipboard: (callback: (text: string) => void) => {
     ipcRenderer.on(IPC.CLIPBOARD, (_event, text) => callback(text));
+  },
+  onBandwidth: (callback: (bytesPerSec: number) => void) => {
+    ipcRenderer.on(IPC.BANDWIDTH, (_event, bps) => callback(bps));
   },
   onDesktopSize: (callback: (size: { width: number; height: number }) => void) => {
     ipcRenderer.on(IPC.SET_DESKTOP_SIZE, (_event, size) => callback(size));
