@@ -71,13 +71,18 @@ function restartMobileServer(port: number): void {
 }
 
 function createWindow(): void {
+  // 窗口图标：开发/未打包场景（Linux 桌面）显式设置；Windows/macOS 打包后
+  // 由 exe/icns 提供。路径不存在时静默跳过，不影响启动。
+  const iconPath = path.join(__dirname, '..', '..', 'build', 'icon.png');
+  const windowIcon = fs.existsSync(iconPath) ? iconPath : undefined;
   mainWindow = new BrowserWindow({
     width: 1024,
     height: 768,
     minWidth: 640,
     minHeight: 480,
     title: 'VNC Viewer',
-    backgroundColor: '#1a1a2e',
+    icon: windowIcon,
+    backgroundColor: '#0F172A',
     webPreferences: {
       nodeIntegration: false,
       contextIsolation: true,
@@ -135,10 +140,16 @@ function createWindow(): void {
         ],
       },
       {
-        label: '手机',
+        label: '工具',
         submenu: [
           {
-            label: '显示手机连接信息',
+            label: '实时日志',
+            accelerator: 'CmdOrCtrl+L',
+            click: () => mainWindow?.webContents.send('menu:show-logs'),
+          },
+          { type: 'separator' },
+          {
+            label: '手机连接信息',
             click: () => {
               if (mobileServer) {
                 const port = mobileServer.getPort();
@@ -151,13 +162,6 @@ function createWindow(): void {
               }
             },
           },
-          { type: 'separator' },
-          {
-            label: '查看实时日志',
-            accelerator: 'CmdOrCtrl+L',
-            click: () => mainWindow?.webContents.send('menu:show-logs'),
-          },
-          { type: 'separator' },
           {
             label: '设置...',
             accelerator: 'CmdOrCtrl+,',
@@ -173,10 +177,6 @@ function createWindow(): void {
           }},
           { label: '实际大小', accelerator: 'CmdOrCtrl+1', click: () => {
             mainWindow?.webContents.send('menu:zoom-100');
-          }},
-          { type: 'separator' },
-          { label: '查看实时日志', accelerator: 'CmdOrCtrl+L', click: () => {
-            mainWindow?.webContents.send('menu:show-logs');
           }},
           { type: 'separator' },
           { role: 'toggleDevTools', label: '开发者工具' },
@@ -224,18 +224,20 @@ function createWindow(): void {
             mainWindow?.webContents.send('menu:zoom-100');
           }},
           { type: 'separator' },
-          { label: '查看实时日志', accelerator: 'Ctrl+L', click: () => {
-            mainWindow?.webContents.send('menu:show-logs');
-          }},
-          { type: 'separator' },
           { role: 'toggleDevTools' },
         ],
       },
       {
-        label: '手机',
+        label: '工具',
         submenu: [
           {
-            label: '显示手机连接信息',
+            label: '实时日志',
+            accelerator: 'Ctrl+L',
+            click: () => mainWindow?.webContents.send('menu:show-logs'),
+          },
+          { type: 'separator' },
+          {
+            label: '手机连接信息',
             click: () => {
               if (mobileServer) {
                 const port = mobileServer.getPort();
@@ -248,13 +250,6 @@ function createWindow(): void {
               }
             },
           },
-          { type: 'separator' },
-          {
-            label: '查看实时日志',
-            accelerator: 'Ctrl+L',
-            click: () => mainWindow?.webContents.send('menu:show-logs'),
-          },
-          { type: 'separator' },
           {
             label: '设置',
             accelerator: 'Ctrl+,',

@@ -72,22 +72,26 @@ const passwordInput = getEl<HTMLInputElement>('password');
 const sharedCheck = getEl<HTMLInputElement>('shared');
 const connectBtn = getEl<HTMLButtonElement>('connect-btn');
 const errorMsg = getEl<HTMLDivElement>('error-msg');
-const statusBar = getEl<HTMLDivElement>('status-bar');
+const optionsToggle = getEl<HTMLButtonElement>('options-toggle');
+const optionsPanel = getEl<HTMLDivElement>('options-panel');
 const statusIndicator = getEl<HTMLSpanElement>('status-indicator');
 const statusText = getEl<HTMLSpanElement>('status-text');
 const serverInfoText = getEl<HTMLSpanElement>('server-info-text');
-const qualityText = getEl<HTMLSpanElement>('quality-text');
 const statsText = getEl<HTMLSpanElement>('stats-text');
 const zoomText = getEl<HTMLSpanElement>('zoom-text');
+const zoomIconFit = getEl<HTMLElement>('zoom-icon-fit');
+const zoomIcon100 = getEl<HTMLElement>('zoom-icon-100');
 const toolbarEl = getEl<HTMLDivElement>('toolbar');
 const canvas = getEl<HTMLCanvasElement>('vnc-canvas');
 const emptyState = getEl<HTMLDivElement>('empty-state');
 const viewport = getEl<HTMLDivElement>('viewport-container');
 const btnNewConn = getEl<HTMLButtonElement>('btn-new-conn');
 const btnDisconnect = getEl<HTMLButtonElement>('btn-disconnect');
-const btnZoomFit = getEl<HTMLButtonElement>('btn-zoom-fit');
-const btnZoom100 = getEl<HTMLButtonElement>('btn-zoom-100');
+const btnZoomToggle = getEl<HTMLButtonElement>('btn-zoom-toggle');
 const btnFullscreen = getEl<HTMLButtonElement>('btn-fullscreen');
+const btnMore = getEl<HTMLButtonElement>('btn-more');
+const moreMenu = getEl<HTMLDivElement>('more-menu');
+const btnEmptyConnect = getEl<HTMLButtonElement>('btn-empty-connect');
 const btnCtrlAltDel = getEl<HTMLButtonElement>('btn-ctrl-alt-del');
 const btnClipboard = getEl<HTMLButtonElement>('btn-clipboard');
 const btnLog = getEl<HTMLButtonElement>('btn-log');
@@ -96,6 +100,7 @@ const logBody = getEl<HTMLDivElement>('log-body');
 const logAutoScroll = getEl<HTMLInputElement>('log-autoscroll');
 const btnLogClear = getEl<HTMLButtonElement>('btn-log-clear');
 const btnLogClose = getEl<HTMLButtonElement>('btn-log-close');
+const btnSettings = getEl<HTMLButtonElement>('btn-settings');
 
 // 设置对话框
 const settingsDialog = getEl<HTMLDivElement>('settings-dialog');
@@ -160,9 +165,19 @@ function setupEventListeners(): void {
   // 连接按钮
   connectBtn.addEventListener('click', handleConnect);
 
-  // 回车键触发连接
+  // 回车键触发连接（服务器/密码框）
+  hostInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') handleConnect();
+  });
   passwordInput.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') handleConnect();
+  });
+
+  // 选项折叠面板
+  optionsToggle.addEventListener('click', () => {
+    const expanded = optionsToggle.getAttribute('aria-expanded') === 'true';
+    optionsToggle.setAttribute('aria-expanded', String(!expanded));
+    optionsPanel.classList.toggle('hidden', expanded);
   });
 
   // 端口和显示编号联动
@@ -178,22 +193,35 @@ function setupEventListeners(): void {
 
   // 工具栏按钮
   btnNewConn.addEventListener('click', showConnectionDialog);
+  btnEmptyConnect.addEventListener('click', showConnectionDialog);
   btnDisconnect.addEventListener('click', handleDisconnect);
-  btnZoomFit.addEventListener('click', () => setZoomMode('fit'));
-  btnZoom100.addEventListener('click', () => setZoomMode('100'));
+  btnZoomToggle.addEventListener('click', toggleZoomMode);
   btnFullscreen.addEventListener('click', toggleFullscreen);
   btnCtrlAltDel.addEventListener('click', () => sendCtrlAltDel());
   btnClipboard.addEventListener('click', () => {
     const text = prompt('输入要发送到远程的剪贴板文本:');
     if (text !== null) vncApi.sendCutText(text);
   });
+  btnLog.addEventListener('click', toggleLogPanel);
+
+  // 更多菜单：开合 + 点击外部关闭
+  btnMore.addEventListener('click', (e) => {
+    e.stopPropagation();
+    moreMenu.classList.toggle('hidden');
+  });
+  document.addEventListener('click', (e) => {
+    if (moreMenu.classList.contains('hidden')) return;
+    if (!moreMenu.contains(e.target as Node) && e.target !== btnMore) {
+      moreMenu.classList.add('hidden');
+    }
+  });
 
   // 日志面板开关
-  btnLog.addEventListener('click', toggleLogPanel);
   btnLogClose.addEventListener('click', toggleLogPanel);
   btnLogClear.addEventListener('click', clearLogView);
 
   // 设置对话框
+  btnSettings.addEventListener('click', showSettings);
   btnSettingsSave.addEventListener('click', saveSettings);
   btnSettingsCancel.addEventListener('click', closeSettings);
   settingsPortInput.addEventListener('keydown', (e) => {
@@ -226,6 +254,32 @@ function setupEventListeners(): void {
   window.addEventListener('resize', () => {
     if (zoomMode === 'fit') applyZoomFit();
   });
+
+  // 工具栏自动隐藏：鼠标在视口移动时显示，空闲 2.5s 后淡出
+  // （参考 Chrome Remote Desktop / TigerVNC 的悬浮工具栏行为）
+  viewport.addEventListener('mousemove', onViewportActivity);
+  viewport.addEventListener('mousedown', onViewportActivity);
+  viewport.addEventListener('wheel', onViewportActivity, { passive: true });
+}
+
+// ---- 工具栏自动隐藏 ----
+let toolbarHideTimer: ReturnType<typeof setTimeout> | null = null;
+const TOOLBAR_IDLE_MS = 2500;
+
+function showToolbar(): void {
+  if (!isConnected) return;
+  toolbarEl.classList.remove('toolbar-hidden');
+  if (toolbarHideTimer !== null) clearTimeout(toolbarHideTimer);
+  toolbarHideTimer = setTimeout(hideToolbar, TOOLBAR_IDLE_MS);
+}
+
+function hideToolbar(): void {
+  toolbarEl.classList.add('toolbar-hidden');
+  moreMenu.classList.add('hidden');
+}
+
+function onViewportActivity(): void {
+  if (isConnected) showToolbar();
 }
 
 // ---- IPC 监听 ----
@@ -260,13 +314,14 @@ function setupIPCListeners(): void {
       fbCanvas = null;
       if (statsText) statsText.textContent = '';
       toolbarEl.classList.add('hidden');
-      statusBar.classList.add('hidden');
+      toolbarEl.classList.add('toolbar-hidden');
       emptyState.classList.remove('hidden');
       if (!isFullscreen) {
         dialog.classList.remove('hidden');
       }
       connectBtn.disabled = false;
       connectBtn.textContent = '连接';
+      serverInfoText.textContent = '';
     }
   });
 
@@ -283,7 +338,7 @@ function setupIPCListeners(): void {
     setupCanvas();
     dialog.classList.add('hidden');
     toolbarEl.classList.remove('hidden');
-    statusBar.classList.remove('hidden');
+    showToolbar();
     emptyState.classList.add('hidden');
     isConnected = true;
 
@@ -440,13 +495,33 @@ function saveSettings(): void {
 
 // ---- 连接管理 ----
 function handleConnect(): void {
-  const host = hostInput.value.trim();
-  if (!host) {
+  // 服务器字段支持简写：`地址` / `地址:端口` / `地址::显示编号`（VNC 经典写法）
+  const raw = hostInput.value.trim();
+  if (!raw) {
     errorMsg.textContent = '请输入服务器地址';
     return;
   }
 
-  const port = parseInt(portInput.value) || 5900;
+  let host = raw;
+  let port = parseInt(portInput.value) || 5900;
+  const doubleColon = raw.indexOf('::');
+  const singleColon = raw.indexOf(':');
+  if (doubleColon !== -1) {
+    // host::display → 端口 5900+display
+    host = raw.slice(0, doubleColon);
+    const display = parseInt(raw.slice(doubleColon + 2), 10);
+    if (!isNaN(display)) port = 5900 + display;
+  } else if (singleColon !== -1 && !raw.includes(']')) {
+    // host:port（IPv6 地址含多个冒号，不做解析）
+    host = raw.slice(0, singleColon);
+    const p = parseInt(raw.slice(singleColon + 1), 10);
+    if (!isNaN(p)) port = p;
+  }
+  // 解析结果回填，保持选项面板与输入框一致
+  hostInput.value = host;
+  portInput.value = String(port);
+  displayInput.value = String(Math.max(0, port - 5900));
+
   const password = passwordInput.value || undefined;
   const shared = sharedCheck.checked;
 
@@ -473,20 +548,21 @@ function handleDisconnect(): void {
     isConnected = false;
     fbCanvas = null;
     toolbarEl.classList.add('hidden');
-    statusBar.classList.add('hidden');
+    toolbarEl.classList.add('toolbar-hidden');
     emptyState.classList.remove('hidden');
     if (!isFullscreen) {
       dialog.classList.remove('hidden');
     }
     connectBtn.disabled = false;
     connectBtn.textContent = '连接';
-    serverInfoText.textContent = '未连接';
+    serverInfoText.textContent = '';
   });
 }
 
 function showConnectionDialog(): void {
   dialog.classList.remove('hidden');
   hostInput.focus();
+  hostInput.select();
 }
 
 // ---- 画布管理 ----
@@ -532,9 +608,19 @@ function setZoomMode(mode: 'fit' | '100'): void {
     canvas.style.width = `${fbWidth}px`;
     canvas.style.height = `${fbHeight}px`;
     zoomText.textContent = '100%';
+    zoomIconFit.classList.add('hidden');
+    zoomIcon100.classList.remove('hidden');
   } else {
     applyZoomFit();
+    zoomIconFit.classList.remove('hidden');
+    zoomIcon100.classList.add('hidden');
   }
+  if (isConnected) showToolbar();
+}
+
+/** 缩放模式切换：适配窗口 ↔ 实际大小 */
+function toggleZoomMode(): void {
+  setZoomMode(zoomMode === 'fit' ? '100' : 'fit');
 }
 
 function setupCanvasResize(): void {

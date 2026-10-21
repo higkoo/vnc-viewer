@@ -36,7 +36,8 @@
       "src/renderer/**/*.html",
       "src/renderer/styles/**/*.css",
       "src/mobile/**/*.html",
-      "package.json"
+      "package.json",
+      "build/icon.png"
     ],
     "mac": {
       "target": [
@@ -65,7 +66,8 @@
       "identity": null,
       "entitlements": "build/entitlements.mac.plist",
       "entitlementsInherit": "build/entitlements.mac.plist",
-      "gatekeeperAssess": false
+      "gatekeeperAssess": false,
+      "icon": "build/icon.icns"
     },
     "dmg": {
       "title": "VNC Viewer ${version}"
@@ -84,7 +86,8 @@
             "x64"
           ]
         }
-      ]
+      ],
+      "icon": "build/icon.ico"
     },
     "linux": {
       "target": [
@@ -101,7 +104,8 @@
           ]
         }
       ],
-      "category": "Utility"
+      "category": "Utility",
+      "icon": "build/icons/512x512.png"
     }
   },
   "devDependencies": {
@@ -112,6 +116,7 @@
     "@types/ws": "^8.18.1",
     "electron": "~32.2.0",
     "electron-builder": "^26.15.3",
+    "sharp": "^0.35.5",
     "typescript": "^5.5.0"
   },
   "dependencies": {
