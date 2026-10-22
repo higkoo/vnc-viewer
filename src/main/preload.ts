@@ -33,6 +33,7 @@ const IPC = {
   GET_SETTINGS: 'app:settings:get',
   SET_SETTINGS: 'app:settings:set',
   MOBILE_PORT_CHANGED: 'app:mobile-port-changed',
+  WINDOW_RESIZE: 'window:resize-to-content',
 } as const;
 
 const api = {
@@ -59,6 +60,10 @@ const api = {
   onMobilePortChanged: (callback: (port: number) => void) => {
     ipcRenderer.on(IPC.MOBILE_PORT_CHANGED, (_event, port) => callback(port));
   },
+
+  // 窗口自适应：按远端分辨率调整窗口内容区大小（width/height 为期望的内容区尺寸）
+  resizeWindowToContent: (width: number, height: number) =>
+    ipcRenderer.invoke(IPC.WINDOW_RESIZE, width, height),
 
   // 事件监听
   onFramebufferUpdate: (callback: (rect: any) => void) => {
@@ -105,6 +110,9 @@ const api = {
   },
   onMenuZoom100: (callback: () => void) => {
     ipcRenderer.on('menu:zoom-100', () => callback());
+  },
+  onMenuResizeWindowToRemote: (callback: () => void) => {
+    ipcRenderer.on('menu:resize-window-to-remote', () => callback());
   },
   onMenuShowLogs: (callback: () => void) => {
     ipcRenderer.on('menu:show-logs', () => callback());

@@ -4,7 +4,7 @@
  */
 
 // Electron 32.x：require('electron') 正常导出 API 命名空间
-import { app, BrowserWindow, ipcMain, Menu, dialog, MenuItemConstructorOptions } from 'electron';
+import { app, BrowserWindow, ipcMain, Menu, dialog, MenuItemConstructorOptions, screen } from 'electron';
 
 import * as path from 'path';
 import * as fs from 'fs';
@@ -178,6 +178,9 @@ function createWindow(): void {
           { label: '实际大小', accelerator: 'CmdOrCtrl+1', click: () => {
             mainWindow?.webContents.send('menu:zoom-100');
           }},
+          { label: '窗口适应远端', accelerator: 'CmdOrCtrl+2', click: () => {
+            mainWindow?.webContents.send('menu:resize-window-to-remote');
+          }},
           { type: 'separator' },
           { role: 'toggleDevTools', label: '开发者工具' },
         ],
@@ -222,6 +225,9 @@ function createWindow(): void {
           }},
           { label: '实际大小', accelerator: 'Ctrl+1', click: () => {
             mainWindow?.webContents.send('menu:zoom-100');
+          }},
+          { label: '窗口适应远端', accelerator: 'Ctrl+2', click: () => {
+            mainWindow?.webContents.send('menu:resize-window-to-remote');
           }},
           { type: 'separator' },
           { role: 'toggleDevTools' },
@@ -560,6 +566,33 @@ function setupIPC(): void {
       mainWindow?.webContents.send(IPC_CHANNELS.MOBILE_PORT_CHANGED, settings.mobilePort);
     }
     return { success: true };
+  });
+
+  // ---- 窗口自适应：按远端分辨率调整窗口内容区大小 ----
+  // width/height 由渲染进程计算（远端尺寸 + 本地 UI 占用），主进程负责裁剪与落位
+  ipcMain.handle(IPC_CHANNELS.WINDOW_RESIZE, (_event, width: unknown, height: unknown) => {
+    if (!mainWindow) return { success: false, error: '窗口不存在' };
+    if (mainWindow.isFullScreen()) {
+      return { success: false, error: '全屏状态下无法调整窗口大小' };
+    }
+    // 参数校验：内容区尺寸必须为合理范围的整数
+    const wOk = typeof width === 'number' && Number.isInteger(width) && width >= 200 && width <= 16384;
+    const hOk = typeof height === 'number' && Number.isInteger(height) && height >= 150 && height <= 16384;
+    if (!wOk || !hOk) {
+      warn(`窗口自适应参数非法: width=${JSON.stringify(width)}, height=${JSON.stringify(height)}`);
+      return { success: false, error: '尺寸参数非法' };
+    }
+    // 裁剪到屏幕工作区可用范围，避免窗口超出屏幕
+    const { workArea } = screen.getPrimaryDisplay();
+    const w = Math.min(width as number, workArea.width);
+    const h = Math.min(height as number, workArea.height);
+    mainWindow.setContentSize(w, h);
+    // 调整后在屏幕工作区内居中
+    const x = workArea.x + Math.max(0, Math.floor((workArea.width - w) / 2));
+    const y = workArea.y + Math.max(0, Math.floor((workArea.height - h) / 2));
+    mainWindow.setPosition(x, y);
+    info(`窗口自适应: 内容区调整为 ${w}x${h}（远端 ${width}x${height}${w < (width as number) || h < (height as number) ? '，受屏幕工作区裁剪' : ''}）`);
+    return { success: true, width: w, height: h };
   });
 }
 

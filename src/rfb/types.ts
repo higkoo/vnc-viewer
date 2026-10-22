@@ -203,5 +203,7 @@ export const IPC_CHANNELS = {
   // 设置
   GET_SETTINGS: 'app:settings:get',
   SET_SETTINGS: 'app:settings:set',
+  // 窗口按远端分辨率调整大小
+  WINDOW_RESIZE: 'window:resize-to-content',
   MOBILE_PORT_CHANGED: 'app:mobile-port-changed',
 } as const;

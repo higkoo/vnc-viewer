@@ -25,6 +25,7 @@ interface VncApi {
   onMenuExitFullscreen: (callback: () => void) => void;
   onMenuZoomFit: (callback: () => void) => void;
   onMenuZoom100: (callback: () => void) => void;
+  onMenuResizeWindowToRemote: (callback: () => void) => void;
   onMenuShowLogs: (callback: () => void) => void;
   onMenuShowSettings: (callback: () => void) => void;
   getLogs: () => Promise<any>;
@@ -32,6 +33,7 @@ interface VncApi {
   onLog: (callback: (entry: { time: string; level: string; msg: string }) => void) => void;
   getSettings: () => Promise<any>;
   setSettings: (settings: any) => Promise<any>;
+  resizeWindowToContent: (width: number, height: number) => Promise<any>;
   onMobilePortChanged: (callback: (port: number) => void) => void;
 }
 
@@ -88,6 +90,7 @@ const viewport = getEl<HTMLDivElement>('viewport-container');
 const btnNewConn = getEl<HTMLButtonElement>('btn-new-conn');
 const btnDisconnect = getEl<HTMLButtonElement>('btn-disconnect');
 const btnZoomToggle = getEl<HTMLButtonElement>('btn-zoom-toggle');
+const btnWindowFit = getEl<HTMLButtonElement>('btn-window-fit');
 const btnFullscreen = getEl<HTMLButtonElement>('btn-fullscreen');
 const btnMore = getEl<HTMLButtonElement>('btn-more');
 const moreMenu = getEl<HTMLDivElement>('more-menu');
@@ -196,6 +199,7 @@ function setupEventListeners(): void {
   btnEmptyConnect.addEventListener('click', showConnectionDialog);
   btnDisconnect.addEventListener('click', handleDisconnect);
   btnZoomToggle.addEventListener('click', toggleZoomMode);
+  btnWindowFit.addEventListener('click', resizeWindowToRemote);
   btnFullscreen.addEventListener('click', toggleFullscreen);
   btnCtrlAltDel.addEventListener('click', () => sendCtrlAltDel());
   btnClipboard.addEventListener('click', () => {
@@ -406,6 +410,7 @@ function setupIPCListeners(): void {
   vncApi.onMenuExitFullscreen(() => exitFullscreen());
   vncApi.onMenuZoomFit(() => setZoomMode('fit'));
   vncApi.onMenuZoom100(() => setZoomMode('100'));
+  vncApi.onMenuResizeWindowToRemote(() => resizeWindowToRemote());
   vncApi.onMenuShowLogs(() => toggleLogPanel());
   vncApi.onMenuShowSettings(() => showSettings());
 
@@ -594,7 +599,8 @@ function applyZoomFit(): void {
 
   const scaleX = availW / fbWidth;
   const scaleY = availH / fbHeight;
-  zoomLevel = Math.min(scaleX, scaleY, 1); // 不放大超过原始大小
+  // 双向自适应：窗口小则缩小，窗口大则放大，保持纵横比完整显示远端画面
+  zoomLevel = Math.min(scaleX, scaleY);
 
   canvas.style.width = `${fbWidth * zoomLevel}px`;
   canvas.style.height = `${fbHeight * zoomLevel}px`;
@@ -621,6 +627,21 @@ function setZoomMode(mode: 'fit' | '100'): void {
 /** 缩放模式切换：适配窗口 ↔ 实际大小 */
 function toggleZoomMode(): void {
   setZoomMode(zoomMode === 'fit' ? '100' : 'fit');
+}
+
+/** 窗口适应远端：把窗口内容区调整为与远端分辨率一致，实现 1:1 像素映射 */
+function resizeWindowToRemote(): void {
+  if (!isConnected || fbWidth === 0 || fbHeight === 0) return;
+  if (isFullscreen) return; // 全屏下无法调整窗口大小
+  // 本地 UI 额外占用 = 当前窗口尺寸 - 视口尺寸（工具栏、内边距、边框等）
+  const extraW = window.innerWidth - viewport.clientWidth;
+  const extraH = window.innerHeight - viewport.clientHeight;
+  const w = Math.round(fbWidth + extraW);
+  const h = Math.round(fbHeight + extraH);
+  // 切到 100% 模式：窗口匹配后无需缩放；若远端超出屏幕被主进程裁剪，
+  // ResizeObserver 会因视口变化触发（fit 模式下会自动重新适配，100% 模式下可滚动查看）
+  setZoomMode('100');
+  vncApi.resizeWindowToContent(w, h);
 }
 
 function setupCanvasResize(): void {
@@ -1131,6 +1152,7 @@ function handleKeyDown(e: KeyboardEvent): void {
     if (e.key === 'd' || e.key === 'D') { handleDisconnect(); e.preventDefault(); return; }
     if (e.key === '0') { setZoomMode('fit'); e.preventDefault(); return; }
     if (e.key === '1') { setZoomMode('100'); e.preventDefault(); return; }
+    if (e.key === '2') { resizeWindowToRemote(); e.preventDefault(); return; }
   }
 
   // 焦点切换到 canvas, 阻止默认行为（含 Tab 焦点切换）
